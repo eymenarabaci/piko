@@ -534,7 +534,7 @@ def create_app(data_dir=None, providers=None):
             message = "Eklediğim dosyaları incele ve özetle."
         conversation_run_id = str(body.get("conversation_run_id") or "")
         previous = await require(conversation_run_id) if conversation_run_id else None
-        kind = classify_request(message)
+        kind = classify_request(message, planning_level)
         if kind == "chat":
             if previous:
                 result = await orchestrator_chat(conversation_run_id, request)

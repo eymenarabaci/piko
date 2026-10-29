@@ -1,30 +1,73 @@
-"""Conservative request routing without an extra model invocation."""
+"""Route ordinary conversation and multi-part work without a model call."""
 from __future__ import annotations
 
 import re
 
 
-def classify_request(message: str) -> str:
-    text = message.casefold().translate(str.maketrans('çğıöşü', 'cgiosu'))
-    if re.search(r'\bplan(?:i)?\s+(?:yap|hazirla|olustur|cikar)|\b(?:planla|planlayalim)\b', text):
-        return 'plan'
-    # Questions about the current work stay conversational, even if they mention
-    # several technologies or quote a long diagnostic message.
-    question = re.search(r'\b(?:nedir|neden|nasil|ne durumda|ne yapildi|bitti mi|acikla|anlat|ne demek)\b', text)
-    action = re.search(r'\b(?:ekle|duzelt|uygula|gelistir|yeniden yaz|entegre et|olustur|kur|yapalim)\b', text)
-    if question and not action:
-        return 'chat'
-    broad = re.search(r'\b(?:sifirdan|komple|tamamen|tum sistem|tum proje|hepsini|tumunu|bunlari|uctan uca|mimariyi degistir|yeniden yaz)\b', text)
-    domains = ('firebase', 'github', 'google drive', 'android', 'ios', 'electron',
-               'kimlik dogrulama', 'odeme', 'veritabani', 'senkronizasyon')
-    domain_count = sum(term in text for term in domains)
-    list_count = len(re.findall(r'(?:^|\n)\s*(?:[-*]|\d+[.)])\s+', text))
-    action_count = len(re.findall(r'\b(?:ekle|duzelt|uygula|gelistir|entegre et|olustur|kur)\b', text))
-    if broad or list_count >= 3 or action_count >= 3 or (action and (len(message) > 700 or domain_count >= 2)):
-        return 'plan'
-    if re.search(r'\b(?:uygulama|sistem|platform|web sitesi)\b.{0,100}\b(?:istiyorum|gelistir|olustur|kur)\b', text):
-        return 'plan'
-    # Small corrections, file-scoped work and ordinary dialogue need no planner.
-    if len(message) <= 400 or question or (action and list_count < 2 and domain_count < 2):
-        return 'chat'
-    return 'plan'
+_TRANSLATION = str.maketrans("çğıöşü", "cgiosu")
+_ACTION = re.compile(
+    r"\b(?:ekle\w*|eklen\w*|duzelt\w*|uygula\w*|gelistir\w*|"
+    r"entegre\w*|olustur\w*|kur\w*|yap\w*|duzenle\w*|"
+    r"guncelle\w*|tasarla\w*|paketle\w*|dagit\w*|bagla\w*|"
+    r"senkronize\w*|yeniden yaz\w*|build\w*)\b"
+)
+_INTENT = re.compile(r"\b(?:istiyorum|olsun|olmali|gerekiyor|eklensin|guncellensin|calissin|yapilsin|olusturulsun)\b")
+_QUESTION = re.compile(r"\b(?:nedir|neden|nasil|ne durumda|ne yapildi|bitti mi|acikla|anlat|ne demek)\b")
+_BROAD = re.compile(
+    r"\b(?:sifirdan|komple|tamamen|tum sistem|tum proje|hepsini|tumunu|"
+    r"bunlari|uctan uca|mimariyi degistir|yeniden yaz|tam senkronizasyon)\b"
+)
+_DOMAIN_GROUPS = (
+    ("github", "git repo", "commit", "pull request"),
+    ("firebase", "firestore", "veritabani", "database"),
+    ("google drive", "drive", "app script"),
+    ("android", "mobil", "apk", "ios"),
+    ("electron", "masaustu", "desktop", "pencereli"),
+    ("frontend", "arayuz", "tasarim", "ekran"),
+    ("kimlik dogrulama", "yetki", "admin", "rol"),
+    ("profil", "kullanici", "calisan", "fotograf"),
+    ("senkronizasyon", "otomatik guncelle", "dosya izleme"),
+)
+
+
+def classify_request(message: str, planning_level: str = "fast") -> str:
+    """Return ``plan`` for substantial implementation, ``chat`` for dialogue."""
+    text = message.casefold().translate(_TRANSLATION)
+    if re.search(r"\bplan(?:i)?\s+(?:yap|hazirla|olustur|cikar)|\b(?:planla|planlayalim)\b", text):
+        return "plan"
+
+    if _QUESTION.search(text) and not _INTENT.search(text) and not re.search(
+        r"\b(?:ekle|duzelt|uygula|gelistir|olustur|kur|yap|duzenle|guncelle|tasarla|paketle|dagit|bagla)\b", text
+    ):
+        return "chat"
+
+    actions = _ACTION.findall(text)
+    wants_work = bool(actions or _INTENT.search(text))
+    if _QUESTION.search(text) and not wants_work:
+        return "chat"
+
+    broad = bool(_BROAD.search(text))
+    domain_count = sum(any(term in text for term in group) for group in _DOMAIN_GROUPS)
+    list_count = len(re.findall(r"(?:^|\n)\s*(?:[-*]|\d+[.)])\s+", text))
+    clauses = len(re.findall(r"\b(?:ve|ayrica|bir de|bide|hem|dahil)\b", text))
+    file_scoped = bool(re.search(r"\b[\w.-]+\.(?:py|tsx?|jsx?|css|html|json|md)\b", text))
+
+    if broad or list_count >= 3:
+        return "plan"
+    if not wants_work:
+        return "chat"
+    if re.search(r"\b(?:uygulama|sistem|platform|web sitesi)\b.{0,110}\b(?:istiyorum|gelistir\w*|olustur\w*|kur\w*)\b", text):
+        return "plan"
+    if domain_count >= 2 and (len(text) >= 75 or len(actions) >= 1):
+        return "plan"
+    if len(actions) >= 2 and (clauses >= 1 or len(text) >= 150):
+        return "plan"
+    if len(text) >= 80 and (clauses >= 1 or "," in text) and (domain_count >= 1 or _INTENT.search(text)):
+        return "plan"
+    if planning_level == "detailed" and len(text) >= 65 and not file_scoped:
+        return "plan"
+    if planning_level == "balanced" and len(text) >= 160 and not file_scoped:
+        return "plan"
+    if len(text) > 400 and not file_scoped:
+        return "plan"
+    return "chat"

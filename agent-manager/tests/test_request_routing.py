@@ -12,6 +12,7 @@ from manager.schema import RunRequest
     ('Merhaba', 'chat'),
     ('GitHub ve Firebase nasıl çalışıyor?', 'chat'),
     ('Şu hata ne demek? ' + 'diagnostic ' * 90, 'chat'),
+    ('Mevcut projede masaüstü uygulaması yapıldı mı, Android giriş ve GitHub bağlantısı nasıl çalışıyor?', 'chat'),
     ('Navbar.tsx içindeki buton adını Kaydet yap', 'chat'),
     ('Bu küçük hatayı düzelt', 'chat'),
     ('Yeni bir plan oluştur', 'plan'),
@@ -19,6 +20,9 @@ from manager.schema import RunRequest
     ('Firebase ve GitHub entegrasyonunu ekle', 'plan'),
     ('Sıfırdan masaüstü uygulama istiyorum', 'plan'),
     ('1. Oturum kur\n2. API geliştir\n3. Mobil uygulama oluştur', 'plan'),
+    ('Kullanıcıların profil bilgilerini yönetici sonradan düzenleyebilsin, profil fotoğrafı da eklensin', 'plan'),
+    ('Drive klasörüne işe özel klasör açılsın ve GitHub ile otomatik senkronizasyon çalışsın', 'plan'),
+    ('Pencereli masaüstü uygulamasını ve mobil APK uygulamasını oluştur; arayüzü de yeniden düzenle', 'plan'),
 ])
 def test_request_route(message, expected):
     assert classify_request(message) == expected
@@ -79,3 +83,8 @@ def test_simple_question_does_not_invoke_planner():
     response = _run_immediate(ns['assist'](SimpleNamespace(json=json_body)))
     assert response['kind'] == 'chat'
     assert calls == ['chat']
+
+
+def test_detailed_level_routes_substantial_work_to_plan():
+    assert classify_request('Kullanıcı yönetimi ekranını düzenleyip kalıcı profil bilgilerini ekle', 'detailed') == 'plan'
+    assert classify_request('Bu mimari neden yavaş çalışıyor?', 'detailed') == 'chat'
