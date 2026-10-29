@@ -2412,7 +2412,112 @@ function applySettings() {
 function openSettings() {
   applySettings();
   $('#settings-dialog').showModal();
+  checkForUpdate();
 }
+
+let updateStatus = null;
+let updateBusy = false;
+
+function renderUpdateStatus(data) {
+  updateStatus = data;
+  const current = data?.current;
+  const remote = data?.remote;
+  $('#update-current').textContent = current ? current.slice(0, 8) : '—';
+  $('#update-remote').textContent = remote ? remote.slice(0, 8) : '—';
+  const available = Number(data?.behind || 0) > 0;
+  $('#update-badge').textContent = available ? 'Yeni sürüm var' : 'Güncel';
+  $('#update-badge').classList.toggle('available', available);
+  if (data?.last_update?.state === 'dependencies_failed') {
+    $('#update-badge').textContent = 'Kurulum uyarısı';
+  }
+  $('#update-state').textContent = data?.last_update?.state === 'dependencies_failed'
+    ? data.last_update.detail
+    : data?.reason || (available
+    ? `${data.behind} yeni commit hazır.`
+    : 'Bu kurulum güncel.');
+  $('#apply-update').disabled = updateBusy || !data?.eligible;
+}
+
+async function checkForUpdate() {
+  if (updateBusy) return;
+  updateBusy = true;
+  $('#check-update').disabled = true;
+  $('#apply-update').disabled = true;
+  $('#update-state').textContent = 'GitHub sürümü kontrol ediliyor…';
+  try {
+    const data = await api('/api/update/status?refresh=1', { timeoutMs: 30000 });
+    renderUpdateStatus(data);
+  } catch (error) {
+    updateStatus = null;
+    $('#update-badge').textContent = 'Kontrol edilemedi';
+    $('#update-badge').classList.remove('available');
+    $('#update-state').textContent = errorText(error);
+  } finally {
+    updateBusy = false;
+    $('#check-update').disabled = false;
+    $('#apply-update').disabled = !updateStatus?.eligible;
+  }
+}
+
+async function applyUpdate() {
+  if (updateBusy || !updateStatus?.eligible) return;
+  if (state.pendingAttachments.some(item => item.uploading)) {
+    $('#update-state').textContent = 'Dosya yüklemesi bitince güncellemeyi başlatın.';
+    return;
+  }
+  updateBusy = true;
+  $('#check-update').disabled = true;
+  $('#apply-update').disabled = true;
+  $('#update-state').textContent = 'Güncelleme uygulanıyor…';
+  try {
+    const result = await api('/api/update/apply', { method: 'POST', timeoutMs: 120000 });
+    renderUpdateStatus(result);
+    $('#update-badge').textContent = 'Yeniden başlatılıyor';
+    $('#update-badge').classList.remove('available');
+    $('#update-state').textContent = 'Dosyalar güncellendi. Uygulama yeni sürümle yeniden açılıyor…';
+    if (result.restart_required) {
+      let restarted = false;
+      const deadline = Date.now() + 600000;
+      while (Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        try {
+          const status = await api('/api/update/status', { timeoutMs: 3500 });
+          if (status.server_started_at && status.server_started_at !== result.server_started_at) {
+            renderUpdateStatus(status);
+            restarted = true;
+            break;
+          }
+        } catch { /* Sunucu yeniden başlarken kısa bağlantı kesilmesi beklenir. */ }
+      }
+      if (restarted) {
+        try {
+          sessionStorage.setItem('agent-manager-update-draft', $('#prompt').value);
+          sessionStorage.setItem('agent-manager-update-attachments', JSON.stringify(
+            state.pendingAttachments.filter(item => item.id).map(({id, name, mime}) => ({id, name, mime}))));
+        } catch {}
+        location.reload();
+      } else {
+        $('#update-badge').textContent = 'Yeniden açılma bekleniyor';
+        $('#update-state').textContent = 'Dosyalar güncellendi; sunucu henüz dönmedi. Masaüstü başlatıcısını yeniden açın.';
+      }
+    } else {
+      $('#update-badge').textContent = 'Güncel';
+      $('#update-state').textContent = result.reason || 'Güncelleme tamamlandı.';
+    }
+  } catch (error) {
+    updateStatus = null;
+    $('#update-badge').textContent = 'Güncelleme başarısız';
+    $('#update-badge').classList.remove('available');
+    $('#update-state').textContent = errorText(error);
+  } finally {
+    updateBusy = false;
+    $('#check-update').disabled = false;
+    $('#apply-update').disabled = !updateStatus?.eligible;
+  }
+}
+
+$('#check-update').addEventListener('click', checkForUpdate);
+$('#apply-update').addEventListener('click', applyUpdate);
 function openPlanEditor(run = inspectedPlan()) {
   state.editPlanRunId = run?.id;
   $('#plan-json').value = JSON.stringify(run?.plan?.steps || [], null, 2);
@@ -2846,4 +2951,16 @@ async function initialize() {
   }
 }
 
-initialize();
+initialize().finally(() => {
+  try {
+    const draft = sessionStorage.getItem('agent-manager-update-draft');
+    if (draft !== null) $('#prompt').value = draft;
+    sessionStorage.removeItem('agent-manager-update-draft');
+    const attachments = JSON.parse(sessionStorage.getItem('agent-manager-update-attachments') || '[]');
+    if (Array.isArray(attachments) && attachments.length) {
+      state.pendingAttachments = attachments.filter(item => item && typeof item.id === 'string');
+      renderPendingAttachments();
+    }
+    sessionStorage.removeItem('agent-manager-update-attachments');
+  } catch {}
+});

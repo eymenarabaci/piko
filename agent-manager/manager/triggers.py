@@ -80,6 +80,7 @@ class TriggerManager:
         self.engine = engine
         self._lock = threading.RLock()
         self._running = False
+        self.update_pause = False
         self._daemon_task = None
         self._watch_state = {}  # workspace -> {"last_mtime": float, "change_detected_at": float | None}
         self._ensure_file()
@@ -286,6 +287,9 @@ class TriggerManager:
         """Continuously inspect interval triggers and workspace file watchers."""
         self._running = True
         while self._running:
+            if self.update_pause:
+                await asyncio.sleep(1)
+                continue
             try:
                 now_dt = datetime.now(timezone.utc)
                 now_ts = now_dt.timestamp()

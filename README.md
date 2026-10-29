@@ -32,6 +32,12 @@ setup.cmd
 - **Yerel Masaüstü Modu:** `desktop.cmd` dosyasına çift tıklayın. Tarayıcınızda `http://127.0.0.1:8765` açılacaktır.
 - **Uzaktan Erişim / Mobil Modu:** `remote.cmd` dosyasını çalıştırın (Sunucu dış ağlara ve Tailscale IP'nize açılır).
 
+### Uygulama içinden güncelleme
+
+**Ayarlar → Sürüm ve güncelleme** bölümünde **Sürümü kontrol et** ve yeni sürüm varsa **Güncelle** düğmelerini kullanın. Güncelleme yalnız bu bilgisayarın tarayıcısından, GitHub `origin/main` dalındaki daha yeni bir sürüme yapılır. Çalışan görev veya yerel kod değişikliği varsa düğme kapanır; önce görevin bitmesini ve değişikliklerin commit edilmesini bekleyin. Uygulama verileri güncellemeden önce `agent-manager/data/backups/` altına yedeklenir. Kurulum ve sunucu yeniden başlatma tamamlanınca sayfa yenilenir.
+
+Birden fazla kopya açıksa başlatıcı, başka bir kopyanın kullandığı 8765 yerine uygun sonraki portu seçer; açılan tarayıcı adresini kullanın. Güncelleme işlemi mevcut klonu günceller ve diğer kopyalara uygulanmaz.
+
 ---
 
 ## 📱 Android Uzaktan Kontrol Kurulumu

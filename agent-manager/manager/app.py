@@ -5,6 +5,9 @@ import json
 import os
 import re
 import secrets
+import shutil
+import subprocess
+import sys
 import uuid
 import httpx
 from contextlib import asynccontextmanager
@@ -21,12 +24,14 @@ from .ao import AOClient
 from .attachments import AttachmentStore, MAX_REQUEST_BYTES, attachment_prompt, validate_for_model
 from .model_router import NoEligibleModel, infer_role
 from .projects import ProjectManager
+from .processes import _record
 from .providers import Providers
 from .outcomes import ensure_usable_result, is_infrastructure_error
 from .schema import Plan, RunRequest
 from .request_routing import classify_request
 from .store import Store, now
 from .triggers import TriggerManager
+from .updates import Updater, UpdateError
 from .worker_catalog import list_workers
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -103,6 +108,9 @@ def create_app(data_dir=None, providers=None):
             token_file.write_text(remote_token, encoding="utf-8")
         app.state.remote_token = remote_token
         app.state.data_dir = data_dir
+        app.state.server_started_at = now()
+        app.state.updater = Updater(ROOT.parent, data_dir)
+        app.state.update_in_progress = False
         app.state.attachments = AttachmentStore(data_dir)
         app.state.projects = ProjectManager(data_dir)
         models = await load_and_discover_models(ROOT)
@@ -163,6 +171,8 @@ def create_app(data_dir=None, providers=None):
         origin = request.headers.get("origin")
         if origin and not is_authenticated_remote and origin != f"{request.url.scheme}://{request.headers.get('host')}":
             return JSONResponse({"detail": "Farklı kaynaktan istek reddedildi."}, status_code=403)
+        if getattr(app.state, "update_in_progress", False) and request.method in {"POST", "PUT", "DELETE"}:
+            return JSONResponse({"detail": "Uygulama güncelleniyor; yeni işlem başlatılamaz."}, status_code=503)
         if request.method in {"POST", "PUT", "DELETE"}:
             c_type = request.headers.get("content-type", "")
             c_len = request.headers.get("content-length", "0")
@@ -273,6 +283,120 @@ def create_app(data_dir=None, providers=None):
                 "workers": list_workers(),
                 "daily_tokens": await engine.optimizer.get_daily_total(),
                 "workspace_default": str(ROOT)}
+
+    @app.get("/api/update/status")
+    async def update_status(request: Request):
+        refresh = request.query_params.get("refresh", "0") in {"1", "true"}
+        result = await app.state.updater.status(refresh=refresh)
+        result["server_started_at"] = app.state.server_started_at
+        status_file = data_dir / "backups" / "last-update-status.json"
+        try:
+            saved = json.loads(status_file.read_text(encoding="utf-8"))
+            if isinstance(saved, dict):
+                result["last_update"] = {key: str(saved.get(key, ""))[:300]
+                                         for key in ("state", "detail", "at")}
+                result["restart_state"] = result["last_update"]["state"]
+                result["restart_detail"] = result["last_update"]["detail"]
+        except (OSError, ValueError):
+            pass
+        if app.state.update_in_progress:
+            result.update(eligible=False, reason="Yeniden başlatılıyor.", restart_required=True)
+        return result
+
+    @app.post("/api/update/apply")
+    async def apply_update(request: Request):
+        # Host headers and bearer tokens do not prove local presence. In particular,
+        # an authenticated Android/Tailscale client must not update this PC.
+        if (not request.client or request.client.host not in {"127.0.0.1", "::1"}
+                or request.headers.get("host", "").split(":")[0] not in {"127.0.0.1", "localhost"}):
+            raise HTTPException(403, "Güncelleme yalnız bu bilgisayardan başlatılabilir.")
+        origin = request.headers.get("origin")
+        if origin and origin != f"{request.url.scheme}://{request.headers.get('host')}":
+            raise HTTPException(403, "Farklı kaynaktan güncelleme başlatılamaz.")
+        server = getattr(app.state, "uvicorn_server", None)
+        if server is None:
+            raise HTTPException(503, "Otomatik yeniden başlatma için uygulamayı run.py ile açın.")
+        if app.state.update_in_progress:
+            raise HTTPException(409, "Güncelleme zaten sürüyor.")
+
+        app.state.update_in_progress = True
+        app.state.triggers.update_pause = True
+        applied = False
+        helper_file = None
+        status_file = None
+        try:
+            if await app.state.engine.store.active_count() or any(
+                not task.done() for task in app.state.engine.tasks.values()
+            ):
+                raise UpdateError("Çalışan görevler bitmeden güncelleme yapılamaz.")
+            result = await app.state.updater.apply()
+            applied = True
+            if await app.state.engine.store.active_count():
+                raise UpdateError("Güncelleme sırasında yeni bir görev başladı; uygulamayı elle yeniden başlatın.")
+
+            # Run the current helper from ignored data so a remote update cannot
+            # remove or alter the helper while the old process is shutting down.
+            backup_dir = data_dir / "backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            helper_file = backup_dir / f"restart-helper-{uuid.uuid4().hex}.py"
+            shutil.copyfile(ROOT / "manager" / "update_restart.py", helper_file)
+            status_file = backup_dir / "last-update-status.json"
+            status_file.write_text(json.dumps({"state": "restarting", "detail": "", "at": now()}),
+                                   encoding="utf-8")
+            import psutil
+            created = psutil.Process().create_time()
+            flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
+            helper = subprocess.Popen(
+                [sys.executable, "-B", str(helper_file), str(os.getpid()), str(created),
+                 str(app.state.restart_port), str(app.state.restart_executable), str(ROOT),
+                 json.dumps(app.state.restart_args), str(status_file), app.state.server_started_at],
+                cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, close_fds=True, creationflags=flags,
+            )
+            try:
+                helper_process = psutil.Process(helper.pid)
+                _record(ROOT, {"resource_id": f"update-helper-{helper.pid}-{helper_process.create_time()}",
+                               "owner_task": "agent-manager-update", "pid": helper.pid,
+                               "created_utc": now(), "executable_path": helper_process.exe(),
+                               "parent_pid": os.getpid(), "shared": False,
+                               "disposable": True, "state": "running"})
+            except (OSError, psutil.Error):
+                pass
+
+            async def finish_response_then_shutdown():
+                await asyncio.sleep(0.8)
+                server.should_exit = True
+
+            asyncio.create_task(finish_response_then_shutdown())
+            result["server_started_at"] = app.state.server_started_at
+            return result
+        except UpdateError as exc:
+            if helper_file is not None:
+                helper_file.unlink(missing_ok=True)
+            if status_file is not None:
+                try:
+                    status_file.write_text(json.dumps({"state": "failed", "detail": str(exc)[:300], "at": now()}),
+                                           encoding="utf-8")
+                except OSError:
+                    pass
+            app.state.update_in_progress = False
+            app.state.triggers.update_pause = False
+            raise HTTPException(409 if not applied else 500, str(exc)) from exc
+        except Exception as exc:
+            if helper_file is not None:
+                helper_file.unlink(missing_ok=True)
+            if status_file is not None:
+                try:
+                    status_file.write_text(json.dumps({"state": "failed", "detail": "Otomatik yeniden başlatma başlatılamadı.", "at": now()}),
+                                           encoding="utf-8")
+                except OSError:
+                    pass
+            app.state.update_in_progress = False
+            app.state.triggers.update_pause = False
+            detail = ("Kod güncellendi fakat otomatik yeniden başlatma başlatılamadı; "
+                      "uygulamayı elle yeniden başlatın." if applied else
+                      "Güncelleme uygulanamadı; uygulama çalışmaya devam ediyor.")
+            raise HTTPException(500, detail) from exc
 
     @app.get("/api/projects/{project_id}/stats")
     async def get_project_stats(project_id: str):

@@ -51,6 +51,16 @@ class Store:
                 rows = await cur.fetchall()
         return [json.loads(r[0]) for r in rows]
 
+    async def active_count(self) -> int:
+        """Count every active run, including records older than list()'s display cap."""
+        async with self.lock:
+            async with self.db.execute(
+                "SELECT COUNT(*) FROM runs WHERE json_extract(payload, '$.status') "
+                "IN ('queued', 'planning', 'running', 'waiting_quota')"
+            ) as cur:
+                row = await cur.fetchone()
+        return int(row[0])
+
     async def conversation(self, run_id):
         run = await self.get(run_id)
         if run is None:

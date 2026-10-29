@@ -7,5 +7,5 @@ if not exist "agent-manager\.venv\Scripts\python.exe" (
   if errorlevel 1 exit /b 1
 )
 cd /d "agent-manager"
-".venv\Scripts\python.exe" run.py --desktop --open %*
+".venv\Scripts\python.exe" run.py --open %*
 if errorlevel 1 pause
