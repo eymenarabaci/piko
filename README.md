@@ -22,7 +22,7 @@
 ### 1. Kurulum
 Depoyu klonlayın ve kök dizindeki kurulum dosyasını çalıştırın:
 ```cmd
-git clone https://github.com/kullanici-adiniz/AI-Orchestrator.git
+git clone https://github.com/eymenarabaci/AI-Orchestrator.git
 cd AI-Orchestrator
 setup.cmd
 ```
