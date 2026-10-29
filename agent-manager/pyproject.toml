@@ -1,0 +1,18 @@
+[project]
+name = "local-agent-manager"
+version = "1.0.0"
+description = "Local CLI agents orchestrated by upstream LangGraph"
+requires-python = ">=3.12"
+dependencies = [
+  "langgraph==1.2.17",
+  "langgraph-checkpoint-sqlite==3.1.2",
+  "fastapi==0.162.0",
+  "uvicorn==0.54.0",
+  "httpx==0.28.1",
+  "psutil==7.2.2",
+  "websockets==17.3",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="tr">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light"><link rel="icon" href="data:,"><title>Agent Manager · Çalışma alanı</title><link rel="stylesheet" href="/ui/styles.css?v=compact-clean-20261029"><script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script></head>
+<body>
+<div class="app-shell inspector-collapsed">
+ <aside class="sidebar">
+  <a href="/" class="brand" aria-label="Agent Manager ana sayfa"><span>◈</span><b>Agent Manager</b></a>
+  <button id="new-chat" class="new-chat" title="Yeni sohbet"><span>＋</span><span class="nav-label">Yeni sohbet</span><kbd>Ctrl N</kbd></button>
+  <nav class="sidebar-nav" aria-label="Ana gezinme">
+   <button class="nav-item active" data-page="chat" title="Sohbetler"><span aria-hidden="true">◫</span><span class="nav-label">Sohbetler</span></button>
+   <details class="sidebar-tools">
+    <summary title="Araçlar"><span aria-hidden="true">⋯</span><span class="nav-label">Araçlar</span><span class="menu-chevron" aria-hidden="true">⌄</span></summary>
+    <div class="sidebar-tools-content">
+     <button class="nav-item" data-page="history" title="Sohbet geçmişi"><span aria-hidden="true">◷</span><span class="nav-label">Tüm sohbetler</span></button>
+     <button class="nav-item" data-page="models" title="Modeller"><span aria-hidden="true">◇</span><span class="nav-label">Modeller</span><small id="model-count">—</small></button>
+     <button class="nav-item" data-page="personas" title="Uzmanlar ve beceriler"><span aria-hidden="true">♧</span><span class="nav-label">Uzmanlar</span><small id="persona-count">—</small></button>
+      <button class="nav-item" data-page="memory" title="Kalıcı Bellek"><span aria-hidden="true">🧠</span><span class="nav-label">Kalıcı Bellek</span><small id="memory-count">—</small></button>
+      <button class="nav-item" data-page="triggers" title="Proaktif Görevler"><span aria-hidden="true">⚡</span><span class="nav-label">Proaktif Görevler</span><small id="trigger-count">—</small></button>
+     <button class="nav-item" data-page="remote" title="Mobil erişim"><span aria-hidden="true">▯</span><span class="nav-label">Mobil erişim</span></button>
+    </div>
+   </details>
+  </nav>
+  <div class="project-selector-card" id="sidebar-project-card" title="Projeyi Değiştir veya Yönet">
+   <span class="project-icon" aria-hidden="true">📁</span>
+   <div class="project-info">
+    <span class="project-label">Aktif Proje</span>
+    <strong id="active-project-name">İş Geliştirme Projesi</strong>
+    <small id="active-project-path">./workspace</small>
+   </div>
+   <span class="project-arrow">▾</span>
+  </div>
+  <div class="recent-section">
+   <div class="recent-header-row">
+    <span class="recent-caption-label">Sohbetler</span>
+    <div class="recent-scope-toggle">
+     <button type="button" class="scope-btn active" id="scope-project-btn" title="Yalnızca bu projenin sohbetlerini göster">Bu Proje</button>
+     <button type="button" class="scope-btn" id="scope-all-btn" title="Tüm projelerdeki sohbetleri göster">Tümü</button>
+    </div>
+   </div>
+   <div id="recent-runs"></div>
+  </div>
+  <div class="sidebar-space"></div>
+  <div class="local-notice"><i class="status-dot"></i><div>Bu bilgisayarda<small>Dosyalarınızla birlikte çalışır</small></div></div>
+  <button class="profile settings-open" title="Ayarlar"><span>E</span><div>Çalışma alanım<small>Ayarlar ve bağlantılar</small></div><b aria-hidden="true">⚙</b></button>
+ </aside>
+ <div class="workspace">
+  <header class="topbar">
+    <div class="topbar-title-wrap">
+     <button type="button" class="topbar-project-pill" id="topbar-project-btn" title="Aktif Projeyi Değiştir">
+      <span class="project-pill-icon">📁</span>
+      <span id="topbar-project-name">İş Geliştirme Projesi</span>
+      <span class="project-pill-arrow">▾</span>
+     </button>
+     <h1 id="page-title">Görev Orkestrasyonu</h1>
+    </div><div class="top-actions"><span id="connection" class="connection"><i></i><span>Bağlanıyor</span></span><button id="toggle-inspector" class="icon-button" aria-label="Çalışma ayrıntılarını aç" aria-expanded="false" title="Çalışma ayrıntıları">◧</button></div></header>
+   <div class="project-metrics-bar" id="project-metrics-bar">
+    <div class="metrics-bar-left">
+      <div class="metric-item" id="metric-proj-badge" title="Aktif Projeyi Değiştir">
+        <span class="metric-icon">📁</span>
+        <div class="metric-info">
+          <span class="metric-label">Proje</span>
+          <strong id="metric-proj-name">İş Geliştirme Projesi</strong>
+        </div>
+      </div>
+      <div class="metric-divider"></div>
+      <div class="metric-item" title="Bu projede harcanan toplam token">
+        <span class="metric-icon">🔥</span>
+        <div class="metric-info">
+          <span class="metric-label">Harcanan Token</span>
+          <strong id="metric-total-tokens">0</strong>
+        </div>
+      </div>
+      <div class="metric-divider"></div>
+      <div class="metric-item" title="Bu projede başarıyla yürütülen toplam plan adımları">
+        <span class="metric-icon">✓</span>
+        <div class="metric-info">
+          <span class="metric-label">Tamamlanan Adım</span>
+          <strong id="metric-total-steps">0</strong>
+        </div>
+      </div>
+      <div class="metric-divider"></div>
+      <div class="metric-item" title="Bu proje için tanımlı aktif proaktif tetikleyiciler">
+        <span class="metric-icon">⚡</span>
+        <div class="metric-info">
+          <span class="metric-label">Planlanan Tetikleyici</span>
+          <strong id="metric-active-triggers">0</strong>
+        </div>
+      </div>
+    </div>
+    <div class="metrics-bar-right">
+      <button type="button" class="metric-action-btn" id="metric-refresh-btn" title="Model ve Metrikleri Yenile">↻ Modelleri Tara</button>
+    </div>
+   </div>
+  <main>
+   <section id="chat-page" class="chat-page">
+    <div id="messages" class="messages">
+     <div id="welcome" class="welcome">
+      <div class="welcome-emblem">◈</div><p class="welcome-kicker">Ajanlarınız, tek bir çalışma alanında.</p>
+      <h2>Bir hedef verin.<br>Planı birlikte ilerletelim.</h2>
+      <p>Göreviniz adımlara ayrılsın, uzman alt ajanlar çalışsın.<br>Her adımı, ConPTY terminalini, çıktıyı ve durumu buradan takip edin.</p>
+      <div class="prompt-examples">
+       <button data-example="GitHub merkezli iş geliştirme ve proje yönetim uygulaması: Timeline, otomatik Git commit, Google Drive raporları ve yerel masaüstü arayüzü hazırla."><span>⌘</span><b>GitHub & Drive İş Yönetimi</b><small>Zaman çizelgesi, versiyonlama ve raporlama</small></button>
+       <button data-example="Bu projenin mimarisini incele; darboğazları ve uygulanabilir iyileştirmeleri bir raporda açıkla."><span>⋈</span><b>Mimariyi incele</b><small>Bağımlılıkları ve darboğazları bul</small></button>
+       <button data-example="Kullanıcı kimlik doğrulama servisi için API sözleşmesi ve test senaryoları hazırla."><span>▤</span><b>API ve test planı</b><small>Bağımsız adımlarla ilerle</small></button>
+      </div>
+      <div class="welcome-foot"><i class="status-dot"></i>Plan, adımlar ve çıktılar yerel olarak kaydedilir.</div>
+     </div>
+     <div id="run-content" hidden></div>
+    </div>
+    <div class="composer-zone">
+     <div id="conversation-progress" class="conversation-progress" hidden role="status"></div>
+     <div id="job-banner" class="job-banner" hidden><span id="job-label" role="status"></span><button id="cancel-job" class="danger-text">İptal et</button></div>
+     <form id="composer" class="composer">
+      <div class="composer-top"><span class="composer-flow-label">Birlikte ilerleyelim</span><button type="button" class="settings-open settings-pill">⚙ <span>Ayarlar</span></button></div>
+      <label class="sr-only" for="prompt">Mesajınız veya göreviniz</label><textarea id="prompt" maxlength="32000" rows="2" placeholder="Hangi hedef üzerinde çalışalım? (Enter ile gönderin, Shift+Enter ile yeni satır)"></textarea>
+      <div id="attachment-list" class="attachment-list" aria-live="polite" hidden></div>
+      <div class="composer-bottom"><div class="model-controls"><label id="planner-model-control" hidden>Planlayıcı<select id="planner-model" aria-label="Planlayıcı model"><option value="">Yükleniyor…</option></select></label><label id="chat-model-control">Ajan<select id="chat-model" aria-label="Ajan"><option value="">Yükleniyor…</option></select></label><label class="planning-level-control" title="Planın kapsam ve ayrıntısını belirler; otomatik olarak daha fazla ajan çağırmaz.">Planlama<select id="planning-level" aria-label="Planlama düzeyi"><option value="fast">Hızlı</option><option value="balanced">Dengeli</option><option value="detailed">Ayrıntılı</option></select></label></div><div class="composer-submit-actions"><input id="attachment-input" type="file" multiple hidden><button type="button" id="attach-button" class="attach-button" title="Resim veya dosya ekle" aria-label="Resim veya dosya ekle">📎</button><button id="send-button" class="send-button" title="Görevi gönder" aria-label="Görevi gönder">↑</button></div></div>
+      <div class="composer-permission">
+        <label><input id="allow-writes" type="checkbox"> Dosya yazma izni</label>
+        <div class="composer-context-tags">
+         <button type="button" class="ctx-tag" id="ctx-memory-btn" title="Kalıcı Bellek kurallarını incele">🧠 Hafıza Aktif</button>
+        </div>
+       </div>
+     </form>
+     <div class="composer-hint"><span>Enter gönderir, Shift + Enter yeni satır açar.</span><span id="mode-hint">Sorunuzu veya yapmak istediğiniz işi yazın. Gerektiğinde planı inceleyip onaylayabilirsiniz.</span></div>
+    </div>
+   </section>
+   <section id="data-page" class="data-page" hidden></section>
+  </main>
+  <footer class="workspace-footer"><span><i class="status-dot"></i>Yerel API</span><span id="footer-state">Bağlanıyor</span><span id="version-label">Agent Manager</span></footer>
+ </div>
+  <aside id="inspector" class="inspector">
+   <div class="inspector-heading"><b>Plan ayrıntıları</b><button id="close-inspector" class="icon-button" aria-label="Çalışma ayrıntılarını kapat">×</button></div>
+   <div class="inspector-tabs" role="tablist" aria-label="Plan ayrıntıları">
+    <button data-tab="flow" role="tab" aria-selected="true" title="Plan">Plan</button>
+    <button data-tab="output" role="tab" aria-selected="false" title="Çıktılar">Çıktılar</button>
+    <details class="inspector-more">
+     <summary title="Diğer ayrıntılar"><span id="inspector-more-label">Diğer</span> <span aria-hidden="true">⌄</span></summary>
+     <div class="inspector-more-menu">
+      <button data-tab="terminals" role="tab" aria-selected="false" title="Çalışan ajanlar">Ajanlar ve terminaller</button>
+      <button data-tab="personas" role="tab" aria-selected="false" title="Uzmanlar">Uzmanlar</button>
+      <button data-tab="chat" role="tab" aria-selected="false" title="Plan hakkında konuş">Plan sohbeti</button>
+      <button data-tab="events" role="tab" aria-selected="false" title="Etkinlikler">Etkinlikler</button>
+     </div>
+    </details>
+   </div>
+   <div id="inspector-content" class="inspector-content">
+    <div class="inspector-empty"><span>⋈</span><h3>Henüz bir görev yok</h3><p>Plan, alt ajanlar, persona kartları ve canlı sohbet burada görünür.</p></div>
+   </div>
+   <div class="inspector-foot">Seçtiğiniz planın ayrıntıları</div>
+  </aside>
+</div>
+  <dialog id="project-dialog" class="project-dialog-compact">
+   <div class="project-dialog-shell">
+    <header class="dialog-header">
+     <div>
+      <h2>Projeler</h2>
+      <p>Çalışmak istediğiniz projeyi seçin</p>
+     </div>
+     <div class="project-dialog-top-actions">
+      <button type="button" id="btn-toggle-new-proj" class="project-add-toggle-btn">＋ Yeni Proje</button>
+      <button type="button" class="icon-button dialog-close" id="close-project-dialog">×</button>
+     </div>
+    </header>
+    <div class="dialog-body">
+     <div id="project-list" class="project-compact-list"></div>
+     <form id="create-project-form" class="project-compact-create-form" hidden>
+      <h4>Yeni Proje Oluştur</h4>
+      <label>Proje Adı<input type="text" id="new-proj-name" placeholder="Örn: Mobil E-Ticaret" required></label>
+      <label>Proje Klasör Yolu<input type="text" id="new-proj-path" placeholder="Örn: C:\Projeler\mobil" required><small>Ajanların dosya okuyup yazacağı yerel çalışma dizini</small></label>
+      <div class="project-form-btns">
+       <button type="button" id="btn-cancel-new-proj" class="outline-button">Vazgeç</button>
+       <button type="submit" class="primary-button">Oluştur ve Geç</button>
+      </div>
+     </form>
+    </div>
+   </div>
+  </dialog>
+  <dialog id="settings-dialog"><form id="settings-form"><header class="dialog-header"><div><h2>Yapılandırma</h2><p>Bu ayarlar yeni gönderdiğiniz görevlerde kullanılır.</p></div><button type="button" class="icon-button dialog-close" aria-label="Ayarları kapat">×</button></header><div class="dialog-body"><label>Proje klasörü<input id="workspace-path" type="text" spellcheck="false" autocomplete="off" required><small>CLI ajanlarının çalışacağı yerel klasör.</small></label><label>Yürütme altyapısı<select id="execution-backend"><option value="cao">Gömülü CAO (Windows - ConPTY)</option><option value="direct">Doğrudan CLI</option><option value="ao">Agent Orchestrator (AO)</option></select><small id="backend-readiness">Altyapı durumu yükleniyor…</small></label><div class="settings-grid"><label>Adım zaman aşımı (saniye)<input id="timeout-seconds" type="number" min="10" max="1800" value="900" required></label><label>Paralel adım sınırı<input id="max-parallel" type="number" min="1" max="8" value="4" required></label></div><div class="notice" id="backend-note">Gömülü CAO, Windows üzerinde Codex ve Antigravity ajanlarını ConPTY terminalleriyle yönetir. LangGraph planı hazırlar ve denetler.</div></div><footer class="dialog-footer"><button type="button" class="outline-button dialog-close">Vazgeç</button><button class="primary-button">Ayarları kaydet</button></footer></form></dialog>
+  <dialog id="plan-dialog"><form id="plan-form"><header class="dialog-header"><div><h2>Planı düzenle</h2><p>Adım kimlikleri, model ve bağımlılıklar sunucuda doğrulanır.</p></div><button type="button" class="icon-button dialog-close" aria-label="Plan düzenleyiciyi kapat">×</button></header><div class="dialog-body"><label for="plan-json">Adımlar (JSON)</label><textarea id="plan-json" class="code-input" rows="18" required spellcheck="false"></textarea><p id="plan-error" class="form-error" role="alert" hidden></p></div><footer class="dialog-footer"><button type="button" class="outline-button dialog-close">Vazgeç</button><button class="primary-button">Planı kaydet</button></footer></form></dialog>
+  <dialog id="terminal-modal"><div class="dialog-header"><div><h2 id="terminal-modal-title">Terminal Çıktısı</h2><p id="terminal-modal-subtitle">ConPTY Canlı Terminal Akışı</p></div><button type="button" class="icon-button dialog-close" id="close-terminal-modal">×</button></div><div class="dialog-body"><pre id="terminal-modal-output" class="terminal-view"></pre></div><footer class="dialog-footer"><button type="button" class="outline-button" id="refresh-terminal-btn">Yenile</button><button type="button" class="primary-button dialog-close" id="dismiss-terminal-btn">Kapat</button></footer></dialog>
+  <dialog id="model-switch-dialog"><form id="model-switch-form"><header class="dialog-header"><div><h2 id="model-switch-title">Ajanı / Modeli Değiştir</h2><p id="model-switch-subtitle">Kotanın dolmasını beklemeden bu adım için alternatif bir model seçin.</p></div><button type="button" class="icon-button dialog-close" id="close-model-switch">×</button></header><div class="dialog-body"><label>Seçilecek Model<select id="switch-model-select" required></select><small>Seçilen model bu adım için derhal devreye alınacak ve adım yeniden başlatılacaktır.</small></label></div><footer class="dialog-footer"><button type="button" class="outline-button dialog-close" id="cancel-model-switch">Vazgeç</button><button class="primary-button" id="confirm-model-switch-btn" type="submit">Modeli Değiştir ve Devam Et</button></footer></form></dialog>
+<div id="toast" class="toast" role="status" hidden></div>
+<link rel="stylesheet" href="/ui/vendor/xterm/xterm.css">
+<dialog id="live-terminal-modal" class="live-terminal-modal"><header class="dialog-header"><div><h2 id="live-terminal-title">Canlı terminal</h2><p id="live-terminal-status" role="status">Bağlanıyor…</p></div><button type="button" class="icon-button" id="close-live-terminal" aria-label="Canlı terminali kapat">×</button></header><div id="live-terminal-host" class="live-terminal-host" aria-label="Çalışan ajan terminali"></div><footer class="dialog-footer"><span class="live-terminal-hint">Klavye girişleri çalışan ajana iletilir. Bu pencereyi kapatmak görevi durdurmaz.</span><button type="button" class="outline-button" id="reconnect-live-terminal">Yeniden bağlan</button></footer></dialog>
+<script src="/ui/vendor/xterm/xterm.js"></script>
+<script src="/ui/vendor/xterm/addon-fit.js"></script>
+<script type="module" src="/ui/app.js?v=compact-clean-20261029"></script>
+</body></html>

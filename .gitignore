@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Node.js & Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# User Data & Private State (Never Commit)
+agent-manager/data/runs/
+agent-manager/data/checkpoints/
+agent-manager/data/remote_token.txt
+agent-manager/data/active_run.json
+agent-manager/data/chat_history.json
+agent-manager/data/*.sqlite
+agent-manager/data/*.sqlite-journal
+agent-manager/data/*.sqlite-shm
+agent-manager/data/*.sqlite-wal
+agent-manager/work/
+work/
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Android Build artifacts
+agent-remote-android/bin/
+agent-remote-android/gen/
+agent-remote-android/build_temp/
+*.idsig

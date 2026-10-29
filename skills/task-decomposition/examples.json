@@ -1,0 +1,416 @@
+[
+  {
+    "request": "Write one greeting sentence.",
+    "plan": {
+      "task_type": "text_generation",
+      "complexity": "simple",
+      "execution_mode": "direct",
+      "reasoning": "One independently verifiable deliverable needs one step.",
+      "steps": [
+        {
+          "id": "greeting",
+          "description": "Write the requested sentence.",
+          "dependencies": [],
+          "capability": "general",
+          "suggested_model": "",
+          "expected_output": "One greeting sentence",
+          "validation_criteria": [
+            "Contains a greeting and exactly one sentence"
+          ],
+          "shared_resources": [],
+          "test_phase": "run",
+          "substeps": [],
+          "decomposition_reason": "One bounded deliverable with a single ownership and acceptance boundary."
+        }
+      ]
+    }
+  },
+  {
+    "request": "Plan a backend and frontend feature with integration tests.",
+    "plan": {
+      "task_type": "software",
+      "complexity": "complex",
+      "execution_mode": "mixed",
+      "reasoning": "Agree on the contract before independent implementation; integrate both outputs.",
+      "steps": [
+        {
+          "id": "contract",
+          "description": "Define API inputs, outputs, errors and ownership.",
+          "dependencies": [],
+          "capability": "architecture",
+          "suggested_model": "",
+          "expected_output": "API contract and file ownership agreement",
+          "validation_criteria": [
+            "Both implementations can proceed from the contract"
+          ],
+          "shared_resources": [],
+          "test_phase": "run",
+          "substeps": [],
+          "decomposition_reason": "One bounded deliverable with a single ownership and acceptance boundary."
+        },
+        {
+          "id": "backend",
+          "description": "Implement backend against the contract in its assigned files.",
+          "dependencies": [
+            "contract"
+          ],
+          "capability": "backend",
+          "suggested_model": "",
+          "expected_output": "Backend implementation",
+          "validation_criteria": [
+            "Contract tests pass"
+          ],
+          "shared_resources": [],
+          "test_phase": "run",
+          "substeps": [],
+          "decomposition_reason": "One bounded deliverable with a single ownership and acceptance boundary."
+        },
+        {
+          "id": "frontend",
+          "description": "Implement frontend against the contract using mocks in its assigned files.",
+          "dependencies": [
+            "contract"
+          ],
+          "capability": "frontend",
+          "suggested_model": "",
+          "expected_output": "Frontend implementation",
+          "validation_criteria": [
+            "UI tests pass against contract mocks"
+          ],
+          "shared_resources": [],
+          "test_phase": "run",
+          "substeps": [],
+          "decomposition_reason": "One bounded deliverable with a single ownership and acceptance boundary."
+        },
+        {
+          "id": "integration",
+          "description": "Integrate implementations and verify the complete feature.",
+          "dependencies": [
+            "backend",
+            "frontend"
+          ],
+          "capability": "review",
+          "suggested_model": "",
+          "expected_output": "Integrated feature and verification report",
+          "validation_criteria": [
+            "End-to-end tests pass",
+            "All requested requirements are checked"
+          ],
+          "shared_resources": [],
+          "test_phase": "run",
+          "substeps": [],
+          "decomposition_reason": "One bounded deliverable with a single ownership and acceptance boundary."
+        }
+      ]
+    }
+  },
+  {
+    "request": "Build an offline Turkish workshop stock and order application with persistence, accessible UI and automated checks. Keep data small and use no external library.",
+    "plan": {
+      "task_type": "software",
+      "complexity": "complex",
+      "execution_mode": "mixed",
+      "reasoning": "One contract unlocks independent file owners and contract-based test authorship; integration executes tests after all required artifacts exist.",
+      "steps": [
+        {
+          "id": "contract",
+          "description": "Define the data schema, module exports, DOM IDs, stock invariants and exact file ownership.",
+          "dependencies": [],
+          "capability": "architecture",
+          "task_kind": "architecture",
+          "difficulty": "standard",
+          "risk": "low",
+          "complexity_score": 5,
+          "complexity_reason": "Define the data schema, module exports, DOM IDs, stock invariants and exact file ownership.",
+          "suggested_model": "",
+          "effort": "",
+          "expected_output": "Compact contract usable by independent implementers",
+          "validation_criteria": [
+            "Schema, function inputs/outputs and completion invariants are explicit"
+          ],
+          "shared_resources": [],
+          "read_paths": [],
+          "write_paths": [
+            "work/workshop/contract.json"
+          ],
+          "test_phase": "run",
+          "substeps": [],
+          "decomposition_reason": "One bounded deliverable with a single ownership and acceptance boundary."
+        },
+        {
+          "id": "fixtures",
+          "description": "Create six materials and four sample orders matching the fixed contract.",
+          "dependencies": [
+            "contract"
+          ],
+          "capability": "data",
+          "task_kind": "data",
+          "difficulty": "trivial",
+          "risk": "low",
+          "complexity_score": 2,
+          "complexity_reason": "Create six materials and four sample orders matching the fixed contract.",
+          "suggested_model": "",
+          "effort": "",
+          "expected_output": "Small fixture module",
+          "validation_criteria": [
+            "Unique IDs, valid material references and nonnegative quantities"
+          ],
+          "shared_resources": [],
+          "read_paths": [
+            "work/workshop/contract.json"
+          ],
+          "write_paths": [
+            "work/workshop/data.js"
+          ],
+          "test_phase": "run",
+          "substeps": [],
+          "decomposition_reason": "One bounded deliverable with a single ownership and acceptance boundary."
+        },
+        {
+          "id": "styles",
+          "description": "Implement responsive layout, focus indicators and overflow handling for the contracted DOM.",
+          "dependencies": [
+            "contract"
+          ],
+          "capability": "frontend",
+          "task_kind": "frontend",
+          "difficulty": "trivial",
+          "risk": "low",
+          "complexity_score": 3,
+          "complexity_reason": "Implement responsive layout, focus indicators and overflow handling for the contracted DOM.",
+          "suggested_model": "",
+          "effort": "",
+          "expected_output": "Standalone stylesheet",
+          "validation_criteria": [
+            "Readable narrow layout and visible keyboard focus"
+          ],
+          "shared_resources": [],
+          "read_paths": [
+            "work/workshop/contract.json"
+          ],
+          "write_paths": [
+            "work/workshop/styles.css"
+          ],
+          "test_phase": "run",
+          "substeps": [],
+          "decomposition_reason": "One bounded deliverable with a single ownership and acceptance boundary."
+        },
+        {
+          "id": "logic",
+          "description": "Implement pure stock feasibility, shortage calculation and idempotent order completion functions.",
+          "dependencies": [
+            "contract"
+          ],
+          "capability": "logic",
+          "task_kind": "logic",
+          "difficulty": "standard",
+          "risk": "medium",
+          "complexity_score": 6,
+          "complexity_reason": "Implement pure stock feasibility, shortage calculation and idempotent order completion functions.",
+          "suggested_model": "",
+          "effort": "",
+          "expected_output": "Pure exported calculation and state transition module",
+          "validation_criteria": [
+            "Shared stock cannot be double allocated; completion cannot deduct twice"
+          ],
+          "shared_resources": [],
+          "read_paths": [
+            "work/workshop/contract.json"
+          ],
+          "write_paths": [
+            "work/workshop/logic.js"
+          ],
+          "test_phase": "run",
+          "substeps": [],
+          "decomposition_reason": "One bounded deliverable with a single ownership and acceptance boundary."
+        },
+        {
+          "id": "ui",
+          "description": "Implement contracted DOM, controls and local persistence using the specified module imports and exports.",
+          "dependencies": [
+            "contract"
+          ],
+          "capability": "frontend",
+          "task_kind": "frontend",
+          "difficulty": "standard",
+          "risk": "low",
+          "complexity_score": 5,
+          "complexity_reason": "Implement contracted DOM, controls and local persistence using the specified module imports and exports.",
+          "suggested_model": "",
+          "effort": "",
+          "expected_output": "UI module and page wired to contracted interfaces",
+          "validation_criteria": [
+            "Accessible controls, persistent state and meaningful empty/error states"
+          ],
+          "shared_resources": [],
+          "read_paths": [
+            "work/workshop/contract.json"
+          ],
+          "write_paths": [
+            "work/workshop/index.html",
+            "work/workshop/app.js"
+          ],
+          "test_phase": "run",
+          "substeps": [
+            {
+              "id": "interaction",
+              "description": "Implement contracted event wiring, rendering, local persistence and invalid stored-state handling in the UI module.",
+              "phase": "work",
+              "dependencies": [],
+              "capability": "frontend",
+              "task_kind": "frontend",
+              "difficulty": "standard",
+              "complexity_score": 5,
+              "complexity_reason": "Coordinate rendering and persistent state with contracted pure functions and DOM controls.",
+              "risk": "medium",
+              "expected_output": "UI interaction and persistence module",
+              "validation_criteria": [
+                "Module uses the agreed DOM IDs and pure function exports",
+                "State reload and invalid storage handling are defined"
+              ],
+              "read_paths": [
+                "work/workshop/contract.json"
+              ],
+              "write_paths": [
+                "work/workshop/app.js"
+              ],
+              "skill_ids": [],
+              "mcp_server_ids": []
+            },
+            {
+              "id": "markup",
+              "description": "Create the accessible contracted HTML structure, controls and DOM IDs; reference the agreed stylesheet and module.",
+              "phase": "work",
+              "dependencies": [
+                "interaction"
+              ],
+              "capability": "frontend",
+              "task_kind": "frontend",
+              "difficulty": "trivial",
+              "complexity_score": 3,
+              "complexity_reason": "Fixed semantic markup and named controls against an existing DOM contract.",
+              "risk": "low",
+              "expected_output": "Accessible HTML page matching contracted DOM IDs",
+              "validation_criteria": [
+                "All contracted control and status IDs exist exactly once",
+                "Controls have labels and native keyboard semantics"
+              ],
+              "read_paths": [
+                "work/workshop/contract.json"
+              ],
+              "write_paths": [
+                "work/workshop/index.html"
+              ],
+              "skill_ids": [],
+              "mcp_server_ids": []
+            }
+          ],
+          "decomposition_reason": "Markup and interaction/persistence have separate ownership and checks; contract defines DOM IDs, and HTML waits for its referenced module so asset validation has evidence."
+        },
+        {
+          "id": "test_authoring",
+          "description": "Author executable stock invariant tests from contract examples without reading unfinished implementation.",
+          "dependencies": [
+            "contract"
+          ],
+          "capability": "tests",
+          "task_kind": "tests",
+          "difficulty": "standard",
+          "risk": "low",
+          "complexity_score": 4,
+          "complexity_reason": "Author executable stock invariant tests from contract examples without reading unfinished implementation.",
+          "suggested_model": "",
+          "effort": "",
+          "expected_output": "Automated tests importing contracted pure functions",
+          "validation_criteria": [
+            "Tests cover shortages, competing orders, repeated completion and invalid quantities"
+          ],
+          "shared_resources": [],
+          "read_paths": [
+            "work/workshop/contract.json"
+          ],
+          "write_paths": [
+            "work/workshop/tests.js"
+          ],
+          "test_phase": "author",
+          "substeps": [],
+          "decomposition_reason": "One bounded deliverable with a single ownership and acceptance boundary."
+        },
+        {
+          "id": "integration",
+          "description": "Read all produced modules, wire and correct interface mismatches; execute the authored tests and report actual results.",
+          "dependencies": [
+            "fixtures",
+            "styles",
+            "logic",
+            "ui",
+            "test_authoring"
+          ],
+          "capability": "verification",
+          "task_kind": "verification",
+          "difficulty": "standard",
+          "risk": "medium",
+          "complexity_score": 5,
+          "complexity_reason": "Read all produced modules, wire and correct interface mismatches; execute the authored tests and report actual results.",
+          "suggested_model": "",
+          "effort": "",
+          "expected_output": "Integrated application with actual test results",
+          "validation_criteria": [
+            "Automated tests pass or concrete failures are reported; no invented browser verification"
+          ],
+          "shared_resources": [],
+          "read_paths": [
+            "work/workshop/contract.json",
+            "work/workshop/data.js",
+            "work/workshop/styles.css",
+            "work/workshop/logic.js",
+            "work/workshop/index.html",
+            "work/workshop/app.js",
+            "work/workshop/tests.js"
+          ],
+          "write_paths": [
+            "work/workshop/app.js"
+          ],
+          "test_phase": "run",
+          "substeps": [],
+          "decomposition_reason": "One bounded deliverable with a single ownership and acceptance boundary."
+        },
+        {
+          "id": "final_review",
+          "description": "Inspect integrated behavior including persistence, narrow viewport and keyboard access; write concise launch instructions.",
+          "dependencies": [
+            "integration"
+          ],
+          "capability": "verification",
+          "task_kind": "verification",
+          "difficulty": "standard",
+          "risk": "low",
+          "complexity_score": 4,
+          "complexity_reason": "Inspect integrated behavior including persistence, narrow viewport and keyboard access; write concise launch instructions.",
+          "suggested_model": "",
+          "effort": "",
+          "expected_output": "User-facing instructions and evidenced verification report",
+          "validation_criteria": [
+            "Check results name tools used and distinguish checks that could not run"
+          ],
+          "shared_resources": [],
+          "read_paths": [
+            "work/workshop/contract.json",
+            "work/workshop/data.js",
+            "work/workshop/styles.css",
+            "work/workshop/logic.js",
+            "work/workshop/index.html",
+            "work/workshop/app.js",
+            "work/workshop/tests.js"
+          ],
+          "write_paths": [
+            "work/workshop/README.md"
+          ],
+          "test_phase": "run",
+          "substeps": [],
+          "decomposition_reason": "One bounded deliverable with a single ownership and acceptance boundary."
+        }
+      ]
+    }
+  }
+]

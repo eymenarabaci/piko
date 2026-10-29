@@ -1,0 +1,1213 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "id": "gemini-3.8-flash-low",
+      "provider": "antigravity",
+      "cli": "agy",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "low"
+      ],
+      "priority": {
+        "general": 5,
+        "development": 5,
+        "reviewer": 5,
+        "master": 30
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Preserved existing application CLI identity; capabilities and effort are operator configuration, not verified provider catalog facts."
+      },
+      "base_model": "gemini-3.8-flash",
+      "default_effort": "low",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "agy models",
+      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-3.8-flash-medium",
+      "provider": "antigravity",
+      "cli": "agy",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "medium"
+      ],
+      "priority": {
+        "general": 7,
+        "development": 7,
+        "reviewer": 7,
+        "master": 25
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Preserved existing application CLI identity; capabilities and effort are operator configuration, not verified provider catalog facts."
+      },
+      "base_model": "gemini-3.8-flash",
+      "default_effort": "medium",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "agy models",
+      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-argon-medium",
+      "provider": "antigravity",
+      "cli": "agy",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "medium"
+      ],
+      "priority": {
+        "general": 12,
+        "development": 12,
+        "reviewer": 12,
+        "master": 9
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Preserved existing application CLI identity; capabilities and effort are operator configuration, not verified provider catalog facts."
+      },
+      "base_model": "gemini-4-argon",
+      "default_effort": "medium",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "agy models",
+      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "claude-sonnet-5-5-medium",
+      "provider": "antigravity",
+      "cli": "agy",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "medium"
+      ],
+      "priority": {
+        "general": 11,
+        "development": 11,
+        "reviewer": 11,
+        "master": 8
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Preserved existing application CLI identity; capabilities and effort are operator configuration, not verified provider catalog facts."
+      },
+      "base_model": "claude-sonnet-5-5",
+      "default_effort": "medium",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "agy models",
+      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "claude-opus-5-5-high",
+      "provider": "antigravity",
+      "cli": "agy",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "high"
+      ],
+      "priority": {
+        "general": 30,
+        "development": 30,
+        "reviewer": 30,
+        "master": 10
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Preserved existing application CLI identity; capabilities and effort are operator configuration, not verified provider catalog facts."
+      },
+      "base_model": "claude-opus-5-5",
+      "default_effort": "high",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "agy models",
+      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "codex",
+      "provider": "codex",
+      "cli": "codex",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [],
+      "priority": {
+        "master": 100,
+        "development": 100,
+        "reviewer": 100
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "user_configured",
+        "capabilities": "user_configured",
+        "effort_levels": "user_configured",
+        "provider_catalog_verified": false,
+        "note": "Operator-configured Codex CLI candidate and preferred roles. This alias does not assert a model ID or CLI effort support. Quota restoration was user-reported; no live observation has been made."
+      },
+      "base_model": "gpt-6.1-sol",
+      "default_effort": "",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": null,
+      "catalog_observed_at": null,
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "opencode",
+      "provider": "opencode",
+      "cli": "opencode",
+      "capabilities": [
+        "general",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [],
+      "priority": {
+        "development": 30,
+        "reviewer": 20
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "user_configured",
+        "capabilities": "user_configured",
+        "effort_levels": "user_configured",
+        "provider_catalog_verified": false,
+        "note": "Generic OpenCode CLI identity for the embedded CAO backend. It uses the CLI account default model and does not assert model entitlement or quota."
+      },
+      "base_model": "",
+      "default_effort": "",
+      "hidden": true,
+      "execution_supported": false,
+      "catalog_source": null,
+      "catalog_observed_at": null,
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "qwen3.5:4b",
+      "provider": "ollama",
+      "cli": null,
+      "capabilities": [
+        "architect",
+        "task_decomposition",
+        "general",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [],
+      "priority": {
+        "architect": 18,
+        "general": 3,
+        "development": 30,
+        "reviewer": 30
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "local_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "user_configured",
+        "provider_catalog_verified": false,
+        "note": "Configured local Task Architect identity; live model availability has not been checked by this registry."
+      },
+      "base_model": "Qwen/Qwen3.5-4B",
+      "default_effort": "",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "ollama /api/tags",
+      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
+      "quantization": "Q4_K_M",
+      "parameter_size": "4.2B",
+      "digest": "d8b0f5e9760cd1682034f292d7ef72ec46f432149be0df7574bf2d6e92e38c04",
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "gemini-4-argon-high",
+      "provider": "antigravity",
+      "cli": "agy",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "high"
+      ],
+      "priority": {
+        "general": 20,
+        "development": 20,
+        "reviewer": 20,
+        "master": 9
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "gemini-4-argon",
+      "default_effort": "high",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "agy models",
+      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-4-argon-low",
+      "provider": "antigravity",
+      "cli": "agy",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "low"
+      ],
+      "priority": {
+        "general": 13,
+        "development": 13,
+        "reviewer": 13,
+        "master": 15
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "gemini-4-argon",
+      "default_effort": "low",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "agy models",
+      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gemini-3.8-flash-high",
+      "provider": "antigravity",
+      "cli": "agy",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "high"
+      ],
+      "priority": {},
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "gemini-3.8-flash",
+      "default_effort": "high",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "agy models",
+      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "claude-opus-5-5-low",
+      "provider": "antigravity",
+      "cli": "agy",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "low"
+      ],
+      "priority": {},
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "claude-opus-5-5",
+      "default_effort": "low",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "agy models",
+      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "claude-opus-5-5-medium",
+      "provider": "antigravity",
+      "cli": "agy",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "medium"
+      ],
+      "priority": {},
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "claude-opus-5-5",
+      "default_effort": "medium",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "agy models",
+      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "claude-sonnet-5-5-low",
+      "provider": "antigravity",
+      "cli": "agy",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "low"
+      ],
+      "priority": {
+        "general": 9,
+        "development": 9,
+        "reviewer": 9,
+        "master": 18
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "claude-sonnet-5-5",
+      "default_effort": "low",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "agy models",
+      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "claude-sonnet-5-5-high",
+      "provider": "antigravity",
+      "cli": "agy",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "high"
+      ],
+      "priority": {
+        "general": 19,
+        "development": 19,
+        "reviewer": 19,
+        "master": 8
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "claude-sonnet-5-5",
+      "default_effort": "high",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "agy models",
+      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gpt-oss-120b-medium",
+      "provider": "antigravity",
+      "cli": "agy",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "medium"
+      ],
+      "priority": {},
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "gpt-oss-120b",
+      "default_effort": "medium",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "agy models",
+      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "gpt-6.1-sol",
+      "provider": "codex",
+      "cli": "codex",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "priority": {
+        "general": 25,
+        "development": 25,
+        "reviewer": 25,
+        "master": 10
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "gpt-6.1-sol",
+      "default_effort": "low",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "codex models_cache.json",
+      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "gpt-6-astra",
+      "provider": "codex",
+      "cli": "codex",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "priority": {
+        "general": 26,
+        "development": 26,
+        "reviewer": 26,
+        "master": 11
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "gpt-6-astra",
+      "default_effort": "low",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "codex models_cache.json",
+      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "gpt-6-sol",
+      "provider": "codex",
+      "cli": "codex",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "priority": {
+        "general": 27,
+        "development": 27,
+        "reviewer": 27,
+        "master": 12
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "gpt-6-sol",
+      "default_effort": "medium",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "codex models_cache.json",
+      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "gpt-6-luna",
+      "provider": "codex",
+      "cli": "codex",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "priority": {
+        "general": 15,
+        "development": 15,
+        "reviewer": 15,
+        "master": 16
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "gpt-6-luna",
+      "default_effort": "medium",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "codex models_cache.json",
+      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "gpt-reserve",
+      "provider": "codex",
+      "cli": "codex",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "priority": {
+        "general": 100,
+        "master": 100,
+        "development": 100,
+        "reviewer": 100
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "gpt-reserve",
+      "default_effort": "medium",
+      "hidden": true,
+      "execution_supported": true,
+      "catalog_source": "codex models_cache.json",
+      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "provider": "codex",
+      "cli": "codex",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "priority": {
+        "general": 28,
+        "development": 28,
+        "reviewer": 28,
+        "master": 13
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "gpt-5.6-sol",
+      "default_effort": "low",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "codex models_cache.json",
+      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "provider": "codex",
+      "cli": "codex",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "priority": {
+        "general": 29,
+        "development": 29,
+        "reviewer": 29,
+        "master": 14
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "gpt-5.6-terra",
+      "default_effort": "medium",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "codex models_cache.json",
+      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "provider": "codex",
+      "cli": "codex",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "priority": {
+        "general": 16,
+        "development": 16,
+        "reviewer": 16,
+        "master": 17
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "gpt-5.6-luna",
+      "default_effort": "medium",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "codex models_cache.json",
+      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "codex-auto-review",
+      "provider": "codex",
+      "cli": "codex",
+      "capabilities": [
+        "general",
+        "master",
+        "development",
+        "reviewer"
+      ],
+      "effort_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "priority": {
+        "general": 100,
+        "master": 100,
+        "development": 100,
+        "reviewer": 100
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "cli_catalog",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "gpt-6-sol",
+      "default_effort": "medium",
+      "hidden": true,
+      "execution_supported": true,
+      "catalog_source": "codex models_cache.json",
+      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "qwen3:1.7b",
+      "provider": "ollama",
+      "cli": null,
+      "capabilities": [
+        "general"
+      ],
+      "effort_levels": [],
+      "priority": {},
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "local_catalog",
+        "capabilities": "user_configured",
+        "effort_levels": "user_configured",
+        "provider_catalog_verified": false,
+        "note": "Catalog metadata only; capabilities are operator defaults. Catalog presence does not verify entitlement, quota or successful execution."
+      },
+      "base_model": "Qwen/Qwen3-1.7B",
+      "default_effort": "",
+      "hidden": false,
+      "execution_supported": false,
+      "catalog_source": "ollama /api/tags",
+      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
+      "quantization": "Q4_K_M",
+      "parameter_size": "2.0B",
+      "digest": "8f68893c685c3ddff2aa3fffce2aa60a30bb2da65ca488b61fff134a4d1730e7",
+      "input_modalities": [
+        "text"
+      ]
+    }
+  ]
+}

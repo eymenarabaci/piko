@@ -1,0 +1,6 @@
+interface:
+  display_name: "Görev Kaynaklarını Temizle"
+  short_description: "İşi biten görev yardımcılarını güvenle kapat"
+  default_prompt: "$resource-cleanup ile bu görevde açılan geçici kaynakları doğrula, işi bitenleri temizle ve sonucu ölç."
+policy:
+  allow_implicit_invocation: true

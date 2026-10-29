@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#090D16">
+  <title>Agent Remote</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <!-- Top App Header -->
+  <header class="mobile-header">
+    <div class="brand">
+      <span class="emblem">◈</span>
+      <div class="brand-info">
+        <span class="title">Agent Remote</span>
+        <span class="subtitle">Codex & LangGraph Mobile</span>
+      </div>
+    </div>
+    <div class="header-right">
+      <button id="btn-quick-settings" class="header-settings-btn" onclick="switchTab('tab-settings')">
+        <span>⚙️</span>
+        <span class="label">Bağlantı</span>
+      </button>
+      <div id="conn-pill" class="conn-pill disconnected" onclick="switchTab('tab-settings')">
+        <span class="dot"></span>
+        <span id="conn-text">Bağlanıyor…</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Top Segmented Navigation Tabs (Always Visible, Never Hidden) -->
+  <nav class="top-nav-tabs">
+    <button class="top-tab-btn active" data-tab="tab-tasks" onclick="switchTab('tab-tasks')">
+      <span>💬</span> Sohbet & Görevler
+    </button>
+    <button class="top-tab-btn" data-tab="tab-new-task" onclick="switchTab('tab-new-task')">
+      <span>＋</span> Yeni Görev
+    </button>
+    <button class="top-tab-btn" data-tab="tab-settings" onclick="switchTab('tab-settings')">
+      <span>⚙️</span> Bağlantı
+    </button>
+    <button class="top-tab-btn" data-tab="tab-system" onclick="switchTab('tab-system')">
+      <span>◇</span> Modeller
+    </button>
+  </nav>
+
+  <!-- Main View Container -->
+  <main class="views-container">
+    <!-- View 1: Tasks / Görevler -->
+    <section id="view-tasks" class="view active">
+      <!-- Disconnected Alert Banner -->
+      <div id="tasks-not-connected-banner" class="card setup-card" hidden>
+        <div class="setup-icon">⚠️</div>
+        <h3>Sunucu Bağlantısı Bekleniyor</h3>
+        <p>Bilgisayarınızdaki Agent Manager'a bağlanmak için Tailscale IP'si ve mobil token gereklidir.</p>
+        <button class="btn btn-primary btn-block" onclick="switchTab('tab-settings')">⚙️ Bağlantı Ayarlarına Git</button>
+      </div>
+
+      <div class="section-title-row">
+        <h2>Aktif & Geçmiş Görevler</h2>
+        <button class="icon-btn" onclick="fetchRuns(true)" title="Yenile">↻</button>
+      </div>
+
+      <div id="runs-list" class="runs-list">
+        <div class="empty-state">
+          <span class="icon">◫</span>
+          <p>Yükleniyor veya henüz görev yok.<br>Üstteki <b>"＋ Yeni Görev"</b> sekmesinden ilk görevinizi başlatabilirsiniz.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Task Detail Modal / Slide-over -->
+    <div id="task-detail-modal" class="detail-modal" hidden>
+      <div class="detail-header">
+        <button class="back-btn" onclick="closeTaskDetail()">← Geri</button>
+        <span id="detail-run-id" class="badge">#run</span>
+        <span id="detail-status" class="status-chip">bekliyor</span>
+      </div>
+
+      <!-- Detail Subtabs (Sohbet / Adımlar / Terminal) -->
+      <div class="detail-subtabs">
+        <button class="detail-subtab-btn active" data-subtab="chat" onclick="switchDetailSubtab('chat')">
+          <span>💬</span> Sohbet & Akış
+        </button>
+        <button class="detail-subtab-btn" data-subtab="steps" onclick="switchDetailSubtab('steps')">
+          <span>📋</span> Plan Adımları (<span id="steps-count-badge">0</span>)
+        </button>
+        <button class="detail-subtab-btn" data-subtab="terminal" onclick="switchDetailSubtab('terminal')">
+          <span>🖥️</span> Terminal Logları
+        </button>
+      </div>
+
+      <!-- Detail Tab 1: Chat & Stream (Sohbet & Akış) -->
+      <div id="detail-pane-chat" class="detail-pane active">
+        <div class="detail-scroll chat-scroll" id="chat-messages-container">
+          <!-- User Goal Bubble -->
+          <div class="chat-bubble user-bubble">
+            <div class="bubble-meta">
+              <span class="avatar">👤</span>
+              <b>Siz</b>
+              <time id="detail-time" class="time-meta">—</time>
+            </div>
+            <div id="detail-prompt" class="bubble-body">—</div>
+          </div>
+
+          <!-- Action Control Banner (Approve / Resume / Abort) -->
+          <div id="detail-actions" class="card actions-card">
+            <div class="actions-header">⚡ Mobil Müdahale & Onay</div>
+            <div class="action-buttons-row">
+              <button id="btn-approve" class="btn btn-primary" onclick="approveAndResume()" hidden>⚡ Planı Onayla ve Yürüt</button>
+              <button id="btn-resume" class="btn btn-secondary" onclick="resumeCurrentRun()" hidden>▶ Devam Et</button>
+              <button id="btn-abort" class="btn btn-danger" onclick="abortCurrentRun()">✕ İptal Et</button>
+            </div>
+          </div>
+
+          <!-- Pending Questions Awaiting User Input -->
+          <div id="detail-pending-questions"></div>
+
+          <!-- Completed Step Summaries -->
+          <div id="detail-step-summaries"></div>
+
+          <!-- Continuous Chat History -->
+          <div id="detail-chat-thread" class="chat-thread-section"></div>
+        </div>
+
+        <!-- Sticky Chat Composer at Bottom -->
+        <div class="chat-composer-box">
+          <form id="detail-chat-form" onsubmit="sendRunMessage(event)" class="detail-composer-form">
+            <input type="text" id="detail-chat-input" placeholder="Orkestratöre bir soru sorun veya yönlendirin…" required autocomplete="off">
+            <button class="btn-send-chat" type="submit" id="btn-send-chat" title="Gönder">➤</button>
+          </form>
+        </div>
+      </div>
+
+      <!-- Detail Tab 2: Plan Steps (Adımlar) -->
+      <div id="detail-pane-steps" class="detail-pane">
+        <div class="detail-scroll">
+          <div class="card steps-card">
+            <div class="card-title">LangGraph Plan Adımları & Alt Ajanlar</div>
+            <div id="detail-steps-list" class="steps-list"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Detail Tab 3: Terminal Logs -->
+      <div id="detail-pane-terminal" class="detail-pane">
+        <div class="detail-scroll">
+          <div class="card terminal-card">
+            <div class="terminal-header">
+              <span>Canlı Çıktı & Terminal Logları</span>
+              <span id="term-live-indicator" class="pulse-dot"></span>
+            </div>
+            <pre id="detail-terminal-logs" class="terminal-logs">Sunucu logları bekleniyor…</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- View 2: New Task / Yeni Görev -->
+    <section id="view-new-task" class="view">
+      <div class="section-title-row">
+        <h2>Yeni Görev Başlat</h2>
+      </div>
+
+      <form id="new-task-form" onsubmit="submitNewTask(event)" class="task-form">
+        <div class="form-group">
+          <label for="task-prompt">Görev veya Talimat</label>
+          <textarea id="task-prompt" required rows="4" placeholder="Ne yapmak istiyorsunuz? (Örn: FastAPI için JWT kimlik doğrulama modülü ve testleri yaz)"></textarea>
+        </div>
+
+        <div class="form-group">
+          <label>Çalışma Modu</label>
+          <div class="mode-chips">
+            <button type="button" class="mode-chip selected" data-mode="orchestrate" onclick="selectMode('orchestrate')">
+              <b>⚡ Otomatik</b>
+              <small>Planla ve çalıştır</small>
+            </button>
+            <button type="button" class="mode-chip" data-mode="plan" onclick="selectMode('plan')">
+              <b>📋 Önce Planla</b>
+              <small>Onay bekler</small>
+            </button>
+            <button type="button" class="mode-chip" data-mode="chat" onclick="selectMode('chat')">
+              <b>💬 Sohbet</b>
+              <small>Tek adım</small>
+            </button>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="task-model">Yürütücü / Planlayıcı Model</label>
+          <select id="task-model">
+            <option value="auto">Otomatik Model Seçici (Önerilen)</option>
+            <option value="qwen2.5-coder:7b">Qwen 2.5 Coder 7B (Yerel RTX 3060)</option>
+            <option value="llama3.2:latest">Llama 3.2 3B (Yerel Hızlı)</option>
+            <option value="deepseek-r1:8b">DeepSeek R1 8B (Yerel Mantık)</option>
+            <option value="gpt-5-codex">Codex CLI</option>
+            <option value="antigravity-gemini-3-flash">Antigravity CLI</option>
+          </select>
+        </div>
+
+        <div class="form-group toggle-group">
+          <label class="toggle-label">
+            <input type="checkbox" id="task-allow-writes">
+            <span class="toggle-slider"></span>
+            <span class="toggle-text">Dosya Değiştirme / Yazma İzni</span>
+          </label>
+        </div>
+
+        <button type="submit" id="btn-submit-task" class="btn btn-primary btn-block">🚀 Görevi Başlat</button>
+      </form>
+    </section>
+
+    <!-- View 3: Hardware & Models / Donanım & Modeller -->
+    <section id="view-system" class="view">
+      <div class="section-title-row">
+        <h2>Sistem & Modeller</h2>
+      </div>
+
+      <div class="card hw-card">
+        <div class="card-title">🖥️ Donanım & Motor</div>
+        <div class="hw-grid">
+          <div class="hw-item">
+            <span class="hw-label">GPU</span>
+            <span class="hw-val">RTX 3060 (6GB)</span>
+          </div>
+          <div class="hw-item">
+            <span class="hw-label">Motor</span>
+            <span class="hw-val">LangGraph + CAO</span>
+          </div>
+          <div class="hw-item">
+            <span class="hw-label">Bugünkü Token</span>
+            <span id="daily-tokens-val" class="hw-val">0</span>
+          </div>
+          <div class="hw-item">
+            <span class="hw-label">CLI Durumu</span>
+            <span id="cli-status-val" class="hw-val">Bağlı</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🤖 Kullanılabilir Modeller</div>
+        <div id="models-list" class="models-list">Yükleniyor…</div>
+      </div>
+    </section>
+
+    <!-- View 4: Connection & Tailscale Settings (Bağlantı Sekmesi) -->
+    <section id="view-settings" class="view">
+      <div class="section-title-row">
+        <h2>⚙️ Sunucu & Bağlantı Ayarları</h2>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🌐 Sunucu Adresi ve Port</div>
+        <p class="card-desc">Bilgisayarınızın Tailscale veya yerel ağ IP adresini girin:</p>
+
+        <div class="quick-ip-row">
+          <span class="quick-label">Hızlı IP Seç:</span>
+          <button type="button" class="preset-chip" onclick="applyPresetHost('http://127.0.0.1:8765')">Wi-Fi (127.0.0.1)</button>
+          <button type="button" class="preset-chip" onclick="applyPresetHost('http://100.')">Tailscale (100.x)</button>
+        </div>
+
+        <div class="form-group" style="margin-top: 10px;">
+          <label for="server-host">Sunucu Adresi (Örn: http://100.x.y.z:8765)</label>
+          <input type="text" id="server-host" placeholder="http://100.x.y.z:8765 veya http://192.168.x.x:8765">
+        </div>
+
+        <div class="form-group">
+          <label for="server-token">Mobil Bearer Token</label>
+          <input type="password" id="server-token" placeholder="Bilgisayar ekranındaki mobil token">
+          <button type="button" class="btn-text" onclick="toggleTokenVisibility()">Şifreyi Göster / Gizle</button>
+        </div>
+
+        <button type="button" class="btn btn-primary btn-block" onclick="testAndSaveConnection()">✓ Kaydet ve Bağlan</button>
+        <div id="conn-test-result" class="conn-result"></div>
+      </div>
+
+      <div class="card guide-card">
+        <div class="card-title">📖 3 Adımda Kolay Bağlantı</div>
+        <ol class="guide-steps">
+          <li>Bilgisayarınızda <code>remote.cmd</code> dosyasını çalıştırın (veya <code>desktop.cmd</code>).</li>
+          <li>Web arayüzündeki <b>Mobil & Tailscale</b> sekmesinden veya konsoldan <b>Mobil Token</b>'ı kopyalayın.</li>
+          <li>Yukarıdaki kutulara yapıştırıp <b>"Kaydet ve Bağlan"</b>a basın.</li>
+        </ol>
+      </div>
+    </section>
+  </main>
+
+  <!-- Bottom Navigation Bar (Synchronized with Top Tabs) -->
+  <nav class="bottom-nav">
+    <button class="nav-btn active" data-tab="tab-tasks" onclick="switchTab('tab-tasks')">
+      <span class="icon">◫</span>
+      <span class="label">Görevler</span>
+    </button>
+    <button class="nav-btn" data-tab="tab-new-task" onclick="switchTab('tab-new-task')">
+      <span class="icon">＋</span>
+      <span class="label">Yeni</span>
+    </button>
+    <button class="nav-btn" data-tab="tab-settings" onclick="switchTab('tab-settings')">
+      <span class="icon">⚙️</span>
+      <span class="label">Bağlantı</span>
+    </button>
+    <button class="nav-btn" data-tab="tab-system" onclick="switchTab('tab-system')">
+      <span class="icon">◇</span>
+      <span class="label">Modeller</span>
+    </button>
+  </nav>
+
+  <script src="app.js"></script>
+</body>
+</html>

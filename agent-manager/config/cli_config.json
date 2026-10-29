@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "description": "Kendi özel CLI veya yerel model bağlantılarınızı buraya tanımlayabilirsiniz.",
+  "custom_clis": [
+    {
+      "name": "ollama",
+      "enabled": true,
+      "type": "http",
+      "base_url": "http://127.0.0.1:11434",
+      "auto_discover": true
+    },
+    {
+      "name": "agy",
+      "enabled": true,
+      "type": "cli",
+      "binary": "agy",
+      "provider": "antigravity"
+    },
+    {
+      "name": "codex",
+      "enabled": true,
+      "type": "cli",
+      "binary": "codex",
+      "provider": "codex"
+    },
+    {
+      "name": "claude",
+      "enabled": false,
+      "type": "cli",
+      "binary": "claude",
+      "provider": "claude"
+    }
+  ],
+  "models": []
+}
