@@ -1,0 +1,494 @@
+---
+name: cao-workflow
+description: Author and run CAO Python workflow scripts — multi-step, parameterized, fan-out
+  orchestrations executed by `cao workflow run`. Use when the user wants a repeatable multi-step
+  job (e.g. data analysis over many files, a review pipeline, a parameterized batch). Authoring
+  ends at a validated script file; running it is a separate, user-approved step.
+---
+
+# CAO Workflows
+
+A CAO workflow is a **Python script** you write, validate, and — only after asking the user —
+run through `cao workflow run`. Each script drives one or more agent *steps* through CAO's
+shared substrate, so you can fan work out across agents, collect their results, and resume a
+run that was interrupted.
+
+> Your job as an author ends at a **validated script file on disk**. Authoring does NOT run the
+> workflow. Never claim a workflow ran, or will run, when all you did was write it. Running is a
+> separate step the user must approve (see Lifecycle step c).
+
+## When to use
+
+Reach for this skill when the user asks to **build or run a multi-step or parameterized
+workflow** — for example:
+
+- "Analyze every file in `reports/` and summarize the findings."
+- "Run a review pipeline: implement, then review, then verify."
+- "Do the same batch job but with a different input directory each time."
+
+If the work is a single one-off agent call, you don't need a workflow. Workflows earn their
+keep when there are multiple steps, fan-out, parameterization, or a need to resume.
+
+## The script API
+
+Author scripts import from the `cao_workflow` package. This package runs **only in the script
+subprocess** and imports nothing from `cli_agent_orchestrator.*` — it talks to CAO over HTTP.
+Its public surface:
+
+- `step(provider, agent, prompt, *, recovery, step_id=None, timeout=None, **opts) -> StepHandle` —
+  run one agent step and **declare** what re-running it would mean. `recovery` is keyword-only
+  with no default, so omitting it is a `TypeError` at the call. See "Declaring a recovery
+  policy" below before you pick a value.
+- `run_step(provider, agent, prompt, *, step_id=None, timeout=None, **opts) -> StepHandle` —
+  the same call, **declaring no policy**. That is the only difference between the two. A
+  `recovery=` passed to `run_step` lands in `**opts`; the server validates it, the shim does
+  not — see below.
+- `StepHandle` has **five** fields: `.step_id`, `.terminal_id`, `.output`, `.status`, and
+  `.replayed`. **`.replayed` qualifies `.terminal_id`.** When it is `True` the server returned
+  a stored result and ran nothing, and `.terminal_id` is the ORIGINAL id — it names a terminal
+  that **no longer exists**. That flag is the only thing standing between you and reading,
+  writing to, or waiting on a dead id, so check it before you touch `.terminal_id`.
+- `get_inputs() -> dict` — the run's resolved inputs (see Parameterized workflows). Returns
+  `{}` when nothing was declared; never raises on absence.
+- `emit_output(value)` — print the run-level `CAO_WORKFLOW_OUTPUT:` sentinel (the run's return).
+- `ShimError` (and `ShimIdentityError`, `ShimTransportError`, `ShimHTTPError`) — the failure
+  hierarchy `step` and `run_step` raise. Failures surface **unchanged** — the shim never
+  retries. A structured HTTP error with a non-empty string `detail.kind` prints as
+  `run-step returned HTTP <status> (<kind>): <message>` (without the message suffix when
+  absent); an unstructured error keeps the original `run-step returned HTTP <status>` text.
+
+## Declaring a recovery policy
+
+`recovery=` is **the author's claim about the step, and nothing more.** CAO has no mechanism to
+prove what a step does to the outside world, so it cannot and does not verify the claim. A
+recovery policy **DECLARES what re-running this step would mean; it never grants permission.**
+
+The three values, all of which are statements you are making, not protections you are getting:
+
+| Value | What you are asserting |
+| --- | --- |
+| `"idempotent"` | re-running this step has the same effect as running it once |
+| `"reconcile"` | re-running it needs a reconciliation step first (**deferred** — today CAO treats it exactly like `idempotent`) |
+| `"manual"` | do not decide this one without me — halt and ask |
+
+**`"idempotent"` grants nothing and protects nothing.** It does not make a step safe to re-run;
+it tells the resume gate that *you* believe it already is — and wherever the gate would otherwise
+stop and ask a human, it re-executes the step on your word instead. Declare it on a step that
+charges a card, sends mail, or files a ticket and CAO will charge the card again, exactly as
+instructed. If you cannot show the step is safe to repeat, `"manual"` is the honest declaration.
+
+Omitting a policy is a **fourth, distinct state** — it is never silently read as `"manual"`. Use
+`run_step` for it deliberately: an undeclared step still replays (replay executes nothing), but
+where the alternative is re-execution it halts for a human.
+
+**`recovery=` on `run_step` is checked late, not never.** `run_step` has no `recovery`
+parameter, so the value rides `**opts` to the server, which stores it, lets the resume gate
+honour it, and **rejects an unknown value with a `422`** — the route types that field as the
+closed policy enum. What `run_step` lacks is `step()`'s client-side check, which refuses a bad
+value *before any HTTP attempt*; on `run_step` a typo instead fails that step mid-run. Neither
+surface has its value checked by `validate` (the linter sees the keyword, not its contents),
+which is why `validate` reports the `run_step` form as `unenforced-recovery-policy`. Use
+`step()` to declare, and `run_step` only to declare nothing.
+
+## Lifecycle
+
+The whole sequence, in order: **describe → author → validate → present plan → approve → run →
+observe**. **No step may be skipped** — validate is mandatory, approval is a human act, and you must
+ask before running.
+
+**Python is the format.** You are never asked to choose between YAML and Python, and you must never
+ask the user to: workflows you author are Python, full stop. (YAML workflows still *run* — they
+predate this — but nothing new is generated in YAML.)
+
+### a. AUTHOR
+
+**Create the spec through CAO, not by writing the file yourself.**
+
+```
+cao workflow create <name> --from-file ./draft.py     # human at a terminal
+workflow_create(name="<name>", source="<the Python>")  # agent, via MCP
+```
+
+Both return the `path` and a `content_hash` — **keep the hash**, because `cao workflow update` /
+`workflow_update` require it to prove you edited the version you last read.
+
+The workflow is **run by its stem** (`<name>`), so the name must be a bare stem — **no path
+separators**, no directory prefix.
+
+Going through `create` rather than writing into
+`~/.aws/cli-agent-orchestrator/workflows/` yourself is what gets you three checks that only exist on
+that path: the write is contained and size-capped, validate-then-index is atomic with it, and a
+**same-stem cross-tier collision is refused before anything is written**. That last one matters more
+than it sounds: a raw write of `<name>.py` beside an existing `<name>.yaml` *succeeds*, and then
+every attempt to run or inspect `<name>` fails with a tier collision — a file that is unreachable
+the moment it lands.
+
+### b. VALIDATE (mandatory gate)
+
+You can lint a **draft that does not exist on disk yet**, which is the cheapest order — validate,
+revise, then create:
+
+```
+workflow_validate(source="<the Python>")               # agent: no file needed
+cao workflow validate ~/.aws/cli-agent-orchestrator/workflows/<name>.py   # a spec on disk
+```
+
+`create` and `update` lint server-side too and **refuse to write** a spec with a blocking error, so
+validating first saves a round trip rather than replacing a check.
+
+Fix **every** finding before proceeding — the lint findings are **load-bearing**, not style
+nits:
+
+- **`import cli_agent_orchestrator` is banned.** The script runs in a separate subprocess and
+  must reach CAO only over HTTP (the `cao_workflow` shim). Importing the server package breaks
+  that boundary.
+- **`random` / `time` / `datetime` / `uuid` warnings.** Resume **re-executes the script
+  top-to-bottom** and replays journaled step results. Any nondeterministic value computed at
+  the top level will differ on replay and raise `ReplayDivergenceError`. Keep the script
+  deterministic: derive IDs from inputs, not from the clock or an RNG.
+- **`missing-recovery-policy` is a blocking ERROR.** A `step()` call with no `recovery=`
+  keyword fails validation — the signature requires one and so does the linter. Two related
+  warnings fire without blocking: `unverifiable-recovery-policy` (a `step()` call passing
+  `**kwargs`, so the linter cannot see whether a policy is in there) and
+  `unenforced-recovery-policy` (a `recovery=` on `run_step`, which is honoured at resume and
+  validated by the server with a `422`, but is not checked client-side before it is sent). See
+  "Declaring a recovery policy" above.
+
+### c. ASK the user — NEVER auto-run
+
+The script tier executes generated Python. **Never run a workflow without the user's explicit
+approval.** Present the validated file and ask before doing anything in steps d–e.
+
+Ask **before** step d, not after it: step d learns the plan identifier by *attempting* the run, and if
+that plan already happens to be approved the attempt does not stop — it executes.
+
+### d. PRESENT THE PLAN and get it APPROVED
+
+**The first run of a new or changed workflow is refused, by design.** A *plan identifier* is computed
+at run start from everything that affects execution, so it does not exist until you try to run — the
+refusal is how you learn it.
+
+Attempt the run. If it is refused, the response tells you which of two things happened, as a
+**field** — read the field, never the sentence:
+
+| `class` / `kind` | What happened | What to do |
+| --- | --- | --- |
+| `approval_required` | this plan has no approval yet | present the `plan_id` to the user and **stop** |
+| `plan_identity_unavailable` | CAO could not compute a plan identifier for the working directory | there is nothing to approve; follow `message`, retrying only when it says so, otherwise tell the user |
+
+On `approval_required`, show the user the identifier and the one command that grants it:
+
+```
+cao workflow approve <plan_id>
+```
+
+Then **stop and wait.** Do not retry the run, do not poll for the approval to appear, and do not look
+for a tool that grants one — **there deliberately isn't one.** An agent that could approve the plan it
+just wrote would make the check decorative in exactly the case it exists for. Approving is a human act
+at a human's terminal.
+
+Once approved, run again and it proceeds. Approval binds the script, its inputs, the working
+directory's state and the installed agent profile set: change any of them and the next run needs its
+own approval. Editing or installing ANY agent profile changes the `plan_id` of every plan, not just
+the plans that name it. Edits to CAO memory, to managed `.env` values a profile references, to
+installed skills or to plugin MCP servers do not change the `plan_id`, so a later run of the same plan
+uses them without asking again. Tell the user whenever you change any of these.
+
+> **This pause is not a defect, and it does not fail FR-10.** The requirement's failure condition is
+> *asking the user to choose a format* — which never happens, since Python is the format. A human
+> approving what is about to execute on their machine is the requirement working.
+
+### e. RUN with an explicit, pre-announced run-id
+
+Announce the run-id before you start so the user can cancel it:
+"Starting run `kb-1` — cancel with `cao workflow cancel kb-1`."
+
+Choose the invocation by how the run is triggered, because the two paths have very
+different client-side ceilings:
+
+- **`cao workflow run` (CLI)** submits the run, prints the run id, then follows it by
+  polling until it finishes. It exits 0 on `completed` and 1 on `failed` or `cancelled`.
+  No single request has to last the whole run. **Ctrl-C detaches and never cancels**: the
+  run keeps going server-side, and `cao workflow wait <id>` picks it up again.
+  - `--detach` submits, prints the id, and exits 0 without following.
+  - `--wait` is the fully blocking path. It holds one request open until the run finishes,
+    with a client socket timeout of **~8820s (~2.45h)**, and is the only `run` form whose
+    `--json` returns the full `WorkflowRunResult`.
+- **`workflow_run` MCP tool** blocks, and is bounded by the **MCP host's own per-tool-call
+  timeout** — a host-dependent, much-shorter limit that can **drop a long blocking call and lose its return
+  value even though the server run keeps going**.
+
+So:
+
+- **Short runs**: call the `workflow_run` MCP tool (blocking) and read the result directly.
+- **Long runs from an agent**: submit without blocking, then poll. Over MCP, call
+  `workflow_start` with the pre-announced run id, then `workflow_status` or
+  `workflow_wait`, then `workflow_result`. From a shell:
+  ```
+  cao workflow run <name> --run-id <id> --detach
+  cao workflow status <id>
+  cao workflow result <id> --json
+  ```
+- **Long runs from a user's terminal**: plain `cao workflow run <name> --run-id <id>` is
+  fine; it follows the run and Ctrl-C only detaches.
+
+### f. RESUME
+
+```
+cao workflow resume <run-id>
+```
+
+Resume **re-executes the script top-to-bottom** — that is what step b's determinism warning is
+about — and the server decides each step call as it arrives. Never assume your top-level code
+does not re-run. Each step lands on one of three outcomes:
+
+- **replayed** — the stored result is returned and **nothing runs**. `StepHandle.replayed` is
+  `True`, and its `.terminal_id` names a terminal that no longer exists.
+- **executed** — the step runs again for real.
+- **halted** — CAO will not decide this one alone, so the run stops there and waits for a human.
+
+A fourth outcome ends the whole run rather than one step: if the script changed at a step's key,
+that step **diverges** and the run fails with `ReplayDivergenceError`. Deterministic scripts (see
+step b) resume clean; nondeterministic ones diverge.
+
+#### Resolving a halt
+
+A halt reaches your script as a `ShimHTTPError` whose `.status` is `409` and whose `.body` names
+`kind: "decision_required"`, the `step_id`, and which condition halted it; `str(exc)` now shows
+`(decision_required)` and the message too. A step halts when its outcome is genuinely unknown or
+unverifiable: it was dispatched and never settled and no declared policy permits re-execution; its
+stored result is unreadable; its recorded provenance cannot be verified under the current scheme;
+or its author declared `recovery="manual"` and asked to see it.
+
+Resolve it by naming a decision per halted step and resuming again:
+
+```
+cao workflow resume <run-id> --decide <step_id>=rerun   # re-execute that step
+cao workflow resume <run-id> --decide <step_id>=skip    # accept its stored result
+```
+
+`--decide` is repeatable, one per halted step.
+
+**A decision authorises exactly ONE attempt.** If that attempt crashes before it settles, the
+next resume asks again rather than re-executing on the old consent. Consent does not carry
+forward — never present one `rerun` to a user as standing authorisation for later resumes.
+
+**Do not let a blanket `except ShimError` swallow a halt** (see R4): `ShimHTTPError` is a
+`ShimError`, so a catch-all around a step absorbs the 409 and the run finishes with a sentinel
+where a human decision was required. Re-raise when `.status == 409`.
+
+### g. OBSERVE — and decide resume vs repair from a field, not a message
+
+```
+cao workflow result <run-id> --json
+workflow_result(run_id="<run-id>")
+```
+
+A failed run's `failure_envelope` carries a **`classification`**. Read it; do not infer the failure
+class from the message, the state, or the status:
+
+| `classification` | What it means | What to do |
+| --- | --- | --- |
+| `transient` | a persisted timeout; the artifact may still be usable | **Retry — transient failure**: resume the same run |
+| `artifact_defect` | `error` and `provider_error` map here. A `provider_error` is the provider refusing the step in band (authentication, quota, unknown model, rate limit). | **Fix the spec — artifact defect.** For `error`: inspect and repair the script before authoring a new run. If the failing step's `error_kind` is `provider_error`: read its error and tell the user; don't edit the script unless it names the wrong model, and don't resume in a loop. |
+| `cancelled` | the run was deliberately cancelled | **Cancelled by a human**: inspect the intent before taking another action; no automatic retry is promised |
+
+`plan_inputs_changed` surfaces later, from an agent step's `POST /terminals/run-step`, rather than
+from the initial run attempt. It reaches your script as a `ShimHTTPError` whose `.status` is `409`
+and whose `.body` names `kind: "plan_inputs_changed"` and the reason; no step is recorded. The run
+record does not carry that `kind`: if the script lets the error escape, the run ends `FAILED` with
+kind `error` (classified `artifact_defect` above) and its stderr tail shows
+`run-step returned HTTP 409 (plan_inputs_changed): <message>`. While approval enforcement is on, it means the recorded profile or
+memory setting changed, the launch state is unreadable, or approval settings could not be read. It
+also means approval enforcement was turned on after this run started. Start a new run for changed
+inputs, unreadable launch state, or newly enabled enforcement. If approval settings could not be
+read, repair `settings.json`, then resume.
+
+This is the second half of what the sequence promises: branch on the emitted field, then resume only a
+known transient timeout. For a provider refusal, read the failing step's error and tell the user; do not
+resume in a loop or infer a provider-specific retry cause that the persisted record does not contain.
+For a generic persisted error, inspect and repair before authoring a new run.
+
+## Parameterized workflows
+
+Instead of editing a constant per run, declare inputs once and pass values at invocation time.
+
+Add a **module-level `INPUTS` dict** and read the resolved values at runtime with
+`get_inputs()`:
+
+```python
+from cao_workflow import get_inputs
+
+INPUTS = {
+    "target_dir": {"type": "path", "required": True},
+    "max_files":  {"type": "int",  "required": False, "default": 20},
+    "verbose":    {"type": "bool", "required": False, "default": False},
+}
+
+inputs = get_inputs()
+target_dir = inputs["target_dir"]
+max_files = inputs.get("max_files", 20)
+```
+
+Each entry declares `type` (`string` | `int` | `bool` | `path`), `required`, and an optional
+`default`. This makes one authored script reusable — "author once, invoke with inputs."
+
+## Operational discipline
+
+These rules are load-bearing. Each is paired with the reason it exists.
+
+### R1 — Fan-out determinism
+
+To run steps concurrently, use a `ThreadPoolExecutor` and give **every concurrent `run_step` an
+explicit, stable `step_id`**. The sequential `call-N` counter fallback is race-free but *not*
+deterministic across runs under concurrent scheduling — so resume would replay the wrong
+results. Iterate over `sorted()` inputs so the mapping from item → step_id is stable.
+
+Default `max_workers=2` for `claude_code` (measured: 4 starved the heaviest lens). Expose it as
+a tunable input; higher values are fine when steps are light.
+
+### R2 — Secrets as references, never literals
+
+Inputs are **journaled in plaintext and replayed on resume**. Never pass a literal secret
+(token, key, password) as an input. Pass a **name/reference** and resolve the actual secret at
+step time (env var, secrets manager) inside the step.
+
+### R3 — Role-capability matching
+
+Only **write-capable roles** (e.g. `developer`) should be told to write files. A **read-only
+role** (e.g. `reviewer`) instructed to write will **hang the full step budget** waiting on a
+permission it can't get. Read-only steps must READ their inputs and **RETURN findings inline**.
+
+### R4 — Per-unit fault tolerance
+
+**Catch `ShimError` inside each fan-out unit** so one step's timeout degrades to a survivor set
+rather than failing the whole run with a 504. Return a sentinel/`None` for the failed unit and
+let the aggregate proceed.
+
+**But do not swallow a halt or a divergence.** `ShimHTTPError` is a `ShimError`, so the same
+catch also absorbs the `409` a resume raises when a step halts or diverges — and the run then
+completes with a sentinel in place of a result a human was supposed to decide on. Re-raise when
+`.status == 409` (see Resolving a halt).
+
+### Big-outputs discipline
+
+For large results, have the step **write to a file and return the path** — don't return
+megabytes inline. Per-step output is `null` for schema-less steps; the files (and the aggregate
+you build) are the source of truth.
+
+### R5 (INTERIM) — Prefer a headless provider
+
+Prefer **`claude_code`** as the step provider. `kiro_cli` currently launches an interactive TUI
+that hangs `run_step`. **This is interim guidance** — a kiro mitigation is a tracked follow-up,
+not a permanent verdict — but until it lands, use a headless provider.
+
+### Projection ranking
+
+The **runtime journal is the primary truth** for progress and UI — it reflects what actually
+ran. A static script→YAML preview is **optional and lossy**; never treat it as the truth source
+and never author against it.
+
+## Handoff when you're read-only
+
+If you lack write permission (you can't create the `.py` file), **hand off authoring to a
+`developer` agent**, and pass this skill's name (`cao-workflow`) in the handoff message so the
+developer follows the same lifecycle.
+
+## Honesty discipline
+
+- Never claim a workflow ran that didn't.
+- Authoring ends at a **validated file**; running is a separate, user-approved step.
+- Be honest about failures — surface `ShimError`s and non-zero validate findings; don't paper
+  over them.
+
+## Worked example — parameterized fan-out
+
+A script that summarizes each file in a directory concurrently, with a stable `step_id` per
+file, per-unit fault tolerance, and results written to disk:
+
+```python
+"""summarize_dir — fan out a summary step over every file in target_dir."""
+import os
+from concurrent.futures import ThreadPoolExecutor
+
+from cao_workflow import step, emit_output, get_inputs, ShimError
+
+# Parameterized: author once, invoke with different inputs.
+INPUTS = {
+    "target_dir":  {"type": "path", "required": True},
+    "max_workers": {"type": "int",  "required": False, "default": 2},
+}
+
+inputs = get_inputs()
+target_dir = inputs["target_dir"]
+max_workers = inputs.get("max_workers", 2)
+
+# sorted() → the item→step_id mapping is stable across runs (R1 determinism).
+files = sorted(
+    name for name in os.listdir(target_dir)
+    if os.path.isfile(os.path.join(target_dir, name))
+)
+
+
+def summarize(filename: str):
+    path = os.path.join(target_dir, filename)
+    try:
+        # Explicit, STABLE step_id per concurrent call (R1). Read-only role
+        # RETURNS its summary inline (R3) — it does not write files.
+        handle = step(
+            provider="claude_code",          # headless (R5)
+            agent="reviewer",
+            prompt=f"Summarize the file at {path} in 3 bullet points. Return the summary only.",
+            step_id=f"summarize:{filename}",
+            # DECLARED, not defaulted. This step reads a file and returns text — it writes
+            # nothing and charges nothing — so "re-running it has the same effect as running
+            # it once" is an honest claim about THIS step. If it sent mail or filed a ticket,
+            # the honest declaration would be "manual", and CAO would halt and ask instead of
+            # repeating it. `recovery=` is your claim; nothing verifies it for you.
+            recovery="idempotent",
+        )
+        return filename, handle.output
+    except ShimError as exc:
+        # Per-unit tolerance (R4): one timeout degrades to a survivor, not a 504.
+        return filename, f"ERROR: {exc}"
+
+
+with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    results = dict(pool.map(summarize, files))
+
+# Big output → write to a file, return the path (big-outputs discipline).
+out_path = os.path.join(target_dir, "_summaries.json")
+with open(out_path, "w") as fh:
+    import json
+    json.dump(results, fh, indent=2)
+
+emit_output({"summarized": len(results), "output_file": out_path})
+```
+
+The whole sequence for it, end to end — note that the **first run is refused** and that the identifier
+comes out of that refusal:
+
+```
+# b. validate the draft before it exists anywhere
+workflow_validate(source="<the script above>")
+
+# a. create it (returns path + content_hash — keep the hash for a later update)
+cao workflow create summarize_dir --from-file ./summarize_dir.py
+
+# c. ask the user. Then:
+
+# d. attempt the run — refused, because this plan is new
+cao workflow run summarize_dir --run-id sum-1 --input target_dir=./reports
+#   -> Plan 'plan-v2:9f3c…' needs human approval before it can run: an operator approves it with `cao workflow approve plan-v2:9f3c…`, then runs it again. …
+#      Approval is a human decision; an agent must not grant it.
+
+# the USER approves (you must not; no tool does):
+cao workflow approve plan-v2:9f3c…
+
+# e. run for real, with the run-id announced first
+cao workflow run summarize_dir --run-id sum-1 --input target_dir=./reports --detach
+cao workflow wait sum-1
+
+# g. observe; on failure read failure_envelope.classification for resume-vs-repair
+cao workflow result sum-1 --json
+```

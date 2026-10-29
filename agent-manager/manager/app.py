@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import uuid
+import httpx
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit

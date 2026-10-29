@@ -1,0 +1,1301 @@
+"""Settings service for persisting user configuration."""
+
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple
+
+from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite, locked_atomic_write
+from cli_agent_orchestrator.utils.paths import normalized_path
+
+logger = logging.getLogger(__name__)
+
+SETTINGS_FILE = CAO_HOME_DIR / "settings.json"
+
+# Default agent directories per provider
+_DEFAULTS = {
+    "kiro_cli": str(Path.home() / ".kiro" / "agents"),
+    "claude_code": str(CAO_HOME_DIR / "agent-store"),
+    "codex": str(CAO_HOME_DIR / "agent-store"),
+    "cao_installed": str(CAO_HOME_DIR / "agent-context"),
+}
+
+_BOOL_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_BOOL_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+class SettingsUnreadableError(RuntimeError):
+    """settings.json is PRESENT but could not be read or parsed.
+
+    Distinct from "absent", which legitimately means "use the built-in defaults".
+    Conflating the two is how a filesystem problem masquerades as a deliberate
+    opt-out: where reads under the CAO home directory are denied,
+    ``is_learning_enabled()`` answered False and agents reported "workflow
+    self-learning is disabled" — a configuration message for a permissions fault.
+
+    Callers that must fail closed still do; they just now know WHY.
+    """
+
+    def __init__(self, path: Path, cause: BaseException) -> None:
+        self.path = path
+        self.cause = cause
+        super().__init__(f"{path} could not be read: {type(cause).__name__}: {cause}")
+
+    def redacted_detail(self) -> str:
+        """Describe the failure WITHOUT the absolute path, for API responses.
+
+        Server filesystem paths are deliberately kept out of HTTP payloads (the
+        same reason ``MemorySummary`` excludes ``file_path``), so the path is
+        logged server-side and only the exception kind travels.
+        """
+        return (
+            f"CAO settings.json could not be read ({type(self.cause).__name__}); "
+            "configuration state is unknown — check permissions on the CAO home directory"
+        )
+
+
+def _load_or_raise() -> Dict[str, Any]:
+    """Load settings, distinguishing "absent" from "unreadable".
+
+    Deliberately calls ``read_text()`` rather than testing ``exists()`` first:
+    ``Path.exists()`` swallows ``PermissionError`` from the PARENT directory and
+    returns False, so an unreadable home directory would take the "no settings
+    file, use defaults" branch silently, without even a log line.
+    """
+    try:
+        raw = SETTINGS_FILE.read_text()
+    except FileNotFoundError:
+        return {}  # genuinely absent — defaults are the right answer
+    except (OSError, ValueError) as e:  # Includes UnicodeDecodeError from read_text().
+        raise SettingsUnreadableError(SETTINGS_FILE, e) from e
+
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise SettingsUnreadableError(SETTINGS_FILE, e) from e
+    if not isinstance(data, dict):
+        raise SettingsUnreadableError(
+            SETTINGS_FILE, TypeError(f"expected a JSON object, got {type(data).__name__}")
+        )
+    return data
+
+
+def _load_result_detail() -> Tuple[Dict[str, Any], bool, bool]:
+    """Read once, distinguishing absent, unreadable, and parsed-invalid settings.
+
+    Approval stays enabled on either failure, but its diagnostic source distinguishes
+    read/decode failures from a parsed value that is not a JSON object. Use the same
+    strict loader as learning_status so both controls observe the same file semantics.
+    """
+    try:
+        return _load_or_raise(), True, False
+    except SettingsUnreadableError as e:
+        read_or_decode_failed = not isinstance(e.cause, TypeError)
+        if read_or_decode_failed:
+            logger.warning(f"Failed to read settings: {e}")
+        return {}, False, read_or_decode_failed
+
+
+def _load_result() -> Tuple[Dict[str, Any], bool]:
+    """Retain the two-item settings result for callers that only need readability."""
+    data, ok, _read_or_decode_failed = _load_result_detail()
+    return data, ok
+
+
+EPHEMERAL_DEFAULTS = {
+    "enabled": False,
+    "allowed_providers": ["claude_code"],
+    "max_brief_bytes": 8192,
+    "pending_ttl_seconds": 900,
+    "claim_lease_seconds": 60,
+    "max_depth": 1,
+}
+
+
+def get_ephemeral_settings() -> Dict[str, Any]:
+    """Read the operator-only block strictly, without environment overrides."""
+    settings = _load_or_raise()
+    block = settings.get("ephemeral", {})
+    if not isinstance(block, dict):
+        block = {}
+    result = {**EPHEMERAL_DEFAULTS, **block}
+    result["_ignored_policy"] = [
+        "ephemeral." + key
+        for key in ("max_tier", "default_tier", "max_effort", "default_effort")
+        if block.get(key) is not None
+    ]
+    if settings.get("model_tiers") is not None:
+        result["_ignored_policy"].append("model_tiers")
+    return result
+
+
+def child_may_delegate() -> bool:
+    """Operator-only ephemeral.child_may_delegate; no environment overrides."""
+    block = _load_or_raise().get("ephemeral", {})
+    return isinstance(block, dict) and block.get("child_may_delegate") is True
+
+
+def _load() -> Dict[str, Any]:
+    """Load settings from disk, tolerating an unreadable file.
+
+    Lenient wrapper over :func:`_load_or_raise` so every existing caller keeps
+    its "unreadable behaves like absent" contract. Callers that need to tell the
+    two apart use :func:`_load_or_raise` or :func:`learning_status`.
+    """
+    try:
+        return _load_or_raise()
+    except SettingsUnreadableError as e:
+        logger.warning(f"Failed to read settings: {e}")
+        return {}
+
+
+def settings_readable() -> bool:
+    """True when settings.json is absent or readable; False when it cannot be read."""
+    try:
+        _load_or_raise()
+    except SettingsUnreadableError:
+        return False
+    return True
+
+
+def _save(data: Dict[str, Any]) -> None:
+    """Save settings to disk.
+
+    Published atomically at mode 0600 through the shared writer: the new file
+    replaces the ``settings.json`` directory entry, so a symlink planted at
+    that path is swapped out rather than followed, and the result is private
+    like ``.env`` and the database. ``write_text`` did neither.
+    """
+    CAO_HOME_DIR.mkdir(parents=True, exist_ok=True)
+    locked_atomic_write(SETTINGS_FILE, json.dumps(data, indent=2), mode=0o600)
+
+
+class _NoWrite(Exception):
+    """Internal: the mutation decided nothing needs persisting."""
+
+
+def _mutate(update: Callable[[Dict[str, Any]], bool]) -> Dict[str, Any]:
+    """Fail-closed, locked read-modify-write of settings.json (GH #737).
+
+    Every writer used to do ``_load()`` / edit / ``_save()``. ``_load()`` is
+    lenient: a settings.json that is PRESENT but cannot be read or parsed —
+    one trailing comma is enough — comes back as ``{}``, the writer then adds
+    its own section to that empty dict, and ``_save`` publishes the result as
+    the new truth. Every other setting is gone, the command exits 0, and the
+    only trace is a ``logger.warning`` that is invisible at the default level.
+    The load and the write were also two separate lock acquisitions, so a
+    second writer that read before the first published lost its own section.
+
+    ``update`` receives the parsed settings while the file's inter-process
+    lock is held, mutates them in place, and returns True to persist or False
+    to leave the file untouched. Absent still loads as ``{}`` — defaults are
+    the right answer for a file that was never written. A present file that
+    cannot be read or parsed raises :class:`SettingsUnreadableError` BEFORE
+    ``update`` runs, so no writer can replace unknown state with its own
+    fragment. Returns the settings as they stand after the call.
+    """
+    settings: Dict[str, Any] = {}
+
+    def compute(_existing: str) -> str:
+        # Re-read through _load_or_raise rather than parsing ``_existing``:
+        # that helper is the one place that tells "absent" from "unreadable",
+        # and locked_atomic_rewrite hands us "" for both.
+        nonlocal settings
+        settings = _load_or_raise()
+        if not update(settings):
+            raise _NoWrite
+        return json.dumps(settings, indent=2)
+
+    try:
+        locked_atomic_rewrite(SETTINGS_FILE, compute, mode=0o600)
+    except _NoWrite:
+        pass
+    except (OSError, UnicodeDecodeError) as e:
+        # locked_atomic_rewrite reads the file itself before calling compute,
+        # so undecodable bytes or OS-level read failures (permission denied,
+        # the path being a directory, ...) surface from there, ahead of our
+        # own read.
+        raise SettingsUnreadableError(SETTINGS_FILE, e) from e
+    return settings
+
+
+def get_agent_dirs() -> Dict[str, str]:
+    """Get configured agent directories per provider.
+
+    Reads from the nested schema first (``agents.dirs``), falls back to the
+    legacy flat key (``agent_dirs``) for backward compatibility.
+
+    Returns dict like:
+      {"kiro_cli": "/home/user/.kiro/agents", "claude_code": "...", ...}
+    """
+    settings = _load()
+    # Nested format (documented schema): {"agents": {"dirs": {...}}}
+    nested = settings.get("agents", {})
+    if isinstance(nested, dict) and "dirs" in nested and isinstance(nested["dirs"], dict):
+        saved = nested["dirs"]
+    else:
+        # Legacy flat format: {"agent_dirs": {...}}
+        saved = settings.get("agent_dirs", {})
+    # Merge defaults with saved — saved overrides defaults
+    result = dict(_DEFAULTS)
+    result.update(saved)
+    return result
+
+
+def installed_context_dir_override() -> Optional[Path]:
+    """Return ``agents.dirs.cao_installed`` when configured away from its default.
+
+    Returns None when the setting is absent or spells the default location.
+
+    The installed-profile context directory has two names for one default: the
+    ``AGENT_CONTEXT_DIR`` constant and this setting's default entry, both
+    ``CAO_HOME_DIR / "agent-context"``. Every consumer that has to find that
+    directory -- the install writer, the opencode collision guard, the Copilot
+    skill-injection probe -- calls this and falls back to its own imported
+    constant on None. So with an unconfigured setting the constant stays the
+    single source of truth (and a test that redirects the constant redirects
+    every consumer), while an operator who points the setting elsewhere moves
+    every consumer together instead of splitting them (PR #493).
+
+    Compared through ``normalized_path`` (realpath + expanduser), so a trailing
+    slash, a ``~`` or a symlinked spelling of the default is still the default
+    rather than an override to a directory nobody else looks in.
+    """
+    configured = usable_agent_dirs().get("cao_installed")
+    if configured is None:
+        return None
+    if normalized_path(configured) == normalized_path(_DEFAULTS["cao_installed"]):
+        return None
+    return Path(configured).expanduser()
+
+
+def usable_agent_dirs() -> Dict[str, str]:
+    """``get_agent_dirs()`` with every value that is not a directory replaced by its default.
+
+    ``get_agent_dirs`` returns what settings.json says, which is right for the
+    Settings UI. It is wrong for anything that walks the filesystem: a blank
+    value is ``Path("")``, i.e. ``Path(".")`` -- the server's working directory
+    -- and a relative one moves with whoever launched the process. Fed to
+    profile discovery, the lookup behind ``cao install <name>``, memory
+    promotion's profile lookup or the installed-context resolver, either would
+    turn the working directory into a
+    profile source and, for ``cao_installed``, the trusted write root, so a
+    profile named ``README`` or ``AGENTS`` lands on a repository file. Every
+    consumer that opens directories goes through this instead; each bad value is
+    logged once per call and falls back to the built-in default for its key, and
+    every surviving value is returned with ``~`` expanded.
+    """
+    result = dict(get_agent_dirs())
+    for key, value in list(result.items()):
+        if not isinstance(value, str) or not value.strip():
+            logger.warning(f"Ignoring blank agents.dirs.{key}; using its default directory")
+        elif not Path(value).expanduser().is_absolute():
+            logger.warning(
+                f"Ignoring relative agents.dirs.{key}={value!r}; using its default directory"
+            )
+        else:
+            # Returned expanded: a ``~`` spelling is a real directory to every
+            # consumer, not a literal path named "~" that discovery finds empty.
+            result[key] = str(Path(value).expanduser())
+            continue
+        if key in _DEFAULTS:
+            result[key] = _DEFAULTS[key]
+        else:
+            del result[key]
+    return result
+
+
+def installed_context_lookup_dirs(default: Path) -> List[Path]:
+    """Directories an existing installed context copy may live in, in probe order.
+
+    The configured override first, then ``default`` -- the constant the caller
+    imports -- when an override is active, because releases before the writer
+    honoured the setting deposited every copy at the default regardless. With no
+    override, just ``default``. Consumers that need to FIND a copy (the install
+    ownership guard, the Copilot skill-injection probe) iterate this; the writer
+    uses only the first entry.
+    """
+    override = installed_context_dir_override()
+    if override is None or normalized_path(override) == normalized_path(default):
+        return [default]
+    return [override, default]
+
+
+def set_agent_dirs(dirs: Dict[str, str]) -> Dict[str, str]:
+    """Update agent directories. Only updates providers that are specified.
+
+    Writes to the nested schema format (``agents.dirs``). Also updates the
+    legacy flat key (``agent_dirs``) for backward compatibility with older
+    CAO versions that may still read it.
+    """
+
+    def update(settings: Dict[str, Any]) -> bool:
+        # Read current from nested first, fall back to flat
+        nested = settings.get("agents", {})
+        if isinstance(nested, dict) and "dirs" in nested and isinstance(nested["dirs"], dict):
+            current = nested["dirs"]
+        else:
+            current = settings.get("agent_dirs", {})
+        for provider, path in dirs.items():
+            if provider in _DEFAULTS:
+                current[provider] = path
+        # Write nested format
+        agents_section = settings.get("agents", {})
+        if not isinstance(agents_section, dict):
+            agents_section = {}
+        agents_section["dirs"] = current
+        settings["agents"] = agents_section
+        # Also write flat key for backward compat
+        settings["agent_dirs"] = current
+        return True
+
+    settings = _mutate(update)
+    logger.info(f"Updated agent directories: {settings.get('agent_dirs')}")
+    return get_agent_dirs()
+
+
+def get_disabled_agent_dirs() -> List[str]:
+    """Directory paths the user has toggled OFF.
+
+    A disabled directory stays listed in Settings but is skipped when scanning
+    for (and loading) agent profiles, so its profiles disappear from the active
+    set without editing paths. Covers both provider defaults (fixes GH #281 —
+    a removed default used to silently reappear) and user extras (GH #280).
+
+    Reads from the nested schema first (``agents.disabled_dirs``), falls back
+    to the legacy flat key (``disabled_agent_dirs``) — same contract as the
+    sibling ``agents.dirs`` / ``agents.extra_dirs`` settings.
+    """
+    settings = _load()
+    nested = settings.get("agents", {})
+    if isinstance(nested, dict) and isinstance(nested.get("disabled_dirs"), list):
+        # list(...) narrows the untyped-dict Any to list[str] for mypy's
+        # no-any-return gate, matching get_extra_agent_dirs' return guard.
+        return list(nested["disabled_dirs"])
+    dirs = settings.get("disabled_agent_dirs", [])
+    return dirs if isinstance(dirs, list) else []
+
+
+def set_disabled_agent_dirs(dirs: List[str]) -> List[str]:
+    """Persist which configured directories are disabled.
+
+    Only paths that are actually configured (a provider default from
+    ``get_agent_dirs`` or a user extra) are accepted — an arbitrary path would
+    silently match nothing during scanning, so rejecting it keeps the stored
+    state honest and the UI truthful. Validation uses the same path
+    normalization as the scan/load side (``utils.paths.normalized_path``), so
+    a valid directory sent in a different spelling (trailing slash, ``~``,
+    symlink) is accepted rather than silently dropped; what gets PERSISTED is
+    always the configured spelling, so the UI's exact-string matching keeps
+    working. Order and duplicates are normalized away.
+
+    Writes to the nested schema (``agents.disabled_dirs``) and the legacy flat
+    key (``disabled_agent_dirs``) for backward compatibility — mirroring
+    ``set_agent_dirs`` / ``set_extra_agent_dirs``.
+    """
+    norm_to_configured = {
+        normalized_path(v): v
+        for v in list(get_agent_dirs().values()) + list(get_extra_agent_dirs())
+        if isinstance(v, str)
+    }
+    seen: Set[str] = set()
+    cleaned: List[str] = []
+    for d in dirs:
+        if not isinstance(d, str) or not d.strip():
+            continue
+        configured = norm_to_configured.get(normalized_path(d.strip()))
+        if configured is not None and configured not in seen:
+            seen.add(configured)
+            cleaned.append(configured)
+
+    def update(settings: Dict[str, Any]) -> bool:
+        # Write nested format
+        agents_section = settings.get("agents", {})
+        if not isinstance(agents_section, dict):
+            agents_section = {}
+        agents_section["disabled_dirs"] = cleaned
+        settings["agents"] = agents_section
+        # Also write flat key for backward compat
+        settings["disabled_agent_dirs"] = cleaned
+        return True
+
+    _mutate(update)
+    logger.info(f"Disabled agent dirs: {cleaned}")
+    return cleaned
+
+
+# Default server tuning values
+_SERVER_DEFAULTS = {
+    "mcp_request_timeout": 30,
+    "event_bus_max_queue_size": 1024,
+    "provider_init_timeout": 60,
+    "startup_prompt_handler_timeout": 20,
+    # Rolling per-terminal raw-output buffer StatusMonitor keeps for raw-path
+    # status detection and GET /terminals/{id}/output (mode=full) — see
+    # StatusMonitor._process_chunk. The old fixed 8192 was measured too small
+    # against the pyte screen geometry this buffer has to outlive: a single
+    # full-screen repaint of a 220x50 viewport is already ~11,000 visible
+    # characters before per-line/per-cell ANSI escapes are added on top, so
+    # one repaint alone could exceed the old cap. A long, chatty session with
+    # several such repaints (status-bar refreshes, spinner frames, full menu
+    # redraws) could evict a still-pending prompt from the buffer before it
+    # was ever read back. 32KB covers several trailing repaints instead of a
+    # fraction of one, while staying a deliberately bounded trade-off (not
+    # unbounded scrollback) — configurable rather than a second blind guess,
+    # since the "safe" size is provider/workload-dependent, not one constant.
+    "state_buffer_max": 32768,
+}
+
+# Env-var overrides for server settings. Precedence: env var > settings.json > default.
+_SERVER_ENV_VARS = {
+    "mcp_request_timeout": "CAO_MCP_REQUEST_TIMEOUT",
+    "event_bus_max_queue_size": "CAO_EVENT_BUS_MAX_QUEUE_SIZE",
+    "provider_init_timeout": "CAO_PROVIDER_INIT_TIMEOUT",
+    "startup_prompt_handler_timeout": "CAO_STARTUP_PROMPT_HANDLER_TIMEOUT",
+    "state_buffer_max": "CAO_STATE_BUFFER_MAX",
+}
+
+
+_server_settings_cache: Optional[Dict[str, Any]] = None
+_server_settings_mtime_ns: int = -1
+
+
+def get_server_settings() -> Dict[str, Any]:
+    """Get server tuning settings (cached; re-reads only when file changes).
+
+    Precedence per key: CAO_* env var > settings.json > built-in default.
+
+    Returns a dict with the following keys (defaults shown):
+      - mcp_request_timeout (30): Seconds to wait for MCP HTTP calls
+      - event_bus_max_queue_size (1024): Max events buffered per subscriber
+      - provider_init_timeout (60): Seconds to wait for a CLI agent to reach IDLE.
+        Also the hard outer cap on total time the startup-prompt handler may run.
+      - startup_prompt_handler_timeout (20): Idle gap, in seconds, between
+        consecutive startup prompts (e.g. workspace trust / bypass dialogs). The
+        handler keeps polling and resets this timer every time it answers a
+        prompt; it stops once no new prompt appears for this many seconds (so a
+        dialog a cold/containerized start renders late is still handled). Total
+        time is bounded by provider_init_timeout.
+      - state_buffer_max (32768): Bytes of raw terminal output StatusMonitor
+        keeps per terminal for raw-path status detection and
+        GET /terminals/{id}/output (mode=full)
+
+    Values can be set via CAO_* environment variables or in
+    ~/.aws/cli-agent-orchestrator/settings.json under the "server" key:
+
+        {
+          "server": {
+            "mcp_request_timeout": 120,
+            "event_bus_max_queue_size": 8192,
+            "provider_init_timeout": 90,
+            "startup_prompt_handler_timeout": 5,
+            "state_buffer_max": 65536
+          }
+        }
+    """
+    global _server_settings_cache, _server_settings_mtime_ns
+    # Cache: only re-read when the file has changed
+    try:
+        mtime_ns = SETTINGS_FILE.stat().st_mtime_ns if SETTINGS_FILE.exists() else -1
+    except OSError:
+        mtime_ns = -1
+    if _server_settings_cache is not None and mtime_ns == _server_settings_mtime_ns:
+        return dict(_server_settings_cache)
+
+    settings = _load()
+    saved = settings.get("server", {})
+    if not isinstance(saved, dict):
+        logger.warning("Invalid settings.server=%r (expected object); using defaults", saved)
+        saved = {}
+    result = dict(_SERVER_DEFAULTS)
+    result.update({k: v for k, v in saved.items() if k in _SERVER_DEFAULTS})
+
+    # Env-var overlay: CAO_* env var beats settings.json value.
+    for key, env_name in _SERVER_ENV_VARS.items():
+        raw = os.environ.get(env_name)
+        if raw is not None and raw.strip() != "":
+            try:
+                result[key] = int(raw)
+            except ValueError:
+                logger.warning(
+                    f"Ignoring invalid {env_name}={raw!r} (expected int); "
+                    f"using file/default {result[key]}"
+                )
+
+    # Validate types and ranges; coerce to int for queue size
+    for key, default in _SERVER_DEFAULTS.items():
+        val = result[key]
+        # int(val), not val <= 0: a float in (0, 1) (e.g. a settings.json
+        # value of 0.5) passes val <= 0 but truncates to 0 once coerced to
+        # int below (state_buffer_max) or by Queue(maxsize=...)
+        # (event_bus_max_queue_size), reintroducing the same
+        # unbounded-buffer/unbounded-queue failure mode this validation
+        # exists to prevent. isinstance(val, (int, float)) above guarantees
+        # int(val) cannot itself raise here.
+        if isinstance(val, bool) or not isinstance(val, (int, float)) or int(val) <= 0:
+            logger.warning(f"Invalid server setting {key}={val!r}, using default {default}")
+            result[key] = default
+    result["event_bus_max_queue_size"] = int(result["event_bus_max_queue_size"])
+    # buffer[-state_buffer_max:] requires an int -- a float survives the
+    # generic isinstance(val, (int, float)) check above (e.g. a settings.json
+    # value of 32768.0), and a float slice bound raises TypeError.
+    result["state_buffer_max"] = int(result["state_buffer_max"])
+    _server_settings_cache = result
+    _server_settings_mtime_ns = mtime_ns
+    return dict(result)
+
+
+def get_max_terminals() -> Optional[int]:
+    """Max terminals this node will track, or None for unlimited.
+
+    Precedence: ``CAO_MAX_TERMINALS`` env var > ``server.max_terminals`` in
+    settings.json > None (unlimited — the pre-cap default, so existing
+    deployments are unaffected).
+
+    Used by ``terminal_service.create_terminal`` to reject creation when the
+    node is full. The one-agent-per-pod Kubernetes topology sets
+    ``CAO_MAX_TERMINALS=1`` on worker pods so each pod hosts exactly one agent.
+
+    Counts TRACKED terminals, meaning rows in the terminals table, not probed
+    liveness: a terminal row is only removed by an explicit ``delete_terminal``,
+    so a terminal whose process died without cleanup still occupies a slot. That
+    is harmless in the topology the cap exists for (a worker pod is disposable and
+    its state is an emptyDir, so its rows die with it) but an operator who sets ``server.max_terminals``
+    on a long-lived node may have to delete a stale row by hand. Deliberately not
+    probed here: this check runs before anything is allocated precisely so it can
+    stay cheap, and per-row liveness probing would put tmux calls in that path.
+
+    Not folded into ``_SERVER_DEFAULTS`` because that table's validation forces
+    every key to a positive int default; this setting's default is "absent"
+    (unlimited), which that machinery cannot represent. Invalid or non-positive
+    values are ignored with a warning (unlimited) rather than treated as 0,
+    which would brick all terminal creation on a typo.
+    """
+    raw = os.environ.get("CAO_MAX_TERMINALS")
+    source = "CAO_MAX_TERMINALS"
+    if raw is None or raw.strip() == "":
+        saved = _load().get("server", {})
+        raw = saved.get("max_terminals") if isinstance(saved, dict) else None
+        source = "server.max_terminals"
+        if raw is None:
+            return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(f"Ignoring invalid {source}={raw!r} (expected int); terminals unlimited")
+        return None
+    if value <= 0:
+        logger.warning(f"Ignoring non-positive {source}={value}; terminals unlimited")
+        return None
+    return value
+
+
+def get_memory_settings() -> Dict[str, Any]:
+    """Get memory-related settings.
+
+    Precedence for most keys: CAO_* env var > settings.json > built-in
+    default. ``memory.lint_enabled`` intentionally uses
+    ``is_memory_lint_enabled()`` fail-closed semantics instead: any explicit
+    false in persisted settings or ``CAO_MEMORY_LINT_ENABLED`` disables lint.
+
+    ``enabled`` defaults to ``True`` (opt-out) to preserve current shipping
+    behavior. Setting it to ``False`` disables all memory subsystem
+    operations — see ``is_memory_enabled()``.
+    """
+    settings = _load()
+    defaults: Dict[str, Any] = {
+        "enabled": True,
+        "flush_threshold": 0.85,
+        "lint_enabled": True,
+        "learning_enabled": False,
+        "instruction_promotion_enabled": False,
+        "explain_enabled": True,
+        "non_accessing_inspection": False,
+        "lifecycle": {"enabled": False},
+    }
+    saved = settings.get("memory", {})
+    if not isinstance(saved, dict):
+        logger.warning("Invalid settings.memory=%r (expected object); using defaults", saved)
+        saved = {}
+    result = dict(defaults)
+    result.update(saved)
+    # Vault config has cross-field safety invariants and is intentionally
+    # available only through get_vault_config().
+    result.pop("vault", None)
+
+    # Env-var overlay: CAO_MEMORY_ENABLED beats settings.json
+    env_enabled = os.environ.get("CAO_MEMORY_ENABLED")
+    if env_enabled is not None and env_enabled.strip() != "":
+        result["enabled"] = env_enabled.strip().lower() in ("1", "true", "yes")
+
+    env_lifecycle = os.environ.get("CAO_MEMORY_LIFECYCLE_ENABLED")
+    if env_lifecycle is not None and env_lifecycle.strip():
+        lifecycle = result.get("lifecycle", {})
+        result["lifecycle"] = {
+            **(lifecycle if isinstance(lifecycle, dict) else {}),
+            "enabled": env_lifecycle.strip().lower() in ("1", "true", "yes"),
+        }
+
+    env_inspection = os.environ.get("CAO_MEMORY_NON_ACCESSING_INSPECTION")
+    if env_inspection is not None and env_inspection.strip():
+        result["non_accessing_inspection"] = env_inspection.strip().lower() in ("1", "true", "yes")
+
+    # Env-var overlay: CAO_MEMORY_EXPLAIN_ENABLED beats settings.json.
+    env_explain = os.environ.get("CAO_MEMORY_EXPLAIN_ENABLED")
+    if env_explain is not None and env_explain.strip() != "":
+        result["explain_enabled"] = env_explain.strip().lower() in ("1", "true", "yes")
+
+    # Env-var overlay: CAO_MEMORY_LEARNING_ENABLED beats settings.json
+    env_learning = os.environ.get("CAO_MEMORY_LEARNING_ENABLED")
+    if env_learning is not None and env_learning.strip() != "":
+        result["learning_enabled"] = env_learning.strip().lower() in ("1", "true", "yes")
+
+    # Env-var overlay: CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED beats settings.json
+    env_promotion = os.environ.get("CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED")
+    if env_promotion is not None and env_promotion.strip() != "":
+        result["instruction_promotion_enabled"] = env_promotion.strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+    # Env-var overlay: CAO_MEMORY_FLUSH_THRESHOLD beats settings.json
+    env_threshold = os.environ.get("CAO_MEMORY_FLUSH_THRESHOLD")
+    if env_threshold is not None and env_threshold.strip() != "":
+        try:
+            fval = float(env_threshold)
+            if 0.0 < fval <= 1.0:
+                result["flush_threshold"] = fval
+            else:
+                logger.warning(
+                    f"Ignoring CAO_MEMORY_FLUSH_THRESHOLD={env_threshold!r} "
+                    f"(must be between 0.0 and 1.0); using file/default"
+                )
+        except ValueError:
+            logger.warning(
+                f"Ignoring invalid CAO_MEMORY_FLUSH_THRESHOLD={env_threshold!r} "
+                f"(expected float); using file/default"
+            )
+
+    result["lint_enabled"] = is_memory_lint_enabled(settings=settings)
+    return result
+
+
+def get_vault_config(*, canonicalize: bool = True):
+    """Load the validated ``memory.vault`` object with a disable-only env gate.
+
+    Schema validation is pure. With ``canonicalize`` (the default for every
+    runtime consumer) project mapping ids are then resolved through the
+    persisted alias table, which fails closed when the database is unavailable.
+    Introspection surfaces such as ``cao config list`` pass ``canonicalize=False``
+    so they can show the configured document on a home that has no database yet.
+    """
+    from cli_agent_orchestrator.services.vault.config import VaultConfig
+
+    settings = _load()
+    memory = settings.get("memory", {})
+    raw_vault = memory.get("vault", {}) if isinstance(memory, dict) else {}
+    if not isinstance(raw_vault, dict):
+        raise ValueError("memory.vault must be an object")
+    config = VaultConfig.model_validate(raw_vault)
+    if canonicalize:
+        from cli_agent_orchestrator.services.vault.binding import canonicalize_vault_config
+
+        config = canonicalize_vault_config(config)
+
+    # This operational override may only reduce exposure. In particular, an
+    # env value of true never enables a file-disabled or absent configuration.
+    raw_env = os.environ.get("CAO_MEMORY_VAULT_ENABLED")
+    if raw_env is not None and raw_env.strip().lower() in _BOOL_FALSE_VALUES:
+        config.enabled = False
+    return config
+
+
+def _coerce_optional_bool(value: Any, *, label: str) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "":
+            return None
+        if normalized in _BOOL_TRUE_VALUES:
+            return True
+        if normalized in _BOOL_FALSE_VALUES:
+            return False
+    logger.warning("Ignoring invalid %s=%r (expected bool); using file/default", label, value)
+    return None
+
+
+def _explicit_false(value: Any, *, label: str) -> bool:
+    return _coerce_optional_bool(value, label=label) is False
+
+
+def is_memory_lint_enabled(settings: Optional[Dict[str, Any]] = None) -> bool:
+    """Return True unless persisted settings or env explicitly disable lint.
+
+    This is intentionally not normal env precedence: either explicit false
+    source disables lint, so env true cannot override persisted false and
+    persisted true cannot override env false.
+    """
+    try:
+        data = settings if settings is not None else _load()
+        saved = data.get("memory", {}) if isinstance(data, dict) else {}
+        if not isinstance(saved, dict):
+            saved = {}
+
+        if _explicit_false(saved.get("lint_enabled", True), label="memory.lint_enabled"):
+            return False
+
+        raw_env = os.environ.get("CAO_MEMORY_LINT_ENABLED")
+        if raw_env is not None and raw_env.strip() != "":
+            coerced = _coerce_optional_bool(raw_env, label="CAO_MEMORY_LINT_ENABLED")
+            if coerced is False:
+                return False
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to read memory.lint_enabled, defaulting to True: {e}")
+        return True
+
+
+def is_non_accessing_inspection_enabled() -> bool:
+    """Opt-in operator inspection: env > file > False; read errors stay off."""
+    try:
+        return bool(get_memory_settings().get("non_accessing_inspection", False))
+    except Exception:
+        logger.warning("Failed to read memory.non_accessing_inspection; defaulting to False")
+        return False
+
+
+def is_memory_lifecycle_enabled() -> bool:
+    """Opt-in lifecycle: env > nested file value > False; invalid/read error is off."""
+    env = os.environ.get("CAO_MEMORY_LIFECYCLE_ENABLED")
+    if env is not None and env.strip():
+        return env.strip().lower() in ("1", "true", "yes")
+    try:
+        memory = _load().get("memory", {})
+        lifecycle = memory.get("lifecycle", {}) if isinstance(memory, dict) else {}
+        if not isinstance(lifecycle, dict) or not isinstance(lifecycle.get("enabled", False), bool):
+            logger.warning("Invalid memory.lifecycle.enabled; defaulting to False")
+            return False
+        return bool(lifecycle.get("enabled", False))
+    except Exception:
+        logger.warning("Failed to read memory.lifecycle.enabled; defaulting to False")
+        return False
+
+
+def is_memory_explain_enabled() -> bool:
+    """On-demand explain: env > file > True; read errors retain the default."""
+    try:
+        value = get_memory_settings().get("explain_enabled", True)
+    except Exception as e:
+        logger.warning(f"Failed to read memory.explain_enabled, defaulting to True: {e}")
+        return True
+    return bool(value)
+
+
+def is_memory_enabled() -> bool:
+    """Return True when the memory subsystem is enabled.
+
+    Precedence: CAO_MEMORY_ENABLED env var > memory.enabled in settings.json
+    > default (True).
+    """
+    try:
+        value = get_memory_settings().get("enabled", True)
+    except Exception as e:
+        logger.warning(f"Failed to read memory.enabled, defaulting to True: {e}")
+        return True
+    return bool(value)
+
+
+def is_learning_enabled() -> bool:
+    """Return True when workflow self-learning (outcome capture) is enabled.
+
+    Precedence: CAO_MEMORY_LEARNING_ENABLED env var > memory.learning_enabled
+    in settings.json > default (False — learning is opt-in).
+
+    Learning is a child of the memory subsystem: lessons distilled from
+    outcomes are stored via memory, so a disabled memory subsystem disables
+    learning regardless of this flag. Read errors default to False (opt-in
+    features fail closed, mirroring the default).
+    """
+    return learning_status().enabled
+
+
+class LearningStatus(NamedTuple):
+    """Whether learning is on, AND whether that answer is trustworthy.
+
+    ``unreadable`` is the honesty bit. ``enabled`` alone cannot distinguish
+    "the operator opted out" from "the settings file could not be read", and
+    those need different messages: the first is a configuration fact, the
+    second is a filesystem fault the operator has to go fix.
+    """
+
+    enabled: bool
+    unreadable: bool
+    detail: str
+
+
+def learning_status() -> LearningStatus:
+    """Resolve learning state, reporting whether settings.json was readable.
+
+    ``unreadable`` is True only when settings.json could not be read AND no
+    decisive ``CAO_MEMORY_LEARNING_ENABLED`` override is present: an
+    env-var-driven install is unaffected by an unreadable file, so reporting it
+    as broken would be its own kind of lie.
+
+    Still fails closed — ``enabled`` is False whenever the answer is unknown.
+    """
+    env_learning = os.environ.get("CAO_MEMORY_LEARNING_ENABLED")
+    env_decisive = env_learning is not None and env_learning.strip() != ""
+
+    try:
+        _load_or_raise()
+    except SettingsUnreadableError as e:
+        if not env_decisive:
+            # error, not warning: this is an operator-actionable fault, and the
+            # symptom it produces ("learning is disabled") does not look like one.
+            logger.error(f"Cannot determine learning state: {e}")
+            return LearningStatus(False, True, e.redacted_detail())
+        logger.warning(f"settings.json unreadable; using CAO_MEMORY_LEARNING_ENABLED: {e}")
+
+    try:
+        settings = get_memory_settings()
+        enabled = bool(settings.get("enabled", True)) and bool(
+            settings.get("learning_enabled", False)
+        )
+    except Exception as e:
+        logger.warning(f"Failed to read memory.learning_enabled, defaulting to False: {e}")
+        return LearningStatus(False, False, f"Failed to read learning settings: {e}")
+    return LearningStatus(enabled, False, "")
+
+
+#: Where a resolved approval posture came from. A CLOSED set: the startup line renders these
+#: verbatim, so adding a member means updating that call site too.
+GATE_SOURCE_ENV = "env"
+GATE_SOURCE_FILE = "settings.json"
+GATE_SOURCE_DEFAULT = "default"
+GATE_SOURCE_READ_FAILURE = "read-failure-fallback"
+GATE_SOURCE_INVALID_SETTINGS = "invalid-settings-fallback"
+
+
+class WorkflowApprovalPosture(NamedTuple):
+    """A resolved approval-gate posture and the mechanism that decided it.
+
+    ``source`` lets the startup line distinguish an explicit settings-file opt-out from a malformed
+    file that leaves enforcement enabled and needs repair.
+    """
+
+    required: bool
+    source: str
+
+
+def resolve_workflow_approval_posture() -> WorkflowApprovalPosture:
+    """Resolve whether the approval gate is required, and what decided it (issue #583 FR-8).
+
+    DEFAULT IS **TRUE** SINCE ISSUE #583 BOLT 3 (``approval-enforcement-default``). Bolt 2 shipped
+    this opt-in for a specific reason that no longer holds: an always-on gate turned a TRANSIENT
+    freeze failure into a refused HEALTHY run, because ``manifest_freeze.build_manifest_json`` is
+    total and writes NULL on failure, and NULL fails closed. Bolt 3 makes the two causes
+    distinguishable — a missing plan identifier now raises
+    :class:`~cli_agent_orchestrator.services.approval_gate.PlanIdentityUnavailableError` and
+    transports as 503, while a genuinely unapproved plan stays 403 — and ships the authoring
+    sequence that takes approval BEFORE running. With both in place, leaving FR-8's guarantee
+    opt-in would mean it never applies in a default installation.
+
+    PRECEDENCE IS DELIBERATELY ASYMMETRIC, AND THIS IS NOT AN OVERSIGHT. Every sibling setting here
+    resolves ``CAO_* env var > settings.json > default`` — see :func:`is_memory_enabled`. This one
+    does NOT:
+
+        ``CAO_WORKFLOW_REQUIRE_APPROVAL`` may turn the gate **ON**.
+        Only ``settings.json`` can turn it **OFF**.
+
+    The reason is that this setting is a CONTROL, not a feature toggle. Under the house precedence,
+    anything able to set an environment variable could switch the approval gate off while the
+    operator's settings file still read as configured on — which would make the weakest
+    configuration mechanism in the system the one that decides whether runs are authorised. The
+    asymmetry is monotonic in the safe direction: nothing that merely influences an environment can
+    weaken the gate. Flipping the default does NOT reopen this; it only changes what the variable is
+    useful for, from switching a control on to re-asserting one that is already on.
+
+    Read/decode failures and malformed configuration FAIL CLOSED: both preserve required enforcement
+    and log an error naming the repair path. :data:`GATE_SOURCE_READ_FAILURE` is reserved for a file
+    that could not be read or decoded; :data:`GATE_SOURCE_INVALID_SETTINGS` names content that parsed
+    but cannot configure this setting. A valid explicit JSON boolean ``false`` is the only settings
+    file opt-out.
+
+    An ABSENT settings file is NOT a read failure. It is the unconfigured case and resolves to the
+    default, which is now enabled. :func:`_load_result` is what makes the two distinguishable.
+    """
+    env = os.environ.get("CAO_WORKFLOW_REQUIRE_APPROVAL")
+    if env is not None and env.strip().lower() in ("1", "true", "yes"):
+        # Enable-only: a falsy env value is NOT consulted, so it cannot override an enabling
+        # settings.json below. Returning early on truthy is what makes the precedence asymmetric.
+        return WorkflowApprovalPosture(True, GATE_SOURCE_ENV)
+
+    data, ok, read_or_decode_failed = _load_result_detail()
+    if not ok:
+        if read_or_decode_failed:
+            logger.error(
+                "Failed to read or decode workflow approval settings from %s; the approval gate "
+                "remains REQUIRED. Repair settings.json and restart or reload the server; "
+                "CAO_WORKFLOW_REQUIRE_APPROVAL=1 may explicitly affirm enabled enforcement.",
+                SETTINGS_FILE,
+            )
+            return WorkflowApprovalPosture(True, GATE_SOURCE_READ_FAILURE)
+        logger.error(
+            "Invalid settings.json content in %s; the approval gate remains REQUIRED. Repair "
+            "settings.json and restart or reload the server; only an explicit JSON boolean "
+            "workflow.require_approval=false disables enforcement.",
+            SETTINGS_FILE,
+        )
+        return WorkflowApprovalPosture(True, GATE_SOURCE_INVALID_SETTINGS)
+
+    workflow_settings = data.get("workflow", {})
+    if not isinstance(workflow_settings, dict):
+        logger.error(
+            "The 'workflow' key in %s is not an object; the approval gate remains REQUIRED. "
+            "Repair settings.json and restart or reload the server.",
+            SETTINGS_FILE,
+        )
+        return WorkflowApprovalPosture(True, GATE_SOURCE_INVALID_SETTINGS)
+
+    if "require_approval" in workflow_settings:
+        required = workflow_settings["require_approval"]
+        if isinstance(required, bool):
+            return WorkflowApprovalPosture(required, GATE_SOURCE_FILE)
+        logger.error(
+            "workflow.require_approval in %s must be a JSON boolean; the approval gate remains "
+            "REQUIRED. Repair settings.json and restart or reload the server.",
+            SETTINGS_FILE,
+        )
+        return WorkflowApprovalPosture(True, GATE_SOURCE_INVALID_SETTINGS)
+    return WorkflowApprovalPosture(True, GATE_SOURCE_DEFAULT)
+
+
+def is_workflow_approval_required() -> bool:
+    """Return True when an unapproved script-tier workflow run must be refused (issue #583 FR-8).
+
+    Thin delegation to :func:`resolve_workflow_approval_posture`, which carries the full reasoning.
+    The signature is unchanged from Bolt 2 so that every existing caller — and every test asserting
+    this exact shape — is untouched; callers that need to know WHY the gate is on or off ask the
+    resolver instead.
+    """
+    return resolve_workflow_approval_posture().required
+
+
+def is_instruction_promotion_enabled() -> bool:
+    """Return True when learned-lesson promotion into profile files is enabled.
+
+    Precedence: CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED env var >
+    memory.instruction_promotion_enabled in settings.json > default (False).
+
+    Promotion is the highest-risk learning tier — it mutates agent profile
+    markdown shared by every session — so it nests inside learning:
+    promotion ⊂ learning ⊂ memory. Any parent off forces it off. Read
+    errors default to False (fail closed).
+    """
+    try:
+        if not is_learning_enabled():
+            return False
+        settings = get_memory_settings()
+        return bool(settings.get("instruction_promotion_enabled", False))
+    except Exception as e:
+        logger.warning(
+            f"Failed to read memory.instruction_promotion_enabled, defaulting to False: {e}"
+        )
+        return False
+
+
+def get_compile_mode() -> str:
+    """Return the active wiki-compilation mode.
+
+    Precedence:
+        1. ``CAO_MEMORY_COMPILE_MODE`` env var (case-insensitive). Accepted
+           values: ``llm``, ``append``. Unknown values are ignored with a
+           WARNING and fall through to settings/default.
+        2. ``memory.compile_mode`` nested key in settings.json.
+        3. Default ``"llm"``.
+
+    Read errors fall through to ``"append"`` — the safe default that never
+    invokes the LLM and reproduces Phase 1/2 behaviour.
+    """
+    env_raw = os.environ.get("CAO_MEMORY_COMPILE_MODE")
+    if env_raw is not None:
+        v = env_raw.strip().lower()
+        if v in ("llm", "append"):
+            return v
+        if v != "":
+            logger.warning(
+                f"Ignoring unknown CAO_MEMORY_COMPILE_MODE={env_raw!r}; "
+                "falling through to settings.json"
+            )
+    try:
+        value = get_memory_settings().get("compile_mode", "llm")
+    except Exception as e:
+        logger.warning(f"Failed to read memory.compile_mode, defaulting to append: {e}")
+        return "append"
+    if isinstance(value, str) and value.strip().lower() in ("llm", "append"):
+        return value.strip().lower()
+    return "append"
+
+
+def get_compile_timeout_s() -> float:
+    """Return the wall-clock timeout (seconds) for the wiki compile call.
+
+    Generous by default: compilation drives a coding-agent CLI that can
+    cold-start in tens of seconds, and it runs in the background so the
+    timeout never blocks store().
+    """
+    try:
+        value = get_memory_settings().get("compile_timeout_s", 120.0)
+        return float(value)
+    except Exception as e:
+        logger.warning(f"Failed to read memory.compile_timeout_s, defaulting to 120.0: {e}")
+        return 120.0
+
+
+# Workflow-journal retention/capture settings (issue #504, U7). Namespaced under
+# the "memory" block like ``audit_log_day_cap_bytes``; written through
+# ``set_memory_setting`` and read via ``get_memory_settings().get(<key>, <default>)``.
+# ``workflow_journal_capture_output`` is a bool gate (default False, NFR-SEC-2); the
+# other three are non-negative ints (byte cap / age / count) validated on write.
+_WORKFLOW_JOURNAL_BOOL_KEYS = frozenset({"workflow_journal_capture_output"})
+_WORKFLOW_JOURNAL_INT_KEYS = frozenset(
+    {
+        "workflow_journal_output_cap_bytes",
+        "workflow_journal_retention_days",
+        "workflow_journal_retention_count",
+    }
+)
+
+
+def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
+    """Update a single memory setting.
+
+    Supported keys:
+        ``enabled`` (bool) — master switch for the memory subsystem.
+        ``explain_enabled`` (bool) — on-demand CLI relevance diagnostic.
+        ``lifecycle.enabled`` (bool) — opt-in supersedes lifecycle.
+        ``non_accessing_inspection`` (bool) — opt-in operator reads without access bumps.
+        ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
+        ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
+        ``learning_enabled`` (bool) — workflow self-learning (outcome capture).
+        ``instruction_promotion_enabled`` (bool) — learned-lesson promotion
+        into agent profile files (requires learning_enabled).
+        ``workflow_journal_capture_output`` (bool) — opt-in workflow output capture
+            (issue #504, U7; default False, NFR-SEC-2).
+        ``workflow_journal_output_cap_bytes`` (int > 0) — per-output byte cap when
+            capture is enabled (U7; default 8192, NFR-SEC-4).
+        ``workflow_journal_retention_days`` (int ≥ 0) — run-age retention bound
+            (U7; default 30, NFR-SEC-3).
+        ``workflow_journal_retention_count`` (int ≥ 0) — most-recent run-count
+            retention bound (U7; default 100, NFR-SEC-3).
+    """
+    # Validate BEFORE taking the file lock: a rejected value must not wait on,
+    # let alone rewrite, settings.json.
+    coerced: Any
+    if key == "enabled":
+        if not isinstance(value, bool):
+            raise ValueError(f"enabled must be a bool, got {type(value).__name__}")
+        coerced = value
+    elif key == "lint_enabled":
+        if not isinstance(value, bool):
+            raise ValueError(f"lint_enabled must be a bool, got {type(value).__name__}")
+        coerced = value
+    elif key == "learning_enabled":
+        if not isinstance(value, bool):
+            raise ValueError(f"learning_enabled must be a bool, got {type(value).__name__}")
+        coerced = value
+    elif key == "instruction_promotion_enabled":
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"instruction_promotion_enabled must be a bool, got {type(value).__name__}"
+            )
+        coerced = value
+    elif key == "lifecycle.enabled":
+        if not isinstance(value, bool):
+            raise ValueError("lifecycle.enabled must be a bool")
+        coerced = value
+    elif key in {"explain_enabled", "non_accessing_inspection"}:
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} must be a bool, got {type(value).__name__}")
+        coerced = value
+    elif key == "flush_threshold":
+        fval = float(value)
+        if not (0.0 < fval <= 1.0):
+            raise ValueError(f"flush_threshold must be between 0.0 and 1.0, got {fval}")
+        coerced = fval
+    elif key in _WORKFLOW_JOURNAL_BOOL_KEYS:
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} must be a bool, got {type(value).__name__}")
+        coerced = value
+    elif key in _WORKFLOW_JOURNAL_INT_KEYS:
+        # bool is an int subclass — reject it so True/False can't masquerade as 1/0.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{key} must be an int, got {type(value).__name__}")
+        min_value = 1 if key == "workflow_journal_output_cap_bytes" else 0
+        if value < min_value:
+            raise ValueError(f"{key} must be >= {min_value}, got {value}")
+        coerced = value
+    else:
+        raise ValueError(f"Unknown memory setting: {key}")
+
+    def update(settings: Dict[str, Any]) -> bool:
+        memory = settings.get("memory", {})
+        if not isinstance(memory, dict):
+            memory = {}
+        if key == "lifecycle.enabled":
+            lifecycle = memory.get("lifecycle", {})
+            if not isinstance(lifecycle, dict):
+                lifecycle = {}
+            memory["lifecycle"] = {**lifecycle, "enabled": coerced}
+        else:
+            memory[key] = coerced
+        settings["memory"] = memory
+        return True
+
+    _mutate(update)
+    logger.info(f"Updated memory setting: {key}={coerced}")
+    return get_memory_settings()
+
+
+def get_extra_agent_dirs() -> List[str]:
+    """Get extra agent scan directories (user-added custom paths).
+
+    Reads from the nested schema first (``agents.extra_dirs``), falls back to
+    the legacy flat key (``extra_agent_dirs``) for backward compatibility.
+    """
+    settings = _load()
+    # Nested format: {"agents": {"extra_dirs": [...]}}
+    nested = settings.get("agents", {})
+    if (
+        isinstance(nested, dict)
+        and "extra_dirs" in nested
+        and isinstance(nested["extra_dirs"], list)
+    ):
+        dirs = nested["extra_dirs"]
+    else:
+        # Legacy flat format: {"extra_agent_dirs": [...]}
+        dirs = settings.get("extra_agent_dirs", [])
+    return dirs if isinstance(dirs, list) else []
+
+
+def set_extra_agent_dirs(dirs: List[str]) -> List[str]:
+    """Set extra agent scan directories.
+
+    Writes to nested schema (``agents.extra_dirs``) and legacy flat key
+    (``extra_agent_dirs``) for backward compatibility.
+    """
+    extra_agent_dirs = [d for d in dirs if d.strip()]
+
+    def update(settings: Dict[str, Any]) -> bool:
+        # Write nested format
+        agents_section = settings.get("agents", {})
+        if not isinstance(agents_section, dict):
+            agents_section = {}
+        agents_section["extra_dirs"] = extra_agent_dirs
+        settings["agents"] = agents_section
+        # Also write flat key for backward compat
+        settings["extra_agent_dirs"] = extra_agent_dirs
+        return True
+
+    _mutate(update)
+    # Prune disabled entries that no longer point at any configured directory —
+    # otherwise removing an extra dir leaves a stale disabled entry behind, and
+    # re-adding that path later would come back silently pre-disabled.
+    disabled = get_disabled_agent_dirs()
+    if disabled:
+        set_disabled_agent_dirs(disabled)
+    return extra_agent_dirs
+
+
+def get_extra_skill_dirs() -> List[str]:
+    """Get extra skill scan directories (user-added custom paths).
+
+    Reads from the nested schema first (``skills.extra_dirs``), falls back to
+    the legacy flat key (``extra_skill_dirs``) for backward compatibility.
+
+    Filters to non-empty strings so malformed persisted data (e.g. a manually
+    edited ``settings.json`` storing ``null`` or numbers) cannot later raise a
+    ``TypeError`` from ``Path(extra)`` and break skill listing/loading.
+    """
+    settings = _load()
+    # Nested format: {"skills": {"extra_dirs": [...]}}
+    nested = settings.get("skills", {})
+    if (
+        isinstance(nested, dict)
+        and "extra_dirs" in nested
+        and isinstance(nested["extra_dirs"], list)
+    ):
+        dirs = nested["extra_dirs"]
+    else:
+        # Legacy flat format: {"extra_skill_dirs": [...]}
+        dirs = settings.get("extra_skill_dirs", [])
+    if not isinstance(dirs, list):
+        return []
+    return [d.strip() for d in dirs if isinstance(d, str) and d.strip()]
+
+
+def get_skill_projection_mode() -> str:
+    """How Agent-Plugin skills are materialized into the global skill store.
+
+    ``"symlink"`` (default) links each projected skill at
+    ``SKILLS_DIR/<name>``; ``"copy"`` copies the content instead, for
+    environments where symlink creation is unsupported (Windows without
+    Developer Mode or elevation). Copy mode re-copies on every projection
+    rebuild, so it is correct but not free.
+
+    Reads ``skills.projection_mode``, alongside the existing
+    ``skills.extra_dirs``. Any unrecognized value falls back to ``"symlink"``
+    rather than raising — a hand-edited ``settings.json`` must not be able to
+    break plugin installation.
+    """
+    settings = _load()
+    nested = settings.get("skills", {})
+    mode = nested.get("projection_mode") if isinstance(nested, dict) else None
+    if isinstance(mode, str) and mode.strip().lower() in ("symlink", "copy"):
+        return mode.strip().lower()
+    return "symlink"
+
+
+def set_skill_projection_mode(mode: str) -> str:
+    """Set the Agent-Plugin skill projection mode (``"symlink"`` or ``"copy"``)."""
+    normalized = (mode or "").strip().lower()
+    if normalized not in ("symlink", "copy"):
+        raise ValueError(f"projection_mode must be 'symlink' or 'copy', got {mode!r}")
+
+    def update(settings: Dict[str, Any]) -> bool:
+        skills_section = settings.get("skills", {})
+        if not isinstance(skills_section, dict):
+            skills_section = {}
+        skills_section["projection_mode"] = normalized
+        settings["skills"] = skills_section
+        return True
+
+    _mutate(update)
+    return normalized
+
+
+def set_extra_skill_dirs(dirs: List[str]) -> List[str]:
+    """Set extra skill scan directories.
+
+    Writes to nested schema (``skills.extra_dirs``) and legacy flat key
+    (``extra_skill_dirs``) for backward compatibility.
+    """
+    extra_skill_dirs = [d.strip() for d in dirs if isinstance(d, str) and d.strip()]
+
+    def update(settings: Dict[str, Any]) -> bool:
+        # Write nested format
+        skills_section = settings.get("skills", {})
+        if not isinstance(skills_section, dict):
+            skills_section = {}
+        skills_section["extra_dirs"] = extra_skill_dirs
+        settings["skills"] = skills_section
+        # Also write flat key for backward compat
+        settings["extra_skill_dirs"] = extra_skill_dirs
+        return True
+
+    _mutate(update)
+    return extra_skill_dirs

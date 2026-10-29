@@ -1,0 +1,831 @@
+"""Base provider interface for CLI tool abstraction.
+
+This module defines the abstract base class that all CLI providers must implement.
+A "provider" is an adapter that enables CAO to interact with a specific CLI-based
+AI agent (e.g., Kiro CLI, Claude Code, Codex).
+
+Provider Responsibilities:
+- Initialize the CLI tool in a tmux window (run startup commands)
+- Detect terminal state by parsing terminal output (IDLE, PROCESSING, COMPLETED, etc.)
+- Extract agent responses from terminal output
+- Provide cleanup logic when terminal is deleted
+
+Implemented Providers:
+- KiroCliProvider: For Kiro CLI (kiro-cli chat)
+- ClaudeCodeProvider: For Claude Code (claude)
+- CodexProvider: For Codex CLI (codex)
+
+Each provider must implement pattern matching for its specific CLI's prompt
+and output format to reliably detect status changes.
+"""
+
+import logging
+import re
+import time
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+logger = logging.getLogger(__name__)
+
+
+class OutputExtractionError(ValueError):
+    """A provider ran but no usable message could be extracted from its output.
+
+    Distinct from the ``ValueError``s that name a bad terminal or provider
+    reference, which are genuine lookup failures. This one means the terminal
+    exists and the step ran; only the response marker was missing from the
+    scrollback.
+
+    Subclasses ``ValueError`` so existing ``except ValueError`` callers keep
+    working; the API boundary catches this narrower type first so an extraction
+    failure is not reported as 404 Not Found (issue #570).
+
+    This is the *retryable* half of the extraction contract: the response marker
+    was not found, so a wider capture may still succeed. A refusal to publish
+    content that was actually found is :class:`OutputExtractionRejected`.
+    """
+
+
+class ProviderExitedError(RuntimeError):
+    """The CLI process exited back to the shell before it was ready (#1018).
+
+    Raised by a provider's ``initialize()`` when the pane's foreground process is
+    again the shell it captured as ``shell_baseline`` before launching the CLI.
+    Distinct from ``TimeoutError``: the pane is not slow, it IS a shell, and the
+    task that was about to be delivered would have been executed by it as
+    commands. Not a ``TerminalInputBlockedError`` either -- that one means
+    "alive, parked on a prompt, leave it running"; this terminal has nothing
+    left to answer, so the deferred-init path tears it down like any other
+    startup failure.
+    """
+
+
+class OutputExtractionRejected(OutputExtractionError):
+    """A deliberate refusal to publish extracted content.
+
+    Raised when the extractor *found* the response region and refused to publish
+    what was in it — the turn produced only private reasoning, or every candidate
+    row was chrome, a user echo, or reasoning.
+
+    The distinction is a security boundary, not a taxonomy nicety. A missing
+    marker is worth retrying with a wider capture and may legitimately degrade to
+    a labelled raw-transcript fallback. A deliberate rejection must do neither:
+    the raw pane contains the very content that was refused, so substituting it
+    silently republishes private reasoning as the agent's answer. Callers that
+    escalate or fall back on :class:`OutputExtractionError` must re-raise this
+    subtype unchanged.
+
+    Subclasses :class:`OutputExtractionError` so existing callers that handle the
+    broader type keep working and the API boundary still maps it away from 404.
+    """
+
+
+class BaseProvider(ABC):
+    """Abstract base class for CLI tool providers.
+
+    All CLI providers must inherit from this class and implement the abstract methods.
+    The provider abstraction allows CAO to work with different CLI-based AI agents
+    through a unified interface.
+
+    Attributes:
+        terminal_id: Unique identifier for the terminal this provider manages
+        session_name: Name of the tmux session containing the terminal
+        window_name: Name of the tmux window containing the terminal
+        _status: Internal status cache (use get_status() for current status)
+        _allowed_tools: CAO-vocabulary tool names this agent is allowed to use
+    """
+
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        """Return whether this provider applies a per-launch model request.
+
+        Providers must override this declaration explicitly. The conservative
+        default prevents an undeclared provider from being reported as having
+        honored a model it may ignore.
+        """
+        return False
+
+    def __init__(
+        self,
+        terminal_id: str,
+        session_name: str,
+        window_name: str,
+        allowed_tools: Optional[List[str]] = None,
+        skill_prompt: Optional[str] = None,
+    ):
+        """Initialize provider with terminal context.
+
+        Args:
+            terminal_id: Unique identifier for this terminal instance
+            session_name: Name of the tmux session
+            window_name: Name of the tmux window
+            allowed_tools: Optional list of CAO tool names the agent is allowed to use
+            skill_prompt: Optional skill catalog text built by the service layer.
+                Providers append this to the system prompt when building their CLI command.
+        """
+        self.terminal_id = terminal_id
+        self.session_name = session_name
+        self.window_name = window_name
+        self._status = TerminalStatus.IDLE
+        self._allowed_tools: Optional[List[str]] = allowed_tools
+        self._skill_prompt: Optional[str] = skill_prompt
+        self._shell_baseline: Optional[str] = None
+        # Native-status (herdr) dispatch tracking. _task_dispatched disambiguates
+        # herdr's ambiguous "idle" (pre-first-turn IDLE vs post-turn COMPLETED);
+        # the two *_first_detected stamps drive the post-completion buffer-flush
+        # wait in _resolve_native_status(). Set by mark_input_received().
+        self._task_dispatched: bool = False
+        self._last_dispatch_time: float = 0.0
+        self._done_first_detected: float = 0.0
+        self._idle_first_detected: float = 0.0
+
+    @property
+    def shell_baseline(self) -> Optional[str]:
+        """Shell process name captured before the CLI tool launched.
+
+        Used by providers to detect when the CLI tool has exited and the
+        shell is showing again (current pane command matches this baseline).
+        """
+        return self._shell_baseline
+
+    @shell_baseline.setter
+    def shell_baseline(self, value: Optional[str]) -> None:
+        self._shell_baseline = value
+
+    @property
+    def status(self) -> TerminalStatus:
+        """Get current provider status."""
+        return self._status
+
+    @property
+    def paste_enter_count(self) -> int:
+        """Number of Enter keys to send after pasting user input.
+
+        After bracketed paste (``paste-buffer -p``), many TUIs (e.g.
+        Claude Code) enter multi-line mode. The first Enter adds a
+        newline; the second Enter on the empty line triggers submission.
+
+        Default is 2 (double-Enter). Override to 1 for TUIs where single
+        Enter submits after bracketed paste.
+        """
+        return 2
+
+    @abstractmethod
+    async def initialize(self) -> bool:
+        """Initialize the provider (e.g., start CLI tool, send setup commands).
+
+        Returns:
+            bool: True if initialization successful, False otherwise
+        """
+        pass
+
+    @abstractmethod
+    def get_status(self, buffer: str) -> TerminalStatus:
+        """Detect terminal status from output buffer using provider-specific patterns.
+
+        Called by StatusMonitor with the accumulated terminal output.
+
+        IMPORTANT — input contract: ``buffer`` is the **raw** pipe-pane byte
+        stream (cursor-positioning escapes, in-place ``\\r`` redraws, OSC titles),
+        NOT a tmux-rendered pane snapshot. Implementations that do structural /
+        line-oriented matching MAY run it through
+        ``cli_agent_orchestrator.utils.text.strip_terminal_escapes`` first
+        (which removes escapes and normalizes cursor moves to newlines).
+        Detectors calibrated against rendered snapshots will misfire on the raw
+        stream if they skip this step. This is deliberately not a hard
+        requirement: some providers depend on the raw escapes (kiro_cli
+        preserves ``\\r`` for permission-prompt detection — see the comment in
+        its get_status) and must NOT be "fixed" to comply.
+
+        Args:
+            buffer: Raw terminal output (rolling buffer, up to ``state_buffer_max``
+                bytes -- server setting, 32KB default).
+
+        Returns:
+            TerminalStatus - always returns a valid status.
+            UNKNOWN if no pattern matched, ERROR only for matched error patterns.
+        """
+        pass
+
+    def get_error_message(self, buffer: str) -> Optional[str]:
+        """Return a provider-owned fatal error message represented by ``buffer``.
+
+        Most providers expose only a status verdict, so the default is no
+        detail. Providers may override this when they can prove that a line is
+        provider error chrome rather than assistant prose. Callers still own
+        bounding and sanitizing the returned string before persistence.
+        """
+
+        return None
+
+    # Opt-in flag for pyte-rendered status detection. A provider sets this True
+    # ONLY when it ships a purpose-built get_status_from_screen() calibrated for
+    # a composited fixed-height viewport (not the raw byte stream). When False,
+    # the StatusMonitor never routes this provider through the screen path even
+    # if CAO_PYTE_STATUS is on — protecting providers (and kiro_cli, which
+    # depends on raw \r) whose detectors are tuned for the raw stream.
+    supports_screen_detection: bool = False
+
+    # Opt-in, with supports_screen_detection, for the screen in the cheap
+    # re-check that StatusMonitor.get_status() runs for a poller while a
+    # terminal reads PROCESSING. By default that re-check parses the raw
+    # rolling buffer. Set True when the raw stream of the provider does not
+    # parse like its screen: Codex redraws only the cells that change, so the
+    # raw buffer of a working turn can parse as IDLE, and that IDLE ended the
+    # PROCESSING of the turn just after it began. Claude Code's Ink TUI repaints
+    # changed cells only, so the raw window holds glyph fragments and, once a
+    # long answer has pushed the input box past the size cap, no box at all
+    # for its detector to anchor on (GH #865). Providers that leave this False
+    # keep the raw re-check, which their detectors and turn bookkeeping were
+    # built around.
+    status_recheck_uses_screen: bool = False
+
+    # Opt-in for the deferred-init direct status probe (capture-pane bypass).
+    # Set True on providers whose get_status() detector is line-oriented and
+    # works correctly on a rendered capture-pane snapshot. Providers whose
+    # get_status() relies on dispatch bookkeeping (e.g. kiro_cli) must leave
+    # this False — their COMPLETED/IDLE split is not screen-detectable.
+    supports_direct_status_probe: bool = False
+
+    # Whether the direct probe's COMPLETED verdict identifies WHICH turn
+    # completed. A rendered pane keeps the previous turn's completion marker on
+    # screen, so a probe that only pattern-matches the marker reports COMPLETED
+    # for a receiver that never accepted the new paste. The deferred-init path
+    # never hits this (a fresh worker has no earlier turn on screen); the inbox
+    # path always can, so it treats a probe COMPLETED as evidence only when the
+    # provider sets this True -- i.e. its detector binds the completion to the
+    # dispatched turn (minimax_code: completion identity + buffer epoch). With
+    # it False the inbox path accepts only live verdicts (PROCESSING,
+    # WAITING_USER_ANSWER) from the probe. Meaningless unless
+    # ``supports_direct_status_probe`` is also True.
+    direct_status_probe_has_turn_identity: bool = False
+
+    # Opt-in only for StatusMonitor's quiet stale-PROCESSING capture-pane
+    # recovery. This is intentionally distinct from
+    # ``supports_direct_status_probe``: the latter also certifies deferred-init
+    # task pickup, where a provider's conservative PROCESSING fallback may mean
+    # "this rendered frame is stale/ambiguous" rather than "the new task
+    # started". A provider can therefore be safe to re-check from a settled
+    # rendered viewport without being safe as delivery evidence.
+    supports_stale_processing_capture: bool = False
+
+    # Uses the stale-processing probe/commit contract; active dialogs must stay waiting.
+    supports_stale_waiting_capture: bool = False
+
+    # Opt-in for the mid-burst PROCESSING probe (StatusMonitor._midburst_processing_probe).
+    # Set True ONLY alongside a probe_processing_from_screen() override that is
+    # side-effect free. The probe runs on a HALF-DRAWN frame, off the two edges
+    # the screen path is otherwise restricted to, and its verdict is discarded
+    # unless it says PROCESSING — so a detector that commits turn bookkeeping
+    # while deciding (minimax_code's completion identity/epoch and _awaiting_turn,
+    # grok_cli's _turn_activity_seen) would have that bookkeeping applied from a
+    # frame the monitor then throws away. Providers that leave this False are
+    # never probed: the terminal keeps the status the edges give it.
+    #
+    # Composes with ``assume_processing_on_dispatch``: the dispatch latch is an
+    # optimistic PROCESSING, not an observation, so the probe still runs until
+    # the turn's work is actually seen (#814).
+    supports_midburst_processing_probe: bool = False
+
+    def probe_processing_from_screen(self, screen_lines: List[str]) -> bool:
+        """Report whether this half-drawn frame shows the agent actively working.
+
+        A pure observation, called only when ``supports_midburst_processing_probe``
+        is True: it MUST NOT mutate provider state, because the monitor ignores
+        everything it says except True, and the frame it sees is mid-redraw
+        rather than settled.
+
+        Answer True only on POSITIVE evidence of work — a drawn spinner or
+        progress row — never on the absence of a ready prompt. A partial redraw
+        routinely erases the composer while the previous response is still on
+        screen, and a settled detector reasonably calls that PROCESSING; here it
+        is not, and a True there spends the monitor's dispatch arm on a frame
+        that shows no new turn (see CodexProvider). Leave every other verdict to
+        the rising edge and quiescence, which see whole frames.
+
+        Default: False — no provider is probed unless it opts in.
+        """
+        return False
+
+    def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
+        """Detect status from a pyte-rendered screen (composited viewport).
+
+        ``screen_lines`` is ``pyte.Screen.display``: a fixed-height list of
+        viewport rows with all cursor moves and in-place redraws already
+        resolved, escape-free, right-padded with spaces. The StatusMonitor
+        calls this (instead of get_status) when CAO_PYTE_STATUS is enabled AND
+        ``supports_screen_detection`` is True. It is invoked on two edges only —
+        the RISING edge (output resumes after a quiet period) and at QUIESCENCE
+        (no new output for the debounce window) — never mid-burst, so a frame is
+        either freshly-resumed or fully settled, not half-drawn. Detectors must
+        not assume every frame is fully settled.
+
+        Default implementation joins the rows into a newline-delimited string
+        and delegates to get_status — a safe no-op fallback for providers that
+        have not been migrated. Override with a viewport-anchored detector
+        (see ClaudeCodeProvider) and set ``supports_screen_detection = True``.
+        """
+        return self.get_status("\n".join(screen_lines))
+
+    def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
+        """Return this provider's current editable composer, when it is known.
+
+        A rendered pane also contains transcript history, so callers must not
+        infer an input boundary from its cursor position alone. Providers opt
+        in only when they can identify their own live composer structure.
+        """
+        return None
+
+    @property
+    def paste_submit_delay(self) -> float:
+        """Seconds to wait after a bracketed paste before sending the Enter key.
+
+        Some TUIs need time to finish processing the bracketed-paste end marker
+        before an Enter registers as "submit" rather than a literal newline.
+        Override per-provider when a CLI needs longer than the default (e.g. the
+        newest Claude Code, whose Ink renderer swallows an Enter sent too soon).
+        """
+        return 0.3
+
+    async def wait_until_input_ready(self, timeout: float = 5.0) -> bool:
+        """Wait until the provider's input surface actually accepts keystrokes.
+
+        Called after ``initialize()``'s status wait reports IDLE/COMPLETED and
+        before the first paste is sent. For most CLIs the status wait is
+        sufficient and this default returns immediately. TUI providers whose
+        renderer drops keystrokes for a beat after the prompt first renders
+        (e.g. Claude Code's Ink input box) override this with a real readiness
+        check, so the first ``send_input`` does not race the widget.
+
+        Returns True when input is believed ready; False on timeout. Callers
+        treat False as "proceed anyway" (best effort) — the method must never
+        raise for a readiness miss.
+        """
+        return True
+
+    @property
+    def accepts_input_while_processing(self) -> bool:
+        """Whether this provider buffers pasted input during PROCESSING for next-turn pickup.
+
+        When True AND CAO_EAGER_INBOX_DELIVERY is enabled, the inbox service will
+        deliver messages to this terminal even when its status is PROCESSING,
+        rather than waiting for IDLE/COMPLETED.
+
+        Override in subclasses for providers whose TUI buffers input at all times
+        (e.g., Claude Code's Ink renderer).
+        """
+        return False
+
+    @property
+    def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
+        """Whether orchestrated input should pause when the provider waits on UI input.
+
+        Some CLIs render interactive pickers or approval prompts where pasted
+        task text would be interpreted as the answer to that prompt. Providers
+        with those surfaces can opt in so CAO blocks orchestrated task delivery
+        while still allowing explicit user-prompt answers.
+
+        Read on two paths: ``terminal_service.send_input`` refuses assign,
+        handoff AND send_message (inbox) deliveries into WAITING_USER_ANSWER,
+        and ``inbox_service`` excludes WAITING_USER_ANSWER from eager delivery
+        for these providers. Both were needed for #896 — before that fix an
+        inbox message was pasted into an open Claude Code AskUserQuestion
+        dialog, which swallowed the text and answered itself.
+        """
+        return False
+
+    @property
+    def assume_processing_on_dispatch(self) -> bool:
+        """Publish PROCESSING immediately when a task is dispatched.
+
+        Most CLIs repaint quickly enough for their first activity frame to
+        drive the transition. Full-screen TUIs that can remain visually
+        unchanged just after submission opt in so callers cannot observe the
+        previous turn's cached COMPLETED state as the new turn's result.
+
+        The published PROCESSING is an optimistic latch, NOT provider evidence.
+        It carries no observation stamp, so it is not "this turn has been seen
+        working": the mid-burst processing probe keeps running until the work is
+        actually seen on screen (#814), and the stale-PROCESSING capture gate,
+        for providers that opt into that recovery, does not accept it either.
+        """
+        return False
+
+    @property
+    def extraction_retries(self) -> int:
+        """Number of extraction retries for transient TUI rendering issues.
+
+        TUI-based providers (e.g. Antigravity CLI's renderer) may show
+        notification spinners that temporarily obscure response text in
+        the tmux capture buffer.  Override this to enable automatic retries
+        with re-capture between attempts.  Default is 0 (no retries).
+        """
+        return 0
+
+    @property
+    def allow_raw_transcript_fallback(self) -> bool:
+        """Whether LAST output may degrade to the provider raw terminal pane.
+
+        The historical service behavior is permissive because several providers
+        have no private sub-channels in their rendered transcript. Providers
+        whose pane can contain non-publishable channels must override this to
+        False. Extraction retries still widen normally; only the raw-pane
+        substitution after exhaustion is disabled.
+        """
+
+        return True
+
+    @abstractmethod
+    def extract_last_message_from_script(self, script_output: str) -> str:
+        """Extract the last message from terminal script output.
+
+        Args:
+            script_output: Raw terminal output/script content
+
+        Returns:
+            str: Extracted last message from the provider
+        """
+        pass
+
+    @abstractmethod
+    def exit_cli(self) -> str:
+        """Get the command to exit the provider CLI.
+
+        Returns:
+            Command string to send to terminal for exiting
+        """
+        pass
+
+    @abstractmethod
+    def cleanup(self) -> bool | None:
+        """Clean up provider resources.
+
+        Providers may return ``False`` when cleanup is intentionally deferred
+        and lifecycle metadata must be retained for a retry. Existing providers
+        that return ``None`` are treated as successfully cleaned up.
+        """
+        pass
+
+    def mark_input_received(self) -> None:
+        """Notify the provider that external input was sent to the terminal.
+
+        Called by the terminal service after send_input() delivers a message.
+        Records that a task was dispatched so the native-status path can
+        distinguish herdr "idle" after task completion (-> COMPLETED) from
+        "idle" before any task was dispatched (-> IDLE), and resets the
+        post-completion flush-wait timers.
+
+        Providers may override to also update their own buffer-detection flag,
+        but should call ``super().mark_input_received()`` to preserve the shared
+        native-status tracking.
+        """
+        self._task_dispatched = True
+        self._last_dispatch_time = time.time()
+        self._done_first_detected = 0.0
+        self._idle_first_detected = 0.0
+
+    def record_dispatched_message(self, message: str) -> None:
+        """Record the exact text being delivered after the input boundary is armed.
+
+        Providers may use this to attribute partial terminal redraws to the
+        current dispatch. Recording text alone is never execution evidence.
+        """
+
+    def mark_redelivery_received(self) -> None:
+        """Notify the provider that CAO re-delivered the SAME logical dispatch.
+
+        ``terminal_service.redeliver_dropped_message`` re-sends a prompt the TUI
+        never accepted (a dropped paste, or an Enter that was swallowed). That is
+        a second *delivery attempt* of the dispatch already announced by
+        :meth:`mark_input_received`, not a new logical turn: the caller is still
+        waiting for the same task it dispatched, so a provider that counts turns
+        — or derives any turn identity from that count — must not believe a new
+        turn began. A provider with no such distinction needs no override.
+
+        The default delegates to :meth:`mark_input_received` so every provider
+        whose bookkeeping does not separate delivery attempts from logical turns
+        keeps exactly its previous behavior on the redelivery path.
+        """
+        self.mark_input_received()
+
+    def notify_status_buffer_reset(self, epoch: int) -> None:
+        """Notify the provider that StatusMonitor started a fresh byte buffer.
+
+        ``StatusMonitor.clear_rolling_buffer()`` is used immediately before a
+        new prompt is pasted.  Providers that carry state across observations
+        (for example a completion fingerprint plus a monotonic stream offset)
+        must not infer continuity through that explicit boundary.  The monitor
+        supplies a monotonically increasing per-terminal ``epoch`` so a
+        provider can retain stale-screen protections while recognising output
+        from the newly-dispatched turn.
+
+        Implementations must be synchronous, cheap, and must not call back
+        into ``StatusMonitor``: the notification is delivered while its lock is
+        held to make the clear and reset atomic relative to output processing.
+        """
+
+        # Most providers only inspect their current rolling buffer and have no
+        # cross-observation state, so the default is intentionally a no-op.
+        del epoch
+
+    def _resolve_native_status(self, buffer: Optional[str] = None) -> Optional[TerminalStatus]:
+        """Resolve status from the backend's native agent state, if available.
+
+        On the herdr backend, ``pipe_pane`` is a no-op so the StatusMonitor
+        buffer is always empty; status must come from herdr's native pane state
+        rather than buffer parsing. Every provider calls this at the top of
+        ``get_status()``; when it returns non-None the buffer path is skipped.
+
+        ``get_native_status()`` returns None when the backend cannot resolve a
+        real agent state — always on tmux, and on herdr when the agent_status
+        is "unknown" (a wrapped ``podman``/``docker exec`` launch hides the
+        agent CLI from herdr). In both cases this returns None unconditionally
+        so the caller falls through to buffer analysis via ``_resolve_buffer()``
+        — never a guess derived from dispatch timing. A guess here previously
+        traded fail-fast init detection (a dead/wedged launch reported ERROR)
+        for optimistic PROCESSING/IDLE, which silently masked real failures
+        until a hardcoded staleness window elapsed. Buffer analysis on real
+        pane content (see ``_resolve_buffer``) restores both fail-fast ERROR
+        detection and a real COMPLETED path without that tradeoff.
+
+        The only ambiguous non-None native state is IDLE: herdr reports "idle"
+        both before any task has been dispatched AND after a task completed
+        (e.g. the user focused the tab, resetting "done" -> "idle").
+        ``_task_dispatched`` (set by mark_input_received()) disambiguates.
+        COMPLETED ("done") and IDLE-post-dispatch both wait 10s from first
+        detection for the pane buffer to flush before reporting COMPLETED, so
+        extract_last_message sees settled output; the idle path gives up
+        (reports COMPLETED) 300s after dispatch.
+
+        Args:
+            buffer: Unused; retained so existing call sites (``self.
+                _resolve_native_status(output)``) do not need updating.
+        """
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        native = get_backend().get_native_status(self.session_name, self.window_name)
+        logger.debug(
+            "[get_status] terminal=%s native=%s",
+            self.terminal_id,
+            native.value if native is not None else None,
+        )
+        if native is None:
+            # Unresolvable at the backend level (tmux always; herdr "unknown").
+            # Fall through to buffer analysis unchanged — no guessing here.
+            return None
+        if native == TerminalStatus.PROCESSING:
+            # Reset flush-wait timers — herdr is actively working, so any
+            # previously stamped idle/done timestamp is from a pre-work gap
+            # and must not be counted toward the post-completion flush wait.
+            self._done_first_detected = 0.0
+            self._idle_first_detected = 0.0
+            logger.debug("[get_status] terminal=%s -> PROCESSING (native)", self.terminal_id)
+            return TerminalStatus.PROCESSING
+        if native == TerminalStatus.COMPLETED and self._task_dispatched:
+            # herdr "done": wait 10s from first detection for buffer to flush.
+            if self._done_first_detected == 0.0:
+                self._done_first_detected = time.time()
+            waited = time.time() - self._done_first_detected
+            if waited >= 10.0:
+                logger.debug(
+                    "[get_status] terminal=%s -> COMPLETED (native done, %.1fs flush wait elapsed)",
+                    self.terminal_id,
+                    waited,
+                )
+                return TerminalStatus.COMPLETED
+            logger.debug(
+                "[get_status] terminal=%s -> PROCESSING (native done, flush wait %.1fs/10s)",
+                self.terminal_id,
+                waited,
+            )
+            return TerminalStatus.PROCESSING
+        if native == TerminalStatus.IDLE and self._task_dispatched:
+            # herdr "idle" post-dispatch: wait 10s from first detection for buffer to flush,
+            # then report COMPLETED (warn if still idle 5 min after dispatch).
+            if self._idle_first_detected == 0.0:
+                self._idle_first_detected = time.time()
+            waited = time.time() - self._idle_first_detected
+            elapsed = time.time() - self._last_dispatch_time
+            if waited >= 10.0:
+                if elapsed >= 300.0:
+                    logger.warning(
+                        "[get_status] terminal=%s -> COMPLETED (native idle, %.0fs since dispatch, giving up)",
+                        self.terminal_id,
+                        elapsed,
+                    )
+                    return TerminalStatus.COMPLETED
+                logger.debug(
+                    "[get_status] terminal=%s -> COMPLETED (native idle, %.1fs flush wait elapsed)",
+                    self.terminal_id,
+                    waited,
+                )
+                return TerminalStatus.COMPLETED
+            logger.debug(
+                "[get_status] terminal=%s -> PROCESSING (native idle, flush wait %.1fs/10s)",
+                self.terminal_id,
+                waited,
+            )
+            return TerminalStatus.PROCESSING
+        if native == TerminalStatus.IDLE:
+            logger.debug(
+                "[get_status] terminal=%s -> IDLE (native idle, no task dispatched)",
+                self.terminal_id,
+            )
+            return TerminalStatus.IDLE
+        # COMPLETED (no task dispatched), WAITING_USER_ANSWER, ERROR -- return directly
+        logger.debug("[get_status] terminal=%s -> %s (native)", self.terminal_id, native.value)
+        return native
+
+    def _resolve_buffer(self, buffer: Optional[str]) -> str:
+        """Resolve the buffer ``get_status()`` should parse when native status is None.
+
+        Event-inbox backends (herdr) never populate the pushed StatusMonitor
+        buffer -- ``pipe_pane`` is a no-op there (see ``_resolve_native_status``)
+        -- so an empty ``buffer`` on herdr does not mean the pane has no
+        content, only that the push pipeline was never fed. Falling straight
+        through to a provider's "no output" default (UNKNOWN, or ERROR for
+        hermes) on every herdr call was the original #359 gap; guessing status
+        from dispatch timing (the #400 native-None matrix this replaces) traded
+        that gap for silently masking real failures behind an optimistic
+        window. Reading the backend's live pane content instead lets each
+        provider's EXISTING pattern matching (idle prompt, error text, response
+        markers) run against real content: a dead launch's error text is
+        visible, a wedged pane genuinely shows no prompt, and a finished turn's
+        response is genuinely there to extract.
+
+        On tmux, ``buffer`` is already populated by the FIFO push pipeline, so
+        this is a pure pass-through -- no extra backend round-trip.
+
+        Args:
+            buffer: The StatusMonitor's pushed buffer for this terminal (may be
+                empty or None).
+
+        Returns:
+            ``buffer`` unchanged (tmux, or a non-empty herdr buffer), or a live
+            ``get_history()`` read (herdr with an empty pushed buffer). Never
+            raises -- a backend read failure falls back to ``buffer`` (or "").
+        """
+        if buffer:
+            return buffer
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        backend = get_backend()
+        if not backend.supports_event_inbox():
+            return buffer or ""
+        try:
+            return backend.get_history(self.session_name, self.window_name)
+        except Exception as e:
+            logger.debug(
+                "[get_status] terminal=%s live buffer read failed, falling back to "
+                "pushed buffer: %s",
+                self.terminal_id,
+                e,
+            )
+            return buffer or ""
+
+    @staticmethod
+    def _extract_questions(user_messages: List[str]) -> List[str]:
+        """Extract lines containing '?' from user messages."""
+        questions: List[str] = []
+        for msg in user_messages:
+            for line in msg.splitlines():
+                stripped = line.strip()
+                if "?" in stripped and len(stripped) > 5:
+                    questions.append(stripped)
+        return questions[-5:]  # last 5
+
+    @staticmethod
+    def _extract_decisions(assistant_text: str) -> List[str]:
+        """Extract decision-like sentences from assistant output."""
+        decision_indicators = re.compile(
+            r"(?:I(?:'ll| will| have| decided| chose| went with|'m going to)|"
+            r"(?:The |My |Our )?(?:approach|decision|plan|solution|strategy) (?:is|was|will be)|"
+            r"(?:We should|Let's|Going to|Decided to|Chose to))",
+            re.IGNORECASE,
+        )
+        decisions: List[str] = []
+        for line in assistant_text.splitlines():
+            stripped = line.strip()
+            if decision_indicators.search(stripped) and len(stripped) > 10:
+                # Trim to first sentence if very long
+                if len(stripped) > 200:
+                    stripped = stripped[:200] + "..."
+                decisions.append(stripped)
+        return decisions[-10:]  # last 10
+
+    @staticmethod
+    def _extract_file_paths(text: str) -> List[str]:
+        """Extract file paths mentioned in terminal output.
+
+        Looks for common patterns: paths with extensions, tool-use file references.
+        """
+        # Match paths like src/foo/bar.py, ./test.js, /abs/path.ts
+        path_pattern = re.compile(
+            r"(?:^|[\s\"'`(])(" r"(?:\.{0,2}/)?(?:[\w.-]+/)+[\w.-]+\.\w{1,10}" r")"
+        )
+        seen: set[str] = set()
+        paths: List[str] = []
+        for match in path_pattern.finditer(text):
+            p = match.group(1)
+            if p not in seen and not p.startswith("http"):
+                seen.add(p)
+                paths.append(p)
+        return paths[-20:]  # last 20
+
+    def _build_context_dict(
+        self,
+        provider_name: str,
+        last_task: str,
+        key_decisions: List[str],
+        open_questions: List[str],
+        files_changed: List[str],
+    ) -> Dict[str, Any]:
+        """Build the standard session context dict."""
+        return {
+            "provider": provider_name,
+            "terminal_id": self.terminal_id,
+            "last_task": last_task,
+            "key_decisions": key_decisions,
+            "open_questions": open_questions,
+            "files_changed": files_changed,
+        }
+
+    def _apply_skill_prompt(self, system_prompt: str) -> str:
+        """Append skill catalog text to a system prompt if available.
+
+        Args:
+            system_prompt: The base system prompt string.
+
+        Returns:
+            The system prompt with skill catalog appended, or unchanged if
+            no skill_prompt was provided.
+        """
+        if not self._skill_prompt:
+            return system_prompt
+        if system_prompt:
+            return f"{system_prompt}\n\n{self._skill_prompt}"
+        return self._skill_prompt
+
+    def get_init_timeout(self, profile: Optional["AgentProfile"] = None) -> int:
+        """Resolve the provider initialization timeout (seconds).
+
+        Returns the per-profile ``provider_init_timeout`` override when the
+        profile declares one, else the server default from
+        ``get_server_settings()`` (60s). Lets containerized profiles, whose
+        wrapped CLI can take far longer to reach IDLE, declare a longer init
+        cap without changing global config.
+
+        Passed the loaded profile as a parameter (like ``_translate_path``)
+        rather than reading ``self`` — subclasses store a profile *name string*
+        in ``self._agent_profile``, not an ``AgentProfile`` object.
+        """
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        if profile is not None and profile.provider_init_timeout is not None:
+            return profile.provider_init_timeout
+        return int(get_server_settings()["provider_init_timeout"])
+
+    def _translate_path(self, path: str, profile: Optional["AgentProfile"] = None) -> str:
+        """Translate a host path to a container guest path using profile path_maps.
+
+        Uses longest-prefix-match: if multiple path_maps match, the one with the
+        longest host prefix wins.  If no map matches, returns the path unchanged.
+
+        ``best_len`` starts at -1 (not 0) so a root mapping (``host="/"``) can
+        still win when it is the only match: ``rstrip("/")`` reduces ``"/"`` to
+        ``""`` (length 0), and ``0 > 0`` is never true, so starting the
+        comparison at 0 silently dropped every root mapping regardless of
+        whether anything more specific matched.
+        """
+        if profile is None or profile.container is None or not profile.container.path_maps:
+            return path
+
+        best_match = None
+        best_len = -1
+        for mapping in profile.container.path_maps:
+            host_prefix = mapping.host.rstrip("/")
+            if path == host_prefix or path.startswith(host_prefix + "/"):
+                if len(host_prefix) > best_len:
+                    best_match = mapping
+                    best_len = len(host_prefix)
+
+        if best_match is None:
+            return path
+
+        host_prefix = best_match.host.rstrip("/")
+        guest_prefix = best_match.guest.rstrip("/")
+        return guest_prefix + path[best_len:]
+
+    def _update_status(self, status: TerminalStatus) -> None:
+        """Update internal status."""
+        self._status = status

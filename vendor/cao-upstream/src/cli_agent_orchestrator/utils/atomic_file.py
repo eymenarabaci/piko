@@ -1,0 +1,584 @@
+"""Shared helpers for inter-process-safe atomic writes to a file.
+
+Two entry points share one set of guarantees:
+
+* :func:`locked_atomic_rewrite` — read the existing content, compute the new
+  content from it, publish atomically. For genuine read-modify-write callers.
+* :func:`locked_atomic_write` — publish new content without reading the old.
+  For full replaces, where the read is pointless and is the only step that can
+  fail on a target holding undecodable bytes.
+
+Several call sites (the Codex/Claude Code memory-injection plugins,
+``utils/skill_injection.py``) implement the same "read existing content,
+compute new content, replace atomically" idiom against a shared target file
+that can be written by more than one **process** — a CAO CLI command and
+``cao-server`` can both touch the same ``AGENTS.md`` / ``CLAUDE.md`` /
+``.agent.md``, and multiple ``cao-server`` worker terminals can trigger the
+hook concurrently for the same working directory.
+
+Two independent bugs show up when the read-modify-write + "atomic" replace
+is done without any lock:
+
+* **Shared temp filename** — ``target.with_suffix(target.suffix + ".tmp")``
+  is a fixed path. Two concurrent writers interleave on the *same* temp
+  file: one writer's ``os.replace`` can publish the other's half-written
+  content, and the ``finally`` unlink can delete the other writer's live
+  temp file out from under it (``FileNotFoundError`` on its own replace).
+* **Lost update** — even with unique temp files, two writers can both read
+  the same base content, compute their own new content, and replace in
+  turn. The second replace wins; the first writer's change is silently
+  lost even though both report success.
+
+``locked_atomic_rewrite`` fixes both: it holds an inter-process
+an OS advisory lock (exclusive, ``LOCK_EX``) on a lockfile from before the read
+until after ``os.replace``, and writes through a temp file that is unique
+per-call (so concurrent *unlocked* readers/writers elsewhere never collide)
+and lives in the same directory as the target (so the final ``os.replace``
+stays on one filesystem and atomic).
+
+Unlike the ``memory_service.py`` / ``wiki_healer.py`` idiom this was modelled
+on — whose targets live under ``CAO_HOME_DIR`` (CAO's own space), so a sidecar
+``target + ".lock"`` never pollutes anything — this helper's targets are
+USER-AUTHORED files in the user's working tree (``AGENTS.md``,
+``.claude/CLAUDE.md``, ``dev.agent.md``). A lock file placed beside each target
+would leave permanent untracked ``*.lock`` files in the user's repo. So the
+lock file is instead kept in a CAO-owned scratch directory (``LOCK_DIR``,
+under ``CAO_HOME_DIR``), keyed by a hash of the target's resolved absolute
+path. This keeps the cross-process serialization guarantee intact — every
+process that locks the same target computes the same lock path — while adding
+ZERO new files to the user's tree.
+
+A threading/asyncio lock alone would not be sufficient here: the CAO CLI
+and ``cao-server`` are separate OS processes, so a kernel-backed cross-process
+lock is required (see
+``services/memory_service.py``, ``services/wiki_healer.py``,
+``services/memory_reconciliation.py``) that is honoured across processes.
+
+POSIX uses ``flock``; Windows uses a byte-range lock on byte zero. Windows
+shared lock requests are serialized as exclusive locks, preserving correctness
+at the cost of reader concurrency.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import errno
+import hashlib
+import logging
+import os
+import secrets
+import stat
+import tempfile
+import time
+from pathlib import Path
+from typing import Callable, Iterator, Optional, Tuple
+
+from cli_agent_orchestrator.constants import LOCK_DIR
+from cli_agent_orchestrator.utils import file_lock as fcntl
+
+_FILE_LOCK_AVAILABLE = fcntl.AVAILABLE
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_LOCK_TIMEOUT_SECONDS = 10.0
+_LOCK_POLL_INTERVAL_SECONDS = 0.05
+
+
+def _lock_path_for(target: Path) -> Path:
+    """Return the CAO-owned lock file path for ``target``.
+
+    The lock lives under ``LOCK_DIR`` (CAO's scratch space), NOT beside the
+    target, so locking a user-tree file adds no files to the user's repo. The
+    lock filename is a hash of the target's *resolved absolute* path, which is
+    what makes the scheme correct across processes: any process (CLI or
+    cao-server) that locks the same target computes the same key, and two
+    distinct targets cannot collide.
+
+    ``Path.resolve(strict=False)`` normalizes the path (absolute, symlinks and
+    ``..`` resolved) even when the target does not exist yet — the common case
+    here, since these files are often created on first write — so the key is
+    stable regardless of whether the target exists at lock time.
+    """
+    resolved = str(target.resolve(strict=False))
+    return _lock_path_for_identity(resolved)
+
+
+def _lock_path_for_identity(identity: str) -> Path:
+    """Return the permanent common lock path for an exact caller identity.
+
+    Callers with filesystem-specific aliasing rules may supply an identity
+    normalized for their storage contract. This helper deliberately performs
+    no path resolution or case normalization itself; the existing target-based
+    lock behavior remains unchanged.
+    """
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    return LOCK_DIR / f"{digest}.lock"
+
+
+class LockUnavailableError(OSError):
+    """Raised when a required inter-process lock cannot be provided."""
+
+
+class LockTimeoutError(LockUnavailableError, TimeoutError):
+    """Raised when the inter-process lock cannot be acquired in time."""
+
+    def __init__(self, lock_path: Path, timeout: float) -> None:
+        self.lock_path = lock_path
+        self.timeout = timeout
+        super().__init__(
+            f"timed out after {timeout}s waiting for lock {lock_path} "
+            "(another process is holding it)"
+        )
+
+
+@contextlib.contextmanager
+def strict_target_lock(
+    target: Path,
+    *,
+    lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+) -> Iterator[None]:
+    """Hold the permanent common lock for ``target`` or refuse explicitly.
+
+    Unlike the older general-purpose helpers' best-effort fallback, this
+    context never yields unless a platform lock is available and acquired.
+    Workflow create/update use this strict boundary because proceeding unlocked
+    would make their existence/hash checks racy again.
+    """
+    lock_path = _lock_path_for(target)
+    with _strict_lock_path(lock_path, target, lock_timeout):
+        yield
+
+
+@contextlib.contextmanager
+def strict_identity_lock(
+    lock_identity: str,
+    target: Path,
+    *,
+    lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+) -> Iterator[None]:
+    """Hold a strict lock selected solely by a caller-provided identity.
+
+    Workflow authoring has already resolved and contained its target before it
+    constructs a filesystem-aware identity. Keeping that contained path out of
+    :func:`_lock_path_for` prevents a second, unguarded path resolution while
+    retaining the target in storage error messages.
+    """
+    lock_path = _lock_path_for_identity(lock_identity)
+    with _strict_lock_path(lock_path, target, lock_timeout):
+        yield
+
+
+@contextlib.contextmanager
+def _strict_lock_path(lock_path: Path, target: Path, lock_timeout: float) -> Iterator[None]:
+    """Acquire one already-selected strict lock path."""
+    if not _FILE_LOCK_AVAILABLE:
+        raise LockUnavailableError(
+            f"inter-process locking is unavailable for workflow target {target}"
+        )
+
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise LockUnavailableError(f"cannot open workflow lock {lock_path}") from exc
+
+    acquired = False
+    deadline = time.monotonic() + lock_timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise LockTimeoutError(lock_path, lock_timeout)
+                time.sleep(_LOCK_POLL_INTERVAL_SECONDS)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    if time.monotonic() >= deadline:
+                        raise LockTimeoutError(lock_path, lock_timeout) from exc
+                    time.sleep(_LOCK_POLL_INTERVAL_SECONDS)
+                    continue
+                raise LockUnavailableError(
+                    f"inter-process locking is unsupported for {lock_path}"
+                ) from exc
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(lock_fd)
+
+
+@contextlib.contextmanager
+def _file_lock(lock_path: Path, timeout: float) -> Iterator[None]:
+    """Hold an exclusive, inter-process OS advisory lock on ``lock_path``.
+
+    Blocks (polling, so a timeout can be enforced) until the lock is
+    acquired or ``timeout`` elapses, then yields with the lock held and
+    releases it on exit. Fails closed on unsupported locking platforms.
+    """
+    if not _FILE_LOCK_AVAILABLE:
+        raise LockUnavailableError(
+            f"inter-process locking is unavailable for target {lock_path}"
+        )
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise LockTimeoutError(lock_path, timeout)
+                time.sleep(_LOCK_POLL_INTERVAL_SECONDS)
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        os.close(lock_fd)
+
+
+def _existing_target_mode(target: Path) -> Optional[int]:
+    """Return the permission bits of an existing ``target``, or ``None`` if absent.
+
+    tempfile.mkstemp creates its temp file at a hard-coded 0600, so without
+    fixing this up ``os.replace`` would silently downgrade a user-authored
+    0644 file (AGENTS.md, CLAUDE.md, .agent.md) to 0600 on every rewrite,
+    breaking group-shared checkouts and other-uid tooling. An existing
+    target's mode is preserved verbatim. For a NEW file the answer is
+    ``None``: the caller creates the temp file itself with mode 0o666 and
+    lets the kernel apply the process umask, which yields exactly what
+    ``write_text`` would have produced without ever reading, let alone
+    setting, the umask. (Reading it requires ``os.umask(0)`` followed by a
+    restore, and the umask is process-global: any other thread creating a
+    file inside that window got 0666.)
+    """
+    try:
+        return stat.S_IMODE(os.stat(target).st_mode)
+    except FileNotFoundError:
+        return None
+
+
+def _open_unique_temp(target: Path, mode: Optional[int]) -> Tuple[int, Path]:
+    """Create a uniquely named temp file next to ``target`` and return ``(fd, path)``.
+
+    With ``mode`` given (existing target) the file is created private via
+    ``tempfile.mkstemp`` and the caller ``fchmod``s it to ``mode`` before the
+    replace. With ``mode`` None (new target) it is created ``O_EXCL`` with
+    0o666 so the kernel applies the umask, the same default any ordinary
+    ``open(..., "w")`` receives; the name is unique per call, so a retry or an
+    unrelated writer can never collide with, or unlink, this call's temp file.
+    """
+    if mode is not None:
+        fd, temp_name = tempfile.mkstemp(
+            dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"
+        )
+        return fd, Path(temp_name)
+    while True:
+        temp_path = target.parent / f".{target.name}.{secrets.token_hex(8)}.tmp"
+        try:
+            fd = os.open(str(temp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            continue
+        return fd, temp_path
+
+
+def locked_atomic_rewrite(
+    target: Path,
+    compute_new_content: Callable[[str], str],
+    *,
+    encoding: str = "utf-8",
+    lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+    mode: Optional[int] = None,
+) -> None:
+    """Read-modify-write ``target`` atomically and safely across processes.
+
+    Holds an exclusive inter-process lock — on a CAO-owned lock file under
+    ``LOCK_DIR``, keyed by a hash of ``target``'s resolved absolute path (see
+    :func:`_lock_path_for`) — for the whole read-modify-write-replace cycle, so
+    two concurrent writers (same or different process) never interleave: the
+    second writer's ``compute_new_content`` always sees the first writer's
+    published result.
+
+    Args:
+        target: The file to rewrite. Parent directory is created if
+            missing. Read as ``""`` if the file does not yet exist.
+        compute_new_content: Called with the current text content of
+            ``target`` (``""`` if it does not exist) while the lock is
+            held; must return the full new content to write.
+        encoding: Text encoding for both the read and the write.
+        lock_timeout: Seconds to wait for the lock before raising
+            ``LockTimeoutError``. Use a bounded timeout (rather than an
+            indefinite block) so a crashed holder or a genuine deadlock
+            surfaces as a clear error instead of hanging the caller.
+        mode: Explicit permission bits for the published file, same meaning
+            as :func:`locked_atomic_write`'s ``mode``. Without it an existing
+            target keeps its own bits and a NEW file gets the umask default —
+            which is wrong for a file the caller owns and needs private
+            (``settings.json`` must be 0600 whether or not it already exists).
+
+    Raises:
+        LockTimeoutError: If the lock is not acquired within
+            ``lock_timeout`` seconds.
+        OSError: Propagated from filesystem operations (read, write,
+            fsync, replace).
+
+    Note:
+        The lock files are **permanent by design** (never unlinked), but they
+        live in CAO's scratch dir (``LOCK_DIR``), NOT beside the target — so
+        the user's working tree gains no files even though the targets
+        themselves are user-authored. Keeping them permanent matters because
+        ``fcntl.flock`` operates on the inode: an unlink+recreate between two
+        calls would break the inter-process serialization guarantee — callers
+        would see different inodes and their locks would not conflict.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _lock_path_for(target)
+
+    with _file_lock(lock_path, lock_timeout):
+        existing = target.read_text(encoding=encoding) if target.exists() else ""
+        _atomic_publish(target, compute_new_content(existing), encoding, mode=mode)
+
+
+def locked_atomic_write(
+    target: Path,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+    overwrite: bool = True,
+    must_exist: bool = False,
+    mode: Optional[int] = None,
+) -> None:
+    """Replace ``target``'s entire contents atomically and safely across processes.
+
+    The blind-write sibling of :func:`locked_atomic_rewrite`. Identical locking,
+    temp-file, fsync, mode-preservation and ``os.replace`` semantics, but it
+    never reads the existing file.
+
+    Use this when the new content does not depend on the old. Reaching for
+    ``locked_atomic_rewrite`` with a callback that ignores its argument looks
+    equivalent but is not: that path decodes the existing bytes first, so a
+    target holding invalid ``encoding`` bytes raises ``UnicodeDecodeError``
+    instead of being replaced. For a full replace that read is both pointless
+    and the only thing that can fail, which makes a corrupt file unrepairable
+    by the very call that would have fixed it.
+
+    Args:
+        target: The file to replace. Parent directory is created if missing.
+        content: The full new content to write.
+        encoding: Text encoding for the write.
+        lock_timeout: Seconds to wait for the lock before raising
+            ``LockTimeoutError``.
+        overwrite: When False, refuse to replace an existing target. The check
+            runs *inside* the lock, so two concurrent creators cannot both
+            observe an absent file. Callers must not pre-check with
+            ``target.exists()`` themselves: that test would sit outside this
+            critical section and reintroduce the race.
+        must_exist: When True, refuse to create a missing target, so the write
+            is an update and never an insert. Checked inside the same lock and
+            for the same reason: a caller testing existence beforehand would let
+            a concurrent delete slip between the check and the write, turning an
+            intended update back into a create. ``overwrite=False`` with
+            ``must_exist=True`` is contradictory and raises ``ValueError``.
+        mode: When given, the published file carries exactly these permission
+            bits whether or not ``target`` already existed, instead of
+            preserving the existing mode or taking the umask default. For files
+            CAO owns outright and that may hold credentials (``settings.json``),
+            pass ``0o600``. Leave ``None`` for user-authored files such as
+            ``CLAUDE.md`` whose mode belongs to the user.
+
+    Raises:
+        FileExistsError: If ``target`` exists and ``overwrite`` is False.
+        FileNotFoundError: If ``target`` is absent and ``must_exist`` is True.
+        ValueError: If ``overwrite`` is False and ``must_exist`` is True.
+        LockTimeoutError: If the lock is not acquired within ``lock_timeout``
+            seconds.
+        OSError: Propagated from filesystem operations (write, fsync, replace).
+    """
+    if not overwrite and must_exist:
+        raise ValueError(
+            "overwrite=False with must_exist=True can never succeed: it demands a "
+            "target that exists and refuses to replace it."
+        )
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _lock_path_for(target)
+
+    with _file_lock(lock_path, lock_timeout):
+        # Checked HERE, not by the caller: an exists() test outside this
+        # critical section lets two concurrent creators both see "absent" and
+        # both write, so the second silently clobbers the first. The same
+        # applies in reverse to must_exist, where a concurrent delete between
+        # an external check and the write would turn an update into a create.
+        if not overwrite and target.exists():
+            raise FileExistsError(f"{target} already exists")
+        if must_exist and not target.exists():
+            raise FileNotFoundError(f"{target} does not exist")
+        if mode is None:
+            # Positional call kept for callers (and tests) that wrap or stub
+            # _atomic_publish with the original three-argument signature.
+            _atomic_publish(target, content, encoding)
+        else:
+            _atomic_publish(target, content, encoding, mode=mode)
+
+
+def locked_atomic_delete(
+    target: Path,
+    *,
+    lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+    must_exist: bool = True,
+) -> None:
+    """Remove ``target`` while holding the same lock the writers use.
+
+    The deleting sibling of :func:`locked_atomic_write`. It exists because
+    ``locked_atomic_write``'s ``must_exist`` guarantee is only real if deletion
+    participates in the same critical section. An unlocked
+    ``exists()``-then-``unlink()`` can land *between* an update's existence check
+    and its ``os.replace``: the delete succeeds, the update then republishes the
+    file, and both callers are told they succeeded while a supposedly-deleted
+    file is back on disk holding the new content. Serialising here makes one of
+    the two lose, which is the whole point of ``must_exist``.
+
+    Deletion needs no temp file or ``os.replace`` because ``unlink`` is already
+    atomic. The lock is what this adds, not atomicity.
+
+    Note:
+        Safe against the ``fcntl.flock``-is-per-inode hazard because the lock
+        file is not the target. ``_lock_path_for`` keys a file under
+        ``LOCK_DIR`` by a hash of the target's *resolved* path, and those lock
+        files are never unlinked, so removing the target leaves the lock inode
+        untouched and a concurrent writer keeps contending on the same one.
+
+    Args:
+        target: The file to remove.
+        lock_timeout: Seconds to wait for the lock before raising
+            ``LockTimeoutError``.
+        must_exist: When True (default), a missing target raises
+            ``FileNotFoundError``. The check runs inside the lock, so two
+            concurrent deleters cannot both observe the file as present.
+            Pass False to make removal idempotent.
+
+    Raises:
+        FileNotFoundError: If ``target`` is absent and ``must_exist`` is True.
+        LockTimeoutError: If the lock is not acquired within ``lock_timeout``
+            seconds.
+        OSError: Propagated from the unlink.
+    """
+    lock_path = _lock_path_for(target)
+
+    with _file_lock(lock_path, lock_timeout):
+        # Inside the lock for the same reason as locked_atomic_write's checks:
+        # a caller testing existence beforehand would race both a concurrent
+        # deleter (double unlink) and a concurrent update (resurrected file).
+        if not target.exists():
+            if must_exist:
+                raise FileNotFoundError(f"{target} does not exist")
+            return
+        target.unlink()
+
+
+def unlocked_atomic_write(
+    target: Path,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    mode: Optional[int] = None,
+) -> None:
+    """Replace ``target`` atomically WITHOUT taking the cross-process lock.
+
+    Same unique-temp-file + ``fsync`` + ``os.replace`` publish as
+    :func:`locked_atomic_write`, so a partially written file is never visible,
+    two concurrent writers cannot tear each other's output (each publishes its
+    own complete temp file; the last ``os.replace`` wins whole), and a symlink
+    planted at ``target`` is swapped out rather than followed. What it gives up
+    is the lock, and with it the ``overwrite``/``must_exist`` checks, which only
+    mean something inside a critical section.
+
+    Use it for files whose NAMES are unique per writer and unbounded in number,
+    such as the per-terminal ``.scrollback`` / ``.snapshot.json`` sidecars
+    written at teardown. :func:`locked_atomic_write` keeps one lock file per
+    target in ``LOCK_DIR`` for the life of the installation (see
+    :func:`_lock_path_for`), so routing an ever-growing set of one-shot targets
+    through it would leave ``LOCK_DIR`` growing by one file per target with
+    nothing to reap them. Keep using the locked writer for the bounded set of
+    shared files (``settings.json``, ``AGENTS.md``, ...) where two processes may
+    really race on the SAME path.
+
+    Args:
+        target: The file to replace. Parent directory is created if missing.
+        content: The full new content to write.
+        encoding: Text encoding for the write.
+        mode: As for :func:`locked_atomic_write`: when given, the published
+            file carries exactly these bits; when ``None`` the existing mode is
+            preserved or the umask default applies.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if mode is None:
+        _atomic_publish(target, content, encoding)
+    else:
+        _atomic_publish(target, content, encoding, mode=mode)
+
+
+def _atomic_publish(
+    target: Path, content: str, encoding: str, *, mode: Optional[int] = None
+) -> None:
+    """Write ``content`` to ``target`` via a unique temp file + ``os.replace``.
+
+    Shared by :func:`locked_atomic_rewrite`, :func:`locked_atomic_write` and
+    :func:`unlocked_atomic_write`. This helper does no locking of its own: the
+    locked callers hold the target's lock around it, the unlocked one relies on
+    the unique temp name plus ``os.replace`` alone (see its docstring for when
+    that is enough).
+
+    ``os.replace`` swaps the directory entry, so a ``target`` that is a symlink
+    is replaced by the new regular file; the link's destination is never
+    opened or written. That is the property the settings writer relies on.
+    """
+    # Capture the existing target's mode BEFORE we write — tempfile.mkstemp
+    # creates the temp at 0600, so without this fixup the os.replace below
+    # would downgrade a user-authored 0644 file to 0600. A missing target
+    # yields None and the temp file is created with the umask applied by the
+    # kernel instead (see _existing_target_mode for why the umask is never
+    # touched here). An explicit ``mode`` overrides both: the caller owns the
+    # file and wants a fixed set of bits.
+    if mode is None:
+        mode = _existing_target_mode(target)
+
+    # Unique temp file in the SAME directory as target (same filesystem,
+    # so the final os.replace stays atomic) rather than a fixed
+    # ``target + ".tmp"`` name, so an unrelated unlocked writer (or a
+    # retry of this same call) can never collide with this call's temp
+    # file or unlink it out from under another in-flight write.
+    fd, temp_path = _open_unique_temp(target, mode)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(content)
+            handle.flush()
+            if mode is not None:
+                # Restore the target's mode on the temp file before the
+                # replace, so the published file keeps its permissions
+                # rather than inheriting mkstemp's 0600.
+                if hasattr(os, "fchmod"):
+                    os.fchmod(handle.fileno(), mode)
+                else:
+                    # mkstemp gave this writer a unique path; Windows Python
+                    # 3.12 has no fchmod, so adjust that same temporary file.
+                    os.chmod(temp_path, mode)
+            os.fsync(handle.fileno())
+        os.replace(temp_path, target)
+    finally:
+        # Only ever removes OUR OWN uniquely-named temp file.
+        with contextlib.suppress(FileNotFoundError):
+            temp_path.unlink()

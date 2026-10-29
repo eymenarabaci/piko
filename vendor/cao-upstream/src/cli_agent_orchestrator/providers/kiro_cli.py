@@ -1,0 +1,1118 @@
+"""Kiro CLI provider implementation.
+
+This module provides the KiroCliProvider class for integrating with Kiro CLI,
+an AI-powered coding assistant that operates through a terminal interface.
+
+Kiro CLI Features:
+- Agent-based conversations with customizable profiles
+- File system access and code manipulation capabilities
+- Interactive permission prompts for sensitive operations
+- ANSI-colored output with distinctive prompt patterns
+
+The provider detects the following terminal states:
+- IDLE: Agent is waiting for user input (shows agent prompt)
+- PROCESSING: Agent is generating a response
+- COMPLETED: Agent has finished responding (shows green arrow + response)
+- WAITING_USER_ANSWER: Agent is waiting for permission confirmation
+- ERROR: Agent encountered an error during processing
+"""
+
+import asyncio
+import logging
+import re
+import shlex
+import time
+from typing import Optional
+
+from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.kiro_capabilities import (
+    KiroPhase0KASError,
+    build_kiro_command,
+)
+from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
+
+logger = logging.getLogger(__name__)
+
+# =============================================================================
+# Regex Patterns for Kiro CLI Output Analysis
+# =============================================================================
+
+# Green arrow pattern indicates the start of an agent response (escape-stripped)
+# Example: "> Here is the code you requested..."
+GREEN_ARROW_PATTERN = r"^>\s*"
+
+# SGR (colour) escape codes only. Used by get_status, which strips colour but
+# MUST preserve carriage returns and cursor-movement sequences: the permission
+# detection counts idle prompts per newline-delimited line, and Kiro renders
+# active prompts with \r in-place redraws (same line, no \n). strip_terminal_
+# escapes would normalise \r -> \n and split those redraws onto separate lines,
+# making an active permission prompt look idle (inbox would then deliver during
+# a permission prompt — see test_permission_prompt_detection).
+ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
+
+# Additional escape sequences that may appear in terminal output
+ESCAPE_SEQUENCE_PATTERN = r"\[[?0-9;]*[a-zA-Z]"
+
+# Control characters to strip from final output. Tab and newline stay: they
+# are the layout of the reply, and without them a multi-line reply (a report
+# template from a handoff, for example) came back as one line.
+CONTROL_CHAR_PATTERN = r"[\x00-\x08\x0b-\x1f\x7f-\x9f]"
+
+# Legacy-UI IDLE prompt pattern for log files (with ANSI codes)
+IDLE_PROMPT_PATTERN_LOG = r"\x1b\[38;5;\d+m\[.+?\].*\x1b\[38;5;\d+m>\s*\x1b\[\d*m"
+
+# =============================================================================
+# New TUI Patterns (Kiro CLI without --legacy-ui)
+# =============================================================================
+
+# New TUI idle prompt: "Ask a question or describe a task ↵"
+# Case-insensitive match; comma between "question" and "or" is optional
+# (older versions used lowercase with comma, v1.29+ uses capitalized without)
+NEW_TUI_IDLE_PATTERN = r"[Aa]sk a question,? or describe a task"
+
+# New TUI IDLE prompt pattern for log files (with ANSI codes)
+NEW_TUI_IDLE_PATTERN_LOG = r"[Aa]sk a question,? or describe a task"
+
+# TUI separator line: horizontal bar (────) used to delimit sections.
+# Require 20+ chars to avoid matching short markdown separators in agent output.
+TUI_SEPARATOR_PATTERN = r"^[─]{20,}$"
+
+# Non-SGR CSI sequences (erase-line \x1b[2K, cursor moves, etc.) — everything
+# except colour codes ending in 'm'. Compiled once at module scope because
+# get_status() is on a hot path (called per output burst); recompiling per call
+# was avoidable overhead. Used in Check 6 to strip TUI chrome so the separator
+# regex can anchor on the raw ─── characters.
+_NON_SGR_CSI = re.compile(r"\x1b\[[0-9;?]*[^m]")
+
+# TUI Credits line marks response completion. Two shapes so far:
+#   up to 2.2x:  "▸ Credits: 0.20 • Time: 29s"
+#   2.25.0:      "▸ Credits: turn 0.20 • session 0.20 | Time: 29s"
+# The 2.25 form put the word "turn" between "Credits:" and the number, which
+# the old pattern did not accept: every turn on 2.25 then fell through to the
+# separator fallback, and that fails too because the new "Trust All Tools
+# active" band sits between the last two separators with a single line of
+# content. Result was IDLE forever after a finished task (never COMPLETED),
+# reproduced against a live 2.25.0 pane on 2026-09-29. Accept an optional
+# "turn" (and any other single word) before the first number.
+TUI_CREDITS_PATTERN = r"▸\s*Credits:\s*(?:[A-Za-z]+\s+)?[\d.]+"
+
+# 2.25's turn/session form is adopted because that release also moved the
+# assistant text onto a bullet-prefixed line. Unlike the pre-2.25 layout, the
+# reply is not reliably separated from the echoed prompt by a blank line, so
+# extraction uses the credits anchors and the bullet line as the reply start.
+TUI_225_CREDITS_PATTERN = r"▸\s*Credits:\s*turn\s+[\d.]+"
+# A colored capture: bullet rows that carry a truecolor SGR.
+TUI_225_COLORED_BULLET_PATTERN = r"\x1b\[38;2;\d+;\d+;\d+m•"
+# A row at column 0 that starts with a bullet: a reply, a tool row, or a
+# reasoning row. An echoed prompt is indented, so its bullets do not match.
+TUI_225_REPLY_PATTERN = r"^•\s+\S"
+# Tool rows ("• Shell ...", "• assign") and reasoning rows ("• Thought for
+# 2s...") have child rows that start with "╰" (arguments, output, the thought).
+# The lines of a reply are plain indented text. The colors of the rows are not
+# a boundary: 2.25 drew the reply blue, and 2.29 draws it orange.
+TUI_225_CHILD_ROW_PATTERN = r"^\s+╰"
+# A reasoning row with its thought collapsed has no child row.
+TUI_225_THOUGHT_ROW_PATTERN = r"^•\s+Thought for \d"
+
+# Reading the pane command costs about 0.1 s of tmux calls; the exit check reads
+# it at most this often (see KiroCliProvider._exited_to_shell).
+EXIT_CHECK_INTERVAL_S = 2.0
+
+# TUI processing indicator: ghost text shown while agent is working.
+# kiro-cli 2.11+ replaced "Kiro is working" with "Thinking..." (with an
+# optional "(esc to cancel)" suffix). Match either variant.
+TUI_PROCESSING_PATTERN = r"Kiro is working|Thinking\.\.\."
+
+# TUI initialization indicator: shown during startup before chat is ready.
+# Kiro TUI renders the idle prompt placeholder ("Ask a question or describe
+# a task") *before* the "● Initializing..." phase completes, which caused a
+# premature IDLE verdict. "Initializing..." is cleared by Kiro once startup
+# finishes, so its presence unconditionally means PROCESSING (unlike the
+# "Kiro is working" ghost text, which can linger as stale after a redraw).
+#
+# Also covers the MCP-server boot line "M of N mcp servers initialized.
+# ctrl-c to start chatting now" — Kiro shows this *before* the idle prompt
+# is interactive, so a paste sent during this window is absorbed by the
+# pre-prompt boot screen and silently dropped (observed during e2e
+# allowed-tools tests).
+#
+# kiro-cli 2.8.x also shows "Initializing · type to queue a message" during
+# boot (different from the "Initializing..." with three dots).
+TUI_INITIALIZING_PATTERN = (
+    r"Initializing\.\.\."
+    r"|\d+ of \d+ mcp servers initialized\.\s*ctrl-c to start chatting now"
+    r"|Initializing\s*·\s*type to queue a message"
+)
+
+
+# TUI permission prompt: shown instead of legacy [y/n/t] format.
+# Requires all three options together to avoid false positives on "Yes"/"No" in agent output.
+# Kiro 2.11 renders the same three-way choice with different wording for
+# subagent spawning: "Yes, single permission / Trust, always allow in this
+# session / No (Tab to edit)". Both alternatives anchor on the full Yes/Trust/No
+# option layout so agent output that merely mentions a permission prompt (or
+# quotes "subagent requires approval") can't flip status to WAITING_USER_ANSWER
+# — the bare header alternative was dropped for that reason. In practice
+# --trust-all-tools suppresses this prompt anyway; detection is a safety net.
+TUI_PERMISSION_PATTERN = (
+    r"Yes\s+No\s+Always [Aa]llow"
+    r"|Yes,\s*single permission[\s\S]{0,200}?Trust,\s*always allow[\s\S]{0,200}?No"
+)
+
+# TUI trust-all-tools acceptance dialog: shown at startup when --trust-all-tools is passed.
+# Matches the footer navigation chrome to avoid false positives on warning text in agent output.
+# Must be anchored to bottom screen region (see get_status WAITING check) to avoid stale matches.
+TUI_TRUST_ALL_TOOLS_FOOTER = r"esc to cancel · ↑↓ to navigate · ↵ to select"
+
+# Distinctive consent-dialog body text. TUI_TRUST_ALL_TOOLS_FOOTER above is
+# kiro's GENERIC list-selector chrome — an update/login/onboarding selector
+# renders it identically — so before answering we require this trust-specific
+# line, and require the ❯ cursor to sit on "No, exit" so Down lands on
+# "Yes, I accept" (not "Yes, and don't ask again"). Anything else fails closed.
+TUI_TRUST_ALL_TOOLS_BODY = r"Kiro is running in trust all tools mode"
+TUI_TRUST_ALL_TOOLS_CURSOR = r"❯\s*No, exit"
+
+# Bottom pane lines scanned for the consent dialog (mirrors codex's window).
+STARTUP_PROMPT_BOTTOM_LINES = 15
+
+# =============================================================================
+# Error Detection
+# =============================================================================
+
+# Strings that indicate the agent encountered an error
+ERROR_INDICATORS = ["Kiro is having trouble responding right now"]
+
+
+class KiroCliProvider(BaseProvider):
+    """Provider for Kiro CLI tool integration.
+
+    This provider manages the lifecycle of a Kiro CLI chat session within a tmux window,
+    including initialization, status detection, and response extraction.
+
+    Attributes:
+        terminal_id: Unique identifier for this terminal instance
+        session_name: Name of the tmux session containing this terminal
+        window_name: Name of the tmux window for this terminal
+        _agent_profile: Name of the Kiro agent profile to use
+        _idle_prompt_pattern: Regex pattern for detecting IDLE state
+        _permission_prompt_pattern: Regex pattern for detecting permission prompts
+    """
+
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        return True
+
+    def __init__(
+        self,
+        terminal_id: str,
+        session_name: str,
+        window_name: str,
+        agent_profile: str,
+        allowed_tools: Optional[list] = None,
+        engine: Optional[KiroEngine] = None,
+        model: Optional[str] = None,
+    ):
+        """Initialize Kiro CLI provider with terminal context.
+
+        Args:
+            terminal_id: Unique identifier for this terminal
+            session_name: Name of the tmux session
+            window_name: Name of the tmux window
+            agent_profile: Name of the Kiro agent profile to use (e.g., "developer")
+            allowed_tools: Optional list of CAO tool names the agent is allowed to use
+            engine: Resolved Kiro engine. Terminal creation probes it before this provider exists.
+            model: Explicit per-call override for profile.model (see
+                _get_profile_model), e.g. a handoff/assign caller pinning a
+                specific model for one worker without a dedicated profile.
+        """
+        super().__init__(terminal_id, session_name, window_name, allowed_tools)
+        self._initialized = False
+        self._input_received = False
+        # The cached result of the exit check (see _exited_to_shell).
+        self._exit_checked_at: Optional[float] = None
+        self._exited = False
+        self._agent_profile = agent_profile
+        self._engine = resolve_kiro_engine(persisted=engine)
+        self._model = model
+
+        # Build dynamic prompt pattern based on agent profile
+        # This pattern matches various Kiro prompt formats after ANSI stripping:
+        # - [developer] >       (basic prompt)
+        # - [developer] !>      (prompt with pending changes)
+        # - [developer] 50% >   (prompt with progress indicator)
+        # - [developer] λ >     (prompt with lambda symbol)
+        # - [developer] 50% λ > (combined progress and lambda)
+        self._idle_prompt_pattern = (
+            rf"\[{re.escape(self._agent_profile)}\]\s*(?:\d+%\s*)?(?:\u03bb\s*)?!?>\s*"
+        )
+        self._permission_prompt_pattern = r"Allow this action\?.*?\[.*?y.*?/.*?n.*?/.*?t.*?\]:"
+
+        # New TUI header pattern: "agent_name · model · ◔ N%"
+        self._new_tui_header_pattern = rf"{re.escape(self._agent_profile)}\s+·\s+.*·\s+◔\s*\d+%"
+
+    @property
+    def paste_enter_count(self) -> int:
+        """Kiro CLI 2.11 needs 2 Enters after bracketed paste to submit.
+
+        The first Enter is consumed by the TUI (finalizes the paste), the
+        second submits the message. Older kiro versions only needed 1.
+        """
+        return 2
+
+    @property
+    def paste_submit_delay(self) -> float:
+        """Kiro 2.11's TUI needs a longer delay after bracketed paste before
+        the Enter key registers as submit rather than being swallowed."""
+        return 1.0
+
+    def _exited_to_shell(self) -> bool:
+        """Return True when the pane is back at the shell that ran before kiro-cli.
+
+        Read at most every EXIT_CHECK_INTERVAL_S: the lookup costs about 0.1 s
+        of tmux calls (more inside a PTY proxy), and get_status() reaches it on
+        every read of a busy frame. A stale "still running" only keeps the
+        terminal PROCESSING for up to that long after kiro-cli exits.
+        """
+        now = time.monotonic()
+        if self._exit_checked_at is None or now - self._exit_checked_at >= EXIT_CHECK_INTERVAL_S:
+            current_cmd = get_backend().get_pane_current_command(
+                self.session_name, self.window_name
+            )
+            self._exited = current_cmd == self.shell_baseline
+            self._exit_checked_at = now
+        return self._exited
+
+    def mark_input_received(self) -> None:
+        """Track that input was sent, enabling separator-free completion detection."""
+        super().mark_input_received()
+        self._input_received = True
+
+    @property
+    def extraction_tail_lines(self) -> int:
+        """Capture enough scrollback for no-credits extraction.
+
+        The no-credits fallback (_extract_tui_message) needs both the
+        start_separator (before the response) and end_separator (TUI frame
+        before the idle prompt) in the same capture window. For long agent
+        responses the start_separator can be hundreds of lines above the
+        idle prompt. 2000 lines covers responses up to ~1800 lines of
+        content, which exceeds any realistic single-turn agent response.
+        """
+        return 2000
+
+    def _get_profile_model(self) -> Optional[str]:
+        """Return the explicit per-call model override if given, else
+        profile.model if the agent profile can be loaded, else None.
+
+        Best-effort: historically the Kiro CLI provider has not required the
+        CAO agent profile to be loadable at runtime (kiro-cli has its own
+        agent store). A missing or unparseable profile must not block launch.
+        """
+        if self._model:
+            return self._model
+        try:
+            profile = load_agent_profile(self._agent_profile)
+        except (FileNotFoundError, RuntimeError) as exc:
+            logger.debug(
+                "Profile '%s' not loadable by CAO; skipping --model resolution: %s",
+                self._agent_profile,
+                exc,
+            )
+            return None
+        return profile.model or None
+
+    async def initialize(self) -> bool:
+        """Initialize Kiro CLI provider by starting kiro-cli chat command.
+
+        This method:
+        1. Waits for the shell to be ready in the tmux window
+        2. Sends the kiro-cli chat command with the configured agent profile
+        3. Waits for the agent to reach IDLE state (ready for input)
+
+        Returns:
+            True if initialization was successful
+
+        Raises:
+            TimeoutError: If shell or Kiro CLI initialization times out
+        """
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        if self._engine == KiroEngine.KAS:
+            # This defensive guard makes direct provider use fail closed too.
+            # Normal terminal creation has already probed and rejected KAS before
+            # a backend window or provider is allocated.
+            raise KiroPhase0KASError(profile_has_v2_policy=False)
+
+        # Step 1: Wait for shell prompt to appear in the tmux window
+        # This ensures the terminal is ready before we send commands
+        init_timeout = get_server_settings()["provider_init_timeout"]
+        if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
+            raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
+
+        # Capture the shell process name before launching kiro — used later to detect kiro exit
+        self.shell_baseline = get_backend().get_pane_current_command(
+            self.session_name, self.window_name
+        )
+
+        # Step 2: Start the Kiro CLI chat session.
+        #
+        # --trust-all-tools: bypass Kiro CLI's permission prompts when CAO
+        # launches with --yolo (allowed_tools=['*']). Without this, every
+        # tool invocation re-prompts, blocking assign/handoff flows.
+        # --model: honor profile.model so workflows can pin a specific model.
+        #
+        # UI mode: always the default TUI. --legacy-ui is NOT an option — see
+        # build_kiro_command's docstring: it conflicts with --agent-engine=v2
+        # and otherwise silently selects the v1 engine, which exposes no MCP
+        # tools, so the agent could not assign/handoff/report_outcome at all.
+        model = self._get_profile_model()
+
+        # kiro-cli 2.11 introduced a "subagent requires approval" prompt that
+        # blocks MCP tool calls that spawn subagents (e.g. cao-mcp-server's
+        # assign/handoff). Current CAO policy always bypasses Kiro's
+        # interactive approval prompt regardless of the profile: CAO enforces
+        # tool scoping at its own layers (profile allowedTools + MCP
+        # allowlist), and there is no human at the terminal in headless
+        # orchestration to answer. Without this, a supervisor invoking
+        # assign() hangs indefinitely on the approval dialog.
+        base_args = build_kiro_command(
+            self._engine,
+            self._agent_profile,
+            model=model,
+            yolo=True,
+        )
+        command = shlex.join(base_args)
+        # Arm the StatusMonitor stickiness gate before launching the CLI so
+        # the IDLE → PROCESSING → IDLE/COMPLETED transition is honored.
+        status_monitor.notify_input_sent(self.terminal_id)
+        get_backend().send_keys(self.session_name, self.window_name, command)
+
+        # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt.
+        # Accept both IDLE and COMPLETED — some CLI versions show a startup
+        # message that get_status() interprets as a completed response.
+        # _wait_ready_accepting_trust_dialog also auto-answers the trust
+        # consent dialog (see its docstring) if a wrapper version still shows
+        # one; --trust-tools='*' does not raise it, so that is now a safety net.
+        #
+        # There is no --legacy-ui retry. It used to exist for older wrappers
+        # whose TUI could not initialize headlessly, but it is no longer a
+        # usable fallback: on a v2 launch kiro-cli errors out on the flag
+        # combination, and a bare --legacy-ui retry would "succeed" into the v1
+        # engine with no MCP tools — turning a loud timeout into an agent that
+        # looks healthy and cannot orchestrate. Failing here is the honest
+        # outcome.
+        if not await self._wait_ready_accepting_trust_dialog():
+            raise TimeoutError(
+                "Kiro CLI initialization timed out waiting for the agent prompt "
+                f"(engine={self._engine.value}, profile={self._agent_profile!r})"
+            )
+
+        self._initialized = True
+        return True
+
+    async def _wait_ready_accepting_trust_dialog(self) -> bool:
+        """Wait for the agent prompt, auto-answering the trust-all-tools dialog.
+
+        CAO always launches kiro-cli with ``--trust-all-tools`` (there is no
+        human at the terminal to answer per-tool permission prompts in headless
+        orchestration; CAO enforces tool scoping at its own profile/MCP layers).
+        Since kiro-cli 2.1, ``--trust-all-tools`` opens a one-time startup
+        consent dialog *before* the chat prompt is interactive:
+
+            ❯ No, exit
+              Yes, I accept
+              Yes, and don't ask again
+
+        The default TUI shows this dialog on kiro-cli 2.16.1 (verified), so the
+        earlier "force --legacy-ui to skip it" workaround no longer helps and
+        init just times out on the dialog. This helper is applied to the
+        ``--legacy-ui`` fallback path too, so if a kiro build shows the dialog
+        there as well it is handled without a version check. get_status()
+        classifies the dialog as WAITING_USER_ANSWER off generic selector
+        chrome, so before answering we VERIFY the dialog body and the ❯ cursor
+        line (fail closed on anything else), then select **"Yes, I accept"**
+        (Down, Enter) — the one-line-down option. We deliberately do NOT pick
+        "Yes, and don't ask again", which would persist a trust-all-tools
+        bypass into the user's kiro config; CAO's acceptance is scoped to this
+        ephemeral session only.
+
+        Returns:
+            True if the terminal reached IDLE or COMPLETED (dialog answered if
+            it was verified and shown), False if it timed out or a
+            WAITING_USER_ANSWER could not be verified as the consent dialog.
+        """
+        init_timeout = float(get_server_settings()["provider_init_timeout"])
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        start = time.monotonic()
+        ready = await wait_until_status(
+            self.terminal_id,
+            {
+                TerminalStatus.IDLE,
+                TerminalStatus.COMPLETED,
+                TerminalStatus.WAITING_USER_ANSWER,
+            },
+            timeout=init_timeout,
+        )
+        if not ready:
+            return False
+        # Ready-flap window: wait_until_status returned on WAITING_USER_ANSWER,
+        # but get_status is re-read here rather than trusted from the wait. If it
+        # has since flapped to IDLE/COMPLETED, treat the terminal as ready and do
+        # NOT send dialog keys (a blind Down+Enter into a live prompt would be a
+        # stray message). Low probability given the sticky latch, but explicit.
+        # Off the loop: get_status() can fork a tmux capture-pane for a PROCESSING
+        # terminal (status_monitor.py's stale-PROCESSING fallback).
+        current = await asyncio.to_thread(status_monitor.get_status, self.terminal_id)
+        if current != TerminalStatus.WAITING_USER_ANSWER:
+            return True
+
+        # WAITING_USER_ANSWER is classified from TUI_TRUST_ALL_TOOLS_FOOTER,
+        # which is kiro's GENERIC list-selector chrome. Verify the dialog BODY
+        # and the ❯ cursor position before answering — a blind Down+Enter on
+        # some other startup selector would pick an arbitrary option. Same
+        # fail-closed shape as codex's directory-trust check. On any mismatch,
+        # fall through to the normal timeout/fallback path.
+        backend = get_backend()
+        pane = strip_terminal_escapes(
+            re.sub(ANSI_CODE_PATTERN, "", backend.get_history(self.session_name, self.window_name))
+        )
+        bottom = "\n".join(pane.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+        if not (
+            re.search(TUI_TRUST_ALL_TOOLS_BODY, bottom)
+            and re.search(TUI_TRUST_ALL_TOOLS_CURSOR, bottom)
+        ):
+            logger.warning(
+                "kiro_cli: WAITING_USER_ANSWER but the trust-all-tools consent "
+                "dialog (body + '❯ No, exit') was not verified; not answering"
+            )
+            return False
+
+        # Verified consent dialog: cursor on "No, exit", so Down lands on
+        # "Yes, I accept" (session-scoped — NOT "Yes, and don't ask again").
+        logger.info(
+            "kiro_cli: answering --trust-all-tools startup consent dialog "
+            "with 'Yes, I accept' (session-scoped)"
+        )
+        # Arm the PROCESSING latch before the keystrokes, like every other
+        # send_special_key path, so answering the dialog isn't blocked by the
+        # WAITING_USER_ANSWER we just observed.
+        status_monitor.notify_input_sent(self.terminal_id)
+        backend.send_special_key(self.session_name, self.window_name, "Down")
+        backend.send_special_key(self.session_name, self.window_name, "Enter")
+        # Bound the post-accept wait by the time already spent, so total startup
+        # stays within provider_init_timeout rather than up to 2x it.
+        remaining = max(0.0, init_timeout - (time.monotonic() - start))
+        return await wait_until_status(
+            self.terminal_id,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=remaining,
+        )
+
+    def get_status(self, output: str) -> TerminalStatus:
+        """Get Kiro CLI status by analyzing terminal output.
+
+        Status detection logic (in priority order):
+        1. No output → UNKNOWN
+        2. No IDLE prompt visible → PROCESSING (agent is generating response)
+        3. Error indicators present → ERROR
+        4. Permission prompt visible → WAITING_USER_ANSWER
+        5. Green arrow + prompt visible → COMPLETED (response ready)
+        6. Only prompt visible → IDLE (waiting for input)
+
+        Native (herdr): if the backend can report a native agent_status, trust it
+        and skip buffer parsing. On herdr the pipe-pane buffer is never fed, so
+        ``output`` is empty and the regex path below can never leave UNKNOWN —
+        which is why kiro never reached IDLE and init timed out. The shared
+        BaseProvider helper consults the backend and disambiguates herdr's
+        ambiguous "idle" via _task_dispatched (set by mark_input_received).
+        """
+        native = self._resolve_native_status(output)
+        if native is not None:
+            return native
+
+        # herdr never pushes a buffer (pipe_pane is a no-op there); read live
+        # pane content instead of falling through to "no output" on every call.
+        output = self._resolve_buffer(output)
+        if not output:
+            return TerminalStatus.UNKNOWN
+
+        # Strip ONLY SGR colour codes for pattern matching. Carriage returns and
+        # cursor-movement sequences are intentionally preserved: the permission
+        # check below counts idle prompts per "\n"-delimited line and relies on
+        # \r in-place redraws staying on the same logical line (see
+        # ANSI_CODE_PATTERN). Do not switch this to strip_terminal_escapes.
+        clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+
+        # Check 0a: Detect idle prompts early — required for the position-aware
+        # processing checks below.
+        old_idle_matches = list(re.finditer(self._idle_prompt_pattern, clean_output))
+        new_tui_idle_matches = list(re.finditer(NEW_TUI_IDLE_PATTERN, clean_output))
+        has_idle_prompt = old_idle_matches[0] if old_idle_matches else None
+        has_new_tui_idle = bool(new_tui_idle_matches)
+
+        # Check 0b: TUI startup — Kiro emits "● Initializing..." or
+        # "0 of N mcp servers initialized. ctrl-c to start chatting now"
+        # before the prompt is interactive; pastes during this window are
+        # silently absorbed by the boot screen.
+        #
+        # The new TUI renders an idle-prompt PLACEHOLDER ("Ask a question
+        # or describe a task") even during boot, so NEW_TUI_IDLE_PATTERN
+        # matching after the init line does NOT mean init has finished —
+        # we must still report PROCESSING.
+        #
+        # In --legacy-ui (and once the new TUI is interactive), the actual
+        # "[agent] N% > " idle prompt only appears AFTER init has completed.
+        # The "0 of N mcp servers initialized..." line is drawn once at
+        # boot and redrawn over by the TUI; under the event-driven FIFO
+        # pipeline that line still sits in the rolling byte stream forever
+        # (issue surfaced by yolo --legacy-ui timing out 11/11 e2e tests).
+        # Treat the init line as PROCESSING only when no real ``[agent] >``
+        # idle prompt appears AFTER the last init match — mirrors the
+        # TUI_PROCESSING_PATTERN ghost-text guard below.
+        #
+        # kiro-cli 2.8.x TUI shows "● Initializing..." (animated spinner)
+        # during MCP boot. Once MCP finishes, the TUI redraws completely:
+        # the spinner disappears and the idle prompt appears. In the raw
+        # FIFO buffer, the idle prompt text lands AFTER the last spinner
+        # frame, so checking new_tui_idle_matches after last_init_pos is a
+        # reliable post-init signal. During the spinner, only spinner frames
+        # are written to the stream; the idle prompt only enters the buffer
+        # when the TUI redraws after init completes.
+        init_matches = list(re.finditer(TUI_INITIALIZING_PATTERN, clean_output))
+        if init_matches:
+            last_init_pos = init_matches[-1].end()
+            real_idle_after_init = any(m.start() > last_init_pos for m in old_idle_matches)
+            new_idle_after_init = any(m.start() > last_init_pos for m in new_tui_idle_matches)
+            if not real_idle_after_init and not new_idle_after_init:
+                return TerminalStatus.PROCESSING
+
+        # Check 2: Look for TUI "Kiro is working" ghost text.
+        # Kiro TUI redraws the screen in-place, so the buffer can retain a stale
+        # "Kiro is working" line from an earlier render even after the agent has
+        # finished and the idle prompt has appeared below it.  Only return
+        # PROCESSING when no idle prompt appears *after* the last match.
+        tui_working_matches = list(re.finditer(TUI_PROCESSING_PATTERN, clean_output))
+        if tui_working_matches:
+            last_working_pos = tui_working_matches[-1].end()
+            idle_after_working = any(
+                m.start() > last_working_pos for m in new_tui_idle_matches + old_idle_matches
+            )
+            if not idle_after_working:
+                return TerminalStatus.PROCESSING
+
+        # Check 2a: Trust-all-tools acceptance dialog at startup (no idle prompt case).
+        # Must come BEFORE the "no idle prompt → PROCESSING" check below, since
+        # the dialog has no idle prompt but should classify WAITING_USER_ANSWER.
+        # Anchored to bottom 20 lines to avoid false positives when the warning text
+        # appears in scrollback with an idle prompt below (same class as issue #405).
+        lines = clean_output.split("\n")
+        bottom_region = "\n".join(lines[-20:]) if len(lines) > 20 else clean_output
+        footer_match = re.search(TUI_TRUST_ALL_TOOLS_FOOTER, bottom_region)
+        if footer_match:
+            after_footer = bottom_region[footer_match.end() :]
+            has_idle_after = re.search(self._idle_prompt_pattern, after_footer) or re.search(
+                NEW_TUI_IDLE_PATTERN, after_footer
+            )
+            if not has_idle_after:
+                return TerminalStatus.WAITING_USER_ANSWER
+
+        # Check 3: If no idle prompt found, determine if kiro is still running.
+        # Compare current pane command against the shell captured before kiro launched.
+        # If they match, kiro has exited and the shell is showing again → IDLE.
+        #
+        # Gated on self._initialized: between send_keys("kiro-cli chat ...")
+        # and the moment kiro-cli exec's, the pane's current command still
+        # matches shell_baseline ("zsh"), and the buffer hasn't shown any
+        # idle prompt yet. Without this gate, get_status() returns IDLE
+        # immediately after launch, which lets pre-init pastes get absorbed
+        # by Kiro's boot screen and silently dropped.
+        if not has_idle_prompt and not has_new_tui_idle:
+            if self._initialized and self.shell_baseline and self._exited_to_shell():
+                return TerminalStatus.IDLE
+            return TerminalStatus.PROCESSING
+
+        # Check 2: Look for known error messages in the output
+        if any(indicator.lower() in clean_output.lower() for indicator in ERROR_INDICATORS):
+            return TerminalStatus.ERROR
+
+        # Check for permission prompt — legacy [y/n/t] or TUI "Yes, No, Always Allow"
+        # Active prompt: 0-1 lines with idle prompt (CLI renders prompt on next line)
+        # Stale prompt: 2+ lines with idle prompt (user answered, agent continued)
+        # Line-based counting handles \r redraws (same line, no \n) correctly
+        perm_matches = list(re.finditer(self._permission_prompt_pattern, clean_output, re.DOTALL))
+        tui_perm_matches = list(re.finditer(TUI_PERMISSION_PATTERN, clean_output))
+        all_perm_matches = perm_matches + tui_perm_matches
+        # Sort by position so we use the last permission prompt regardless of type
+        all_perm_matches.sort(key=lambda m: m.start())
+        if all_perm_matches:
+            after_last_perm = clean_output[all_perm_matches[-1].end() :]
+            lines_after = after_last_perm.split("\n")
+            idle_lines = sum(
+                1
+                for line in lines_after
+                if re.search(self._idle_prompt_pattern, line)
+                or re.search(NEW_TUI_IDLE_PATTERN, line)
+            )
+            if idle_lines <= 1:
+                return TerminalStatus.WAITING_USER_ANSWER
+
+        # Check 4: Look for completed response (green arrow indicates agent output)
+        # Must verify that an idle prompt appears AFTER the response
+        green_arrows = list(re.finditer(GREEN_ARROW_PATTERN, clean_output, re.MULTILINE))
+        if green_arrows:
+            # Find if there's an idle prompt after the last green arrow
+            last_arrow_pos = green_arrows[-1].end()
+            idle_prompts = list(re.finditer(self._idle_prompt_pattern, clean_output))
+
+            for prompt in idle_prompts:
+                if prompt.start() > last_arrow_pos:
+                    logger.debug(f"get_status: returning COMPLETED")
+                    return TerminalStatus.COMPLETED
+
+            # Also check new TUI idle pattern after the last green arrow
+            for prompt in new_tui_idle_matches:
+                if prompt.start() > last_arrow_pos:
+                    logger.debug("get_status: returning COMPLETED (new TUI)")
+                    return TerminalStatus.COMPLETED
+
+            # Has green arrow but no prompt after it - still processing
+            return TerminalStatus.PROCESSING
+
+        # Check 5: TUI completion — Credits marker + idle prompt after it.
+        # In pure TUI mode, there are no green arrows. Completion is indicated
+        # by "▸ Credits:" followed by the idle prompt.
+        credits_matches = list(re.finditer(TUI_CREDITS_PATTERN, clean_output))
+        if credits_matches:
+            last_credits_pos = credits_matches[-1].end()
+            for prompt in new_tui_idle_matches:
+                if prompt.start() > last_credits_pos:
+                    logger.debug("get_status: returning COMPLETED (TUI credits)")
+                    return TerminalStatus.COMPLETED
+            for prompt in old_idle_matches:
+                if prompt.start() > last_credits_pos:
+                    logger.debug("get_status: returning COMPLETED (TUI credits + legacy idle)")
+                    return TerminalStatus.COMPLETED
+            # Credits marker found but no idle prompt after it — still processing
+            return TerminalStatus.PROCESSING
+
+        # Check 6: Kiro CLI 2.3.0+ — no Credits marker emitted. Detect completion
+        # by finding the bordered "response box" — two separators with ≥2 lines
+        # of non-empty content between them — followed by the idle prompt.
+        #
+        # kiro-cli 2.11+ keeps the "ask a question or describe a task" placeholder
+        # visible in the raw buffer at all times (it's part of the TUI chrome),
+        # so a bare idle-prompt match does NOT mean the agent finished. Requiring
+        # a full response box (two separators + content in between) distinguishes
+        # a real completion frame from the pre-response idle state where the
+        # placeholder is visible but the agent hasn't produced output yet.
+        # A minimal completion is user query + agent response = 2 non-empty lines
+        # inside the box.
+        if has_new_tui_idle:
+            lines = clean_output.split("\n")
+
+            # Strip non-SGR CSI (erase-line \x1b[2K, cursor moves, etc.) so
+            # the separator regex can see the raw ─── characters. The top-of-
+            # function strip only removes SGR codes ending in 'm' (color) —
+            # kiro's TUI prefixes many lines with \x1b[2K which would prevent
+            # the separator regex from anchoring at start-of-line.
+            # (_NON_SGR_CSI is compiled once at module scope — hot path.)
+            def _sep_line(line: str) -> str:
+                return _NON_SGR_CSI.sub("", line).strip()
+
+            idle_line_idx = None
+            for i in range(len(lines) - 1, -1, -1):
+                if re.search(NEW_TUI_IDLE_PATTERN, lines[i]):
+                    idle_line_idx = i
+                    break
+            if idle_line_idx is not None:
+                # Find the last separator BEFORE the idle line.
+                last_sep_idx = None
+                for i in range(idle_line_idx - 1, -1, -1):
+                    if re.search(TUI_SEPARATOR_PATTERN, _sep_line(lines[i])):
+                        last_sep_idx = i
+                        break
+                if last_sep_idx is not None:
+                    # Find the previous separator, and require content between them.
+                    for j in range(last_sep_idx - 1, -1, -1):
+                        if re.search(TUI_SEPARATOR_PATTERN, _sep_line(lines[j])):
+                            content = [l for l in lines[j + 1 : last_sep_idx] if _sep_line(l)]
+                            if len(content) >= 2:
+                                logger.debug(
+                                    "get_status: returning COMPLETED (TUI no-credits fallback)"
+                                )
+                                return TerminalStatus.COMPLETED
+                            break
+
+        # Default: Agent is IDLE, waiting for user input
+        return TerminalStatus.IDLE
+
+    # The TUI's live prompt row: "› " then the first row of the text, or the
+    # placeholder / status text the TUI shows there when nothing is typed.
+    _COMPOSER_PROMPT_RE = re.compile(r"^\s*›(?:\s(.*)|\s*)$")
+    # Text the TUI itself paints in the prompt row; none of it is user input.
+    _COMPOSER_CHROME_RE = re.compile(
+        rf"{NEW_TUI_IDLE_PATTERN}|{TUI_PROCESSING_PATTERN}|{TUI_INITIALIZING_PATTERN}"
+        r"|type to queue a message|Type to steer"
+    )
+
+    def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
+        """Return the text sitting unsubmitted in the TUI's › prompt, if it is on screen.
+
+        Issue #78 (PR #1004 review, P2-1): the inbox recovery can only send the
+        bare Enter that submits a paste whose Enter was swallowed when the
+        provider can read its own composer; without this method kiro_cli had
+        no recovery at all and the next inbox message was pasted on top of the
+        first ({MSG1}{MSG2}).
+
+        The TUI pins its prompt to the bottom of the viewport below the last
+        "────" separator and a header row (agent · model · ◔ N% · auth). The
+        header text varies with the agent and the auth state, so the reader
+        anchors on the last separator and the first "›" row after it; the
+        composer is that row minus the glyph plus the indented continuation
+        rows a wrapped or multi-line paste occupies (real captures:
+        fixtures/COMPOSER_FIXTURES.md). Earlier "›" rows are transcript echoes
+        above the separator and are never included. Returns "" when the row
+        holds only the TUI's own text (the "ask a question" placeholder, "Kiro
+        is working", "Initializing") and None for frames without the TUI
+        prompt row (legacy "[agent]>" UI, boot screens).
+        """
+        rows = rendered_pane.splitlines()
+        separators = [
+            index for index, row in enumerate(rows) if re.match(TUI_SEPARATOR_PATTERN, row.strip())
+        ]
+        if not separators:
+            return None
+        prompt_index = next(
+            (
+                index
+                for index in range(separators[-1] + 1, len(rows))
+                if self._COMPOSER_PROMPT_RE.match(rows[index])
+            ),
+            None,
+        )
+        if prompt_index is None:
+            return None
+        match = self._COMPOSER_PROMPT_RE.match(rows[prompt_index])
+        first = ((match.group(1) if match else None) or "").strip()
+        if self._COMPOSER_CHROME_RE.search(first):
+            return ""
+        continuation = [row.strip() for row in rows[prompt_index + 1 :] if row.strip()]
+        return "\n".join([first] + continuation).strip()
+
+    def extract_last_message_from_script(self, script_output: str) -> str:
+        """Extract agent's final response message using green arrow indicator."""
+        # Strip ANSI codes for pattern matching
+        clean_output = strip_terminal_escapes(script_output)
+
+        # Find patterns in clean output
+        green_arrows = list(re.finditer(GREEN_ARROW_PATTERN, clean_output, re.MULTILINE))
+        idle_prompts = list(re.finditer(self._idle_prompt_pattern, clean_output))
+        new_tui_idles = list(re.finditer(NEW_TUI_IDLE_PATTERN, clean_output))
+
+        # Slash command fallback: if the most recent interaction (between the
+        # last two idle prompts) has no green arrow, it was a CLI-handled
+        # command like /context or /compact. Extract that output instead.
+        if len(idle_prompts) >= 2:
+            last_prompt_pos = idle_prompts[-1].start()
+            prev_prompt_pos = idle_prompts[-2].end()
+            has_arrow_in_last_interaction = any(
+                m.start() > prev_prompt_pos and m.start() < last_prompt_pos for m in green_arrows
+            )
+            if not has_arrow_in_last_interaction:
+                between = clean_output[prev_prompt_pos:last_prompt_pos]
+                # First line is the user's command text, skip it
+                lines = between.split("\n", 1)
+                if lines[0].lstrip().startswith("/"):
+                    output = lines[1].strip() if len(lines) > 1 else ""
+                    if output:
+                        output = re.sub(ESCAPE_SEQUENCE_PATTERN, "", output)
+                        output = re.sub(CONTROL_CHAR_PATTERN, "", output)
+                        return output.strip()
+
+        if not green_arrows:
+            # Fallback: try TUI extraction (separator + Credits pattern)
+            return self._extract_tui_message(clean_output, script_output)
+
+        if not idle_prompts and not new_tui_idles:
+            raise ValueError("Incomplete Kiro CLI response - no final prompt detected")
+
+        # Find the last green arrow (response start)
+        last_arrow_pos = green_arrows[-1].end()
+
+        # Find idle prompt that comes AFTER the last green arrow (old or new TUI)
+        final_prompt = None
+        for prompt in idle_prompts:
+            if prompt.start() > last_arrow_pos:
+                final_prompt = prompt
+                break
+        if not final_prompt:
+            for prompt in new_tui_idles:
+                if prompt.start() > last_arrow_pos:
+                    final_prompt = prompt
+                    break
+
+        if not final_prompt:
+            raise ValueError(
+                "Incomplete Kiro CLI response - no final prompt detected after response"
+            )
+
+        # Extract directly from clean output
+        start_pos = last_arrow_pos
+        end_pos = final_prompt.start()
+
+        final_answer = clean_output[start_pos:end_pos].strip()
+
+        if not final_answer:
+            raise ValueError("Empty Kiro CLI response - no content found")
+
+        return final_answer.strip()
+
+    def _extract_tui_225_message(
+        self, lines: list[str], credits_idx: int, raw_output: str | None = None
+    ) -> str | None:
+        """Extract a 2.25 TUI reply using turn anchors instead of paragraphs.
+
+        The pre-2.25 layout reliably places the echoed prompt in the first
+        paragraph inside the response box.  2.25 moved the assistant text to a
+        bullet-prefixed line and can render a one-word reply immediately below
+        the echoed prompt, so paragraph splitting cannot distinguish the two.
+        The reply is the last bullet row of the turn that is not a tool or
+        reasoning row (see TUI_225_CHILD_ROW_PATTERN), up to the next bullet
+        row or the Credits line. ``raw_output`` is not used; the parameter is
+        kept for callers.
+        """
+        prev_credits_idx = -1
+        for i in range(credits_idx - 1, -1, -1):
+            if re.search(TUI_CREDITS_PATTERN, lines[i]):
+                prev_credits_idx = i
+                break
+
+        reply_start = None
+        for i in range(credits_idx - 1, prev_credits_idx, -1):
+            if re.search(TUI_225_REPLY_PATTERN, lines[i]) and not self._is_tui_225_chrome_row(
+                lines, i, credits_idx
+            ):
+                reply_start = i
+                break
+
+        if reply_start is None:
+            return None
+
+        # Rows after the reply are tool or reasoning rows (the reply is the
+        # last bullet that is not one), so the reply ends at the next bullet.
+        reply_end = next(
+            (
+                i
+                for i in range(reply_start + 1, credits_idx)
+                if re.search(TUI_225_REPLY_PATTERN, lines[i])
+            ),
+            credits_idx,
+        )
+        response_lines = lines[reply_start:reply_end]
+        response_lines[0] = re.sub(r"^•\s+", "", response_lines[0], count=1)
+        final_answer = "\n".join(response_lines).strip()
+        final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
+        final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
+        return final_answer.strip()
+
+    @staticmethod
+    def _is_tui_225_chrome_row(lines: list[str], index: int, end: int) -> bool:
+        """Return True when the bullet row at ``index`` is a tool or reasoning row."""
+        if re.search(TUI_225_THOUGHT_ROW_PATTERN, lines[index]):
+            return True
+        for line in lines[index + 1 : end]:
+            if line.strip():
+                return bool(re.search(TUI_225_CHILD_ROW_PATTERN, line))
+        return False
+
+    def _extract_tui_message(self, clean_output: str, raw_output: str | None = None) -> str:
+        """Extract agent response from pure TUI output (no green arrows).
+
+        TUI format:
+            ────────────────────────────
+              user message here
+
+              Agent's response here.
+
+            ▸ Credits: 0.24 - Time: 3s
+            ────────────────────────────
+            agent-name - model - N%
+             Ask a question or describe a task
+
+        Strategy:
+            1. Find the last Credits line (response end marker)
+            2. Find the previous Credits line (prior turn boundary) or start of output
+            3. Find the first separator after that boundary (outer TUI separator)
+               This avoids matching separators inside the agent's response.
+            4. Extract text between separator and Credits
+            5. Skip the first paragraph (user message) if a blank line separates it
+        """
+        lines = clean_output.split("\n")
+
+        # Find the last Credits line
+        credits_idx = None
+        for i in range(len(lines) - 1, -1, -1):
+            if re.search(TUI_CREDITS_PATTERN, lines[i]):
+                credits_idx = i
+                break
+
+        if credits_idx is not None and re.search(TUI_225_CREDITS_PATTERN, lines[credits_idx]):
+            response = self._extract_tui_225_message(lines, credits_idx, raw_output)
+            if response is not None:
+                return response
+            if raw_output is not None and re.search(TUI_225_COLORED_BULLET_PATTERN, raw_output):
+                raise ValueError("No Kiro CLI assistant reply found in colored 2.25 TUI output")
+
+        if credits_idx is None:
+            # Kiro CLI 2.3.0+ may not emit a Credits line. Fall back to
+            # extracting content between separators around the response.
+            # Only attempt this when we know input was sent — without
+            # _input_received the original error contract is preserved.
+            if self._input_received:
+                idle_idx = None
+                for i in range(len(lines) - 1, -1, -1):
+                    if re.search(NEW_TUI_IDLE_PATTERN, lines[i]):
+                        idle_idx = i
+                        break
+
+                if idle_idx is not None:
+                    # Find the last separator before idle (TUI frame boundary)
+                    end_separator_idx = None
+                    for i in range(idle_idx - 1, -1, -1):
+                        if re.search(TUI_SEPARATOR_PATTERN, lines[i].strip()):
+                            end_separator_idx = i
+                            break
+
+                    # Find the separator before that (start of response area)
+                    start_separator_idx = None
+                    if end_separator_idx is not None:
+                        for i in range(end_separator_idx - 1, -1, -1):
+                            if re.search(TUI_SEPARATOR_PATTERN, lines[i].strip()):
+                                start_separator_idx = i
+                                break
+
+                    if start_separator_idx is not None and end_separator_idx is not None:
+                        content_lines = lines[start_separator_idx + 1 : end_separator_idx]
+                        # Skip only the actual TUI header line (agent · model · N%)
+                        content_lines = [
+                            l
+                            for l in content_lines
+                            if not re.search(self._new_tui_header_pattern, l)
+                        ]
+                        # Skip first paragraph (user message echo)
+                        agent_start = 0
+                        found_blank = False
+                        for i, line in enumerate(content_lines):
+                            stripped = line.strip()
+                            if not found_blank and not stripped:
+                                found_blank = True
+                                continue
+                            if found_blank and stripped:
+                                agent_start = i
+                                break
+                        response_lines = content_lines[agent_start:]
+                        final_answer = "\n".join(response_lines).strip()
+                        if final_answer:
+                            final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
+                            final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
+                            return final_answer.strip()
+
+            raise ValueError(
+                "No Kiro CLI response found - no Credits marker or green arrow detected"
+            )
+
+        # Find the previous Credits line (prior turn's end) to establish search boundary.
+        # This ensures we find the outer TUI separator, not one inside the agent's output.
+        prev_credits_idx = -1
+        for i in range(credits_idx - 1, -1, -1):
+            if re.search(TUI_CREDITS_PATTERN, lines[i]):
+                prev_credits_idx = i
+                break
+
+        # Find the first separator AFTER the previous turn boundary
+        separator_idx = None
+        for i in range(prev_credits_idx + 1, credits_idx):
+            if re.search(TUI_SEPARATOR_PATTERN, lines[i].strip()):
+                separator_idx = i
+                break
+
+        # Kiro 2.0: separator is AFTER credits_idx. Scan forward to find it.
+        if separator_idx is None:
+            next_credits_idx = len(lines)
+            for i in range(credits_idx + 1, len(lines)):
+                if re.search(TUI_CREDITS_PATTERN, lines[i]):
+                    next_credits_idx = i
+                    break
+            for i in range(credits_idx + 1, next_credits_idx):
+                if re.search(TUI_SEPARATOR_PATTERN, lines[i].strip()):
+                    separator_idx = i
+                    break
+
+        if separator_idx is None:
+            raise ValueError("No Kiro CLI response found - no separator found near Credits marker")
+
+        # Extract content between separator and Credits
+        if separator_idx > credits_idx:
+            # Kiro 2.0: separator after Credits. Content precedes credits_idx.
+            content_lines = lines[prev_credits_idx + 1 : credits_idx]
+        else:
+            # Pre-2.0: separator before Credits (existing behavior)
+            content_lines = lines[separator_idx + 1 : credits_idx]
+
+        # Skip the first paragraph (user message echo).
+        # The user message is the first block of non-empty lines after the separator.
+        # After a blank line, the agent response begins.
+        agent_start = 0
+        found_blank = False
+        for i, line in enumerate(content_lines):
+            stripped = line.strip()
+            if not found_blank and not stripped:
+                found_blank = True
+                continue
+            if found_blank and stripped:
+                agent_start = i
+                break
+
+        if not found_blank:
+            # No blank line found — entire content is the response
+            agent_start = 0
+
+        response_lines = content_lines[agent_start:]
+        final_answer = "\n".join(response_lines).strip()
+
+        if not final_answer:
+            raise ValueError("Empty Kiro CLI response - no content found")
+
+        # Clean up (ANSI codes already stripped from clean_output at caller)
+        final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
+        final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
+        return final_answer.strip()
+
+    def get_idle_pattern_for_log(self) -> str:
+        """Return Kiro CLI IDLE prompt pattern for log files.
+
+        Returns a pattern that matches either the legacy UI format
+        or the new TUI format.
+        """
+        return rf"(?:{IDLE_PROMPT_PATTERN_LOG}|{NEW_TUI_IDLE_PATTERN_LOG})"
+
+    def exit_cli(self) -> str:
+        """Get the command to exit Kiro CLI."""
+        return "/exit"
+
+    def cleanup(self) -> None:
+        """Clean up Kiro CLI provider."""
+        self._initialized = False

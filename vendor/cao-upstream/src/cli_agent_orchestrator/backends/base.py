@@ -1,0 +1,530 @@
+"""Terminal backend abstract base class.
+
+Defines the contract that all terminal backends (tmux, herdr, etc.) must satisfy.
+Core services depend only on this ABC, never on a concrete backend directly.
+"""
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, List, Optional
+
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+
+class TerminalBackendError(Exception):
+    """Base exception for terminal backend operations."""
+
+    pass
+
+
+class TerminalNotFoundError(TerminalBackendError):
+    """Raised when a terminal/pane cannot be found or resolved."""
+
+    def __init__(self, terminal_id: str, message: Optional[str] = None):
+        self.terminal_id = terminal_id
+        super().__init__(message or f"Terminal not found: {terminal_id}")
+
+
+class TerminalCleanupOutcome(str, Enum):
+    """What an exact-terminal cleanup actually ESTABLISHED, not merely attempted.
+
+    Deliberately finer than a bool. Runtime teardown has to tell a confirmed
+    removal from a merely-unproven one: collapsing either of the two uncertain
+    outcomes below into success is what lets a lifetime-reclaimed marker be
+    written for a pane that is still alive, or for one the backend could not
+    even look at.
+
+    - ``DELETED``: this call closed the exact object and confirmed it is gone.
+    - ``ABSENT``: positive proof no live object carries this ``terminal_id``.
+    - ``STILL_PRESENT``: the exact object is confirmed still live (the close was
+      not requested, or it did not take effect).
+    - ``UNKNOWN``: identity or the post-close state could not be read. Fail
+      closed; it is never evidence of absence.
+    """
+
+    DELETED = "deleted"
+    ABSENT = "absent"
+    STILL_PRESENT = "still_present"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class TerminalCleanupResult:
+    """Outcome of :meth:`TerminalBackend.cleanup_terminal_exact`.
+
+    ``reclaimed`` is True only for the two outcomes that PROVE the runtime is
+    gone: ``DELETED`` (we closed it and confirmed) and ``ABSENT`` (it provably
+    was not there). ``STILL_PRESENT`` and ``UNKNOWN`` both mean the caller must
+    keep the runtime retryable rather than record it as reclaimed.
+    """
+
+    outcome: TerminalCleanupOutcome
+    detail: str = ""
+
+    @property
+    def reclaimed(self) -> bool:
+        """Whether this result proves the exact terminal's runtime is gone."""
+        return self.outcome in (
+            TerminalCleanupOutcome.DELETED,
+            TerminalCleanupOutcome.ABSENT,
+        )
+
+
+class TerminalBackend(ABC):
+    """Abstract base class defining the terminal backend contract.
+
+    All terminal operations CAO requires are declared here. Concrete backends
+    (TmuxBackend, HerdrBackend) implement these methods using their respective
+    multiplexer APIs.
+    """
+
+    # --- Session lifecycle ---
+
+    def shutdown(self) -> None:
+        """Release backend-owned resources during server shutdown when needed."""
+        return None
+
+    @abstractmethod
+    def create_session(
+        self,
+        session_name: str,
+        window_name: str,
+        terminal_id: str,
+        working_directory: Optional[str] = None,
+        extra_env: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """Create a new terminal session with an initial window.
+
+        Args:
+            session_name: Name for the session (e.g., "cao-my-project")
+            window_name: Name for the initial window/tab
+            terminal_id: Unique terminal identifier to inject into the environment
+            working_directory: Optional starting directory
+
+        Returns:
+            The actual window name assigned by the backend
+
+        Raises:
+            TerminalBackendError: If session creation fails
+            ValueError: If working_directory is invalid
+        """
+        ...
+
+    @abstractmethod
+    def session_exists(self, session_name: str) -> bool:
+        """Check if a session exists.
+
+        Args:
+            session_name: Session name to check
+
+        Returns:
+            True if the session exists
+        """
+        ...
+
+    def session_exists_strict(self, session_name: str) -> bool:
+        """Check if a session exists, RAISING when the lookup cannot be answered.
+
+        Semantics differ from ``session_exists`` only in the error case:
+        ``session_exists`` collapses a lookup error into False ("assume
+        absent"), whereas this must distinguish a confirmed absence (return
+        False) from an inability to tell (raise). Teardown confirmation MUST
+        use this so a transient backend error is never misread as "session
+        gone" (#498).
+
+        Implementations must query in a way that keeps the two apart. That is a
+        real constraint, not a formality: a client library that swallows its own
+        transport errors and reports an empty result set makes a lookup failure
+        LOOK like an absence, and a strict check layered over it fails OPEN no
+        matter what it does with its own exceptions. ``TmuxBackend`` therefore
+        issues its own ``list-sessions`` and classifies the exit status
+        (``clients/tmux.py``) rather than using libtmux's session collection.
+
+        The default implementation delegates to ``session_exists`` for backends
+        that cannot yet make the distinction; those backends therefore retain the
+        old lenient, fail-OPEN behavior, and the teardown guarantee is only as
+        strong as this method. HerdrBackend is in that position — tracked as a
+        follow-up.
+        """
+        return self.session_exists(session_name)
+
+    @abstractmethod
+    def list_sessions(self) -> List[Dict[str, str]]:
+        """List all sessions managed by this backend.
+
+        Returns:
+            List of dicts with keys: id, name, status
+        """
+        ...
+
+    @abstractmethod
+    def kill_session(self, session_name: str) -> bool:
+        """Kill/destroy a session.
+
+        Implementations MUST NOT return True on a merely-dispatched kill: session
+        teardown treats True as proof the session is gone and only then drops the
+        matching registry rows, so an optimistic True is what lets tmux and the
+        registry diverge (#498). Confirm the session is actually gone — poll if
+        the kill is asynchronous — before returning True.
+
+        Args:
+            session_name: Session to kill
+
+        Returns:
+            True once the session is confirmed gone; False if it was not found
+            OR the kill could not be confirmed within the backend's bound. A
+            caller that must tell those two apart re-checks existence itself via
+            ``session_exists_strict``.
+        """
+        ...
+
+    # --- Window/tab lifecycle ---
+
+    @abstractmethod
+    def create_window(
+        self,
+        session_name: str,
+        window_name: str,
+        terminal_id: str,
+        working_directory: Optional[str] = None,
+        window_shell: Optional[str] = None,
+        extra_env: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """Create a new window/tab in an existing session.
+
+        Args:
+            session_name: Session to add the window to
+            window_name: Name for the new window
+            terminal_id: Unique terminal identifier to inject into the environment
+            working_directory: Optional starting directory
+            window_shell: Optional shell command to run instead of default shell
+
+        Returns:
+            The actual window name assigned by the backend
+
+        Raises:
+            TerminalBackendError: If window creation fails
+            ValueError: If session not found or working_directory is invalid
+        """
+        ...
+
+    @abstractmethod
+    def kill_window(self, session_name: str, window_name: str) -> bool:
+        """Kill a specific window within a session.
+
+        Retained for the ordinary, live-terminal teardown path and for
+        compatibility. It addresses its target by session/window NAME, so it
+        must never be used for a retained tombstone: session and window names
+        are reusable, and a replacement reusing the name would be destroyed.
+        Use :meth:`cleanup_terminal_exact` whenever ownership is in doubt.
+
+        Args:
+            session_name: Session containing the window
+            window_name: Window to kill
+
+        Returns:
+            True if window was killed, False if not found
+        """
+        ...
+
+    def cleanup_terminal_exact(
+        self,
+        terminal_id: str,
+        session_name: Optional[str] = None,
+        window_name: Optional[str] = None,
+        *,
+        close: bool = True,
+    ) -> TerminalCleanupResult:
+        """Close the exact backend object owned by ``terminal_id``, and confirm it.
+
+        ``terminal_id`` is AUTHORITATIVE; ``session_name`` / ``window_name`` are
+        advisory hints that only narrow the search. A backend must prove
+        ownership from its own terminal identity, never from a reusable
+        session/window label — labels are recycled. A retained deferred-init
+        tombstone routinely shares its session name (and sometimes its window
+        name) with a later replacement terminal, and closing that replacement
+        destroys an unrelated, live agent.
+
+        Contract, in both directions:
+
+        - ``ABSENT`` requires positive proof that no live object carries
+          ``terminal_id``. A failed or unreadable lookup is NOT absence.
+        - ``DELETED`` requires a post-close confirmation that the identity is
+          gone. A dispatched close that could not be confirmed is ``UNKNOWN``.
+        - ``UNKNOWN`` is the fail-closed answer for ambiguous identity (e.g.
+          the id resolves to more than one live object), missing/malformed
+          identity in the backend's own snapshot, or any read that could not be
+          answered. It is never collapsed to ``ABSENT`` or success.
+
+        ``close=False`` performs the identity proof WITHOUT mutating anything, so
+        a caller that already established the session is gone can still get a
+        truthful verdict (``STILL_PRESENT`` when the object is still there).
+
+        The default implementation returns ``UNKNOWN`` rather than raising, so a
+        backend that has not been taught exact identity fails closed — its
+        tombstones stay retryable instead of being silently declared reclaimed.
+        """
+        return TerminalCleanupResult(
+            TerminalCleanupOutcome.UNKNOWN,
+            f"{type(self).__name__} does not implement exact-terminal cleanup",
+        )
+
+    # --- Input ---
+
+    @abstractmethod
+    def send_keys(
+        self,
+        session_name: str,
+        window_name: str,
+        keys: str,
+        enter_count: int = 1,
+        force_bracketed_paste: bool = False,
+        submit_delay: float = 0.3,
+    ) -> None:
+        """Send text input to a window.
+
+        Args:
+            session_name: Target session
+            window_name: Target window
+            keys: Text to send
+            enter_count: Number of Enter keys to send after the text
+            force_bracketed_paste: If True, request bracketed-paste delivery.
+                The herdr backend wraps content in \\x1b[200~...\\x1b[201~
+                itself (it writes raw bytes to the pty, no sanitization). The
+                tmux backend hand-crafts the same wrap on tmux < 3.7 but must
+                delegate to ``paste-buffer -p`` on >= 3.7, where pasted
+                buffers are vis(3)-sanitized and raw ESC bytes would arrive
+                as literal "^[[200~" (issue #413); -p emits markers only when
+                the pane enabled DECSET 2004.
+            submit_delay: Seconds to wait after pasting before sending Enter, so
+                a TUI (e.g. Claude Code's Ink renderer) finishes processing the
+                paste before submission. Backends without a paste step may ignore.
+        """
+        ...
+
+    @abstractmethod
+    def send_special_key(self, session_name: str, window_name: str, key: str) -> None:
+        """Send a special key (e.g., C-c, C-d, Enter) to a window.
+
+        Unlike send_keys(), this sends the key as a control/special key name
+        and does not append a carriage return.
+
+        Args:
+            session_name: Target session
+            window_name: Target window
+            key: Key name (e.g., "C-d", "C-c", "Escape", "Enter", "")
+        """
+        ...
+
+    # --- Output ---
+
+    @abstractmethod
+    def get_history(
+        self,
+        session_name: str,
+        window_name: str,
+        tail_lines: Optional[int] = None,
+        strip_escapes: bool = False,
+        full_history: bool = False,
+        visible_only: bool = False,
+        join_wrapped: bool = False,
+    ) -> str:
+        """Get terminal output/history from a window.
+
+        Args:
+            session_name: Target session
+            window_name: Target window
+            tail_lines: Number of lines from the end (None = backend default).
+                On tmux this INCLUDES the visible pane plus N lines of scrollback
+                above it — it is not a viewport bounded to N rows.
+            strip_escapes: If True, strip ANSI escape sequences
+            full_history: If True, capture entire scrollback
+            visible_only: If True, capture only the currently rendered viewport,
+                nothing from scrollback (overrides tail_lines/full_history). A
+                backend without a viewport concept may approximate with its
+                closest bounded recent read.
+            join_wrapped: If True, return lines the terminal soft-wrapped at its
+                width rejoined into the logical lines the program wrote, so a
+                one-line message is one line whatever the width. A backend that
+                has no wrap concept, or already returns logical lines, ignores
+                it. Callers must treat the result as best-effort: reassemble
+                nothing load-bearing from it (see codex._find_config_rejection).
+
+        Returns:
+            Terminal output as a string
+        """
+        ...
+
+    @property
+    @abstractmethod
+    def max_history_lines(self) -> int:
+        """The most lines one :meth:`get_history` call can return on this backend.
+
+        ``get_output`` escalates through read depths (200 -> 500 -> 1000 ->
+        5000 lines) and, when no response marker is found at any of them,
+        labels the result "overflow" or "no response" against a threshold
+        derived from the deepest depth. That only means something if the
+        backend can actually serve that depth: a rung above the backend's
+        ceiling returns the same bytes as the rung below it, and an overflow
+        that filled the whole readable depth is then reported as "the agent
+        produced no text response" (#728, herdr). Each backend states its
+        ceiling here and ``get_output`` clips the ladder and the threshold to
+        it. Must be at least the shallowest rung.
+        """
+        ...
+
+    @abstractmethod
+    def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
+        """Get the current working directory of a pane.
+
+        Args:
+            session_name: Target session
+            window_name: Target window
+
+        Returns:
+            Working directory path, or None if unavailable
+        """
+        ...
+
+    @abstractmethod
+    def get_pane_current_command(self, session_name: str, window_name: str) -> Optional[str]:
+        """Get the current foreground command running in a pane.
+
+        Args:
+            session_name: Target session
+            window_name: Target window
+
+        Returns:
+            Command name, or None if unavailable
+        """
+        ...
+
+    # --- Attach ---
+
+    @abstractmethod
+    def attach_session(self, session_name: str) -> None:
+        """Attach to a session (for interactive use).
+
+        Args:
+            session_name: Session to attach to
+        """
+        ...
+
+    @abstractmethod
+    def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
+        """Prepare a browser PTY attachment and return its subprocess argv.
+
+        Backends may perform routing work before returning, such as focusing a
+        Herdr workspace/tab. The caller owns the PTY and subprocess lifecycle.
+
+        Args:
+            session_name: Target session
+            window_name: Target window
+
+        Returns:
+            Subprocess argv for the interactive backend client
+
+        Raises:
+            TerminalBackendError: If the backend cannot prepare the attachment
+        """
+        ...
+
+    # --- Pipe-pane (logging) ---
+
+    @abstractmethod
+    def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
+        """Start piping pane output to a file.
+
+        For backends that don't support pipe-pane (e.g., herdr), this is a no-op
+        since inbox delivery uses a different mechanism.
+
+        Args:
+            session_name: Target session
+            window_name: Target window
+            file_path: Absolute path to the log file
+        """
+        ...
+
+    @abstractmethod
+    def stop_pipe_pane(self, session_name: str, window_name: str) -> None:
+        """Stop piping pane output.
+
+        For backends that don't support pipe-pane, this is a no-op.
+
+        Args:
+            session_name: Target session
+            window_name: Target window
+        """
+        ...
+
+    # --- Capability queries ---
+
+    def supports_event_inbox(self) -> bool:
+        """Whether this backend uses event-based inbox delivery (e.g., socket events).
+
+        When True, terminals should be registered with an event-based inbox service
+        instead of using pipe-pane file watching.
+
+        Default is False (pipe-pane based delivery).
+        """
+        return False
+
+    def supports_output_stream(self) -> bool:
+        """Whether the backend publishes terminal bytes directly to the event bus.
+
+        Streaming backends such as a native ConPTY implementation should publish
+        ``terminal.{id}.output`` events themselves. This avoids the POSIX FIFO and
+        tmux ``pipe-pane`` path while retaining the existing status/log consumers.
+        """
+        return False
+
+    def subscribe_output(self, terminal_id: str):
+        """Subscribe to a native terminal's raw output for interactive clients."""
+        raise TerminalBackendError(
+            f"{type(self).__name__} does not support direct output subscriptions"
+        )
+
+    def unsubscribe_output(self, terminal_id: str, subscription) -> None:
+        """Release a direct output subscription without closing the terminal."""
+        raise TerminalBackendError(
+            f"{type(self).__name__} does not support direct output subscriptions"
+        )
+
+    def send_raw(self, terminal_id: str, data: bytes) -> None:
+        """Write bytes to a terminal managed directly by this backend."""
+        raise TerminalBackendError(
+            f"{type(self).__name__} does not support direct terminal input"
+        )
+
+    def resize_terminal(self, terminal_id: str, rows: int, cols: int) -> None:
+        """Resize a terminal managed directly by this backend."""
+        raise TerminalBackendError(
+            f"{type(self).__name__} does not support direct terminal resize"
+        )
+
+    def get_pane_id(self, terminal_id: str, session_name: str = "", window_name: str = "") -> str:
+        """Resolve terminal_id to backend-specific pane identifier.
+
+        Only meaningful for backends that use event-based inbox delivery.
+        Default raises NotImplementedError.
+
+        Args:
+            terminal_id: CAO terminal identifier
+            session_name: Optional session name for window-based fallback lookup
+            window_name: Optional window name for window-based fallback lookup
+
+        Returns:
+            Backend-specific pane identifier
+
+        Raises:
+            NotImplementedError: If backend does not support pane ID resolution
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support get_pane_id()")
+
+    def get_native_status(self, session_name: str, window_name: str) -> Optional[TerminalStatus]:
+        """Query native agent status if the backend has agent awareness.
+
+        Returns None if unsupported — caller falls back to pane content parsing.
+        """
+        return None

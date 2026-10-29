@@ -1,0 +1,709 @@
+"""Bounded, read-only vault traversal with sink-local containment checks."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import stat
+import time
+import unicodedata
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+from cli_agent_orchestrator.services.memory_reconciliation import (
+    _first_symlink_component,
+)
+from cli_agent_orchestrator.services.secret_gate import (
+    SecretMatch,
+    normalize_line_endings,
+    redact_secrets_with_acceptances,
+)
+from cli_agent_orchestrator.services.vault.boundary import (
+    is_excluded_relpath,
+    is_supported_relpath,
+)
+from cli_agent_orchestrator.services.vault.config import (
+    FolderMapping,
+    VaultSpec,
+)
+from cli_agent_orchestrator.services.vault.findings import FindingCode, finding_severity
+from cli_agent_orchestrator.services.vault.parser import (
+    ParseResult,
+    classify_secret,
+    parse_note,
+    secret_acceptances,
+    secret_scan_text,
+)
+from cli_agent_orchestrator.utils.secure_open import open_no_follow
+
+# Bounds the aggregate bytes opened in one scan even when independent config
+# ceilings would otherwise permit an impractical product.
+MAX_TOTAL_SCAN_BYTES = 64 * 1024 * 1024
+
+SCAN_BYTE_BUDGET_EXCEEDED = FindingCode.BYTE_BUDGET_EXCEEDED
+SCAN_NOTE_LIMIT_EXCEEDED = FindingCode.NOTE_LIMIT_EXCEEDED
+
+# ADR-006 stability check: a note whose identity changes across one read window
+# is re-read up to this many times, with a short linear backoff, before it is
+# recorded as ``unstable_skipped`` and left for the next reconcile.
+MAX_UNSTABLE_REREADS = 3
+UNSTABLE_REREAD_DELAY_SECONDS = 0.02
+
+
+@dataclass(frozen=True)
+class ScanFinding:
+    """Content-free outcome for one scanned or refused candidate."""
+
+    code: FindingCode
+    detail: str
+    severity: str
+
+
+@dataclass(frozen=True)
+class ScanNote:
+    """One deterministic scan result; text exists only in memory for reconcile."""
+
+    vault_relpath: str
+    scope: str
+    scope_id: Optional[str]
+    status: str
+    text: Optional[str] = None
+    parsed: Optional[ParseResult] = None
+    content_sha256: Optional[str] = None
+    frontmatter_sha256: Optional[str] = None
+    size_bytes: Optional[int] = None
+    mtime_ns: Optional[int] = None
+    findings: tuple[ScanFinding, ...] = ()
+
+
+@dataclass(frozen=True)
+class ScanReport:
+    """Frozen, sorted scan output with no database or vault side effects."""
+
+    notes: tuple[ScanNote, ...]
+    total_bytes_scanned: int
+    max_total_bytes: int
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    path: str
+    relpath: str
+    mapping: FolderMapping
+    discovery_stat: os.stat_result
+
+
+def scan_vault(
+    vault: VaultSpec,
+    *,
+    max_total_bytes: int = MAX_TOTAL_SCAN_BYTES,
+) -> ScanReport:
+    """Scan mapped Markdown files in deterministic order without writing anything."""
+    if not 0 < max_total_bytes <= MAX_TOTAL_SCAN_BYTES:
+        raise ValueError(f"max_total_bytes must be between 1 and {MAX_TOTAL_SCAN_BYTES}")
+
+    root = os.path.realpath(vault.root)
+    candidates, notes = _discover_candidates(root, vault)
+    blocked_by_case = _case_collision_paths(candidates)
+    total_bytes = 0
+
+    for index, candidate in enumerate(candidates):
+        if index >= vault.max_notes:
+            notes.append(
+                _refused(
+                    candidate,
+                    SCAN_NOTE_LIMIT_EXCEEDED,
+                    f"max_notes exceeded; {len(candidates) - index} candidates skipped",
+                )
+            )
+            break
+        if candidate.relpath in blocked_by_case:
+            notes.append(
+                _refused(
+                    candidate,
+                    FindingCode.PATH_CASE_COLLISION,
+                    "case-collision path",
+                )
+            )
+            continue
+
+        try:
+            before = os.lstat(candidate.path)
+        except OSError:
+            notes.append(_refused(candidate, FindingCode.UNSTABLE_SKIPPED, "stat failed"))
+            continue
+        if before.st_size > vault.max_note_bytes:
+            notes.append(_refused(candidate, FindingCode.NOTE_TOO_LARGE, "max_note_bytes exceeded"))
+            continue
+        if total_bytes + before.st_size > max_total_bytes:
+            notes.append(
+                _refused(
+                    candidate,
+                    SCAN_BYTE_BUDGET_EXCEEDED,
+                    f"total scan byte budget exceeded; {len(candidates) - index} candidates skipped",
+                )
+            )
+            break
+
+        remaining_bytes = max_total_bytes - total_bytes
+        read, after, refusal, reads = _read_stable_utf8_with_rereads(
+            candidate,
+            root,
+            vault.max_note_bytes,
+            max_read_bytes=min(vault.max_note_bytes, remaining_bytes),
+        )
+        if refusal is not None:
+            detail = _refusal_detail(refusal)
+            if refusal == FindingCode.UNSTABLE_SKIPPED and reads > 1:
+                detail = f"{detail}; still changing after {reads} reads"
+            notes.append(_refused(candidate, refusal, detail, after))
+            continue
+        assert read is not None and after is not None
+        raw_bytes = read
+        total_bytes += len(raw_bytes)
+        try:
+            text = raw_bytes.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            notes.append(
+                _refused(
+                    candidate,
+                    FindingCode.NOTE_NOT_UTF8,
+                    "note bytes are not valid UTF-8",
+                    after,
+                )
+            )
+            continue
+
+        normalized = _normalize_line_endings(text)
+        if "\x00" in normalized:
+            notes.append(
+                _refused(
+                    candidate,
+                    FindingCode.NOTE_CONTAINS_NUL,
+                    "note contains NUL byte",
+                    after,
+                )
+            )
+            continue
+        parsed = parse_note(
+            normalized,
+            max_frontmatter_bytes=vault.max_frontmatter_bytes,
+            secret_gate=candidate.mapping.secret_gate,
+        )
+        findings = _parse_findings(parsed)
+        plugin_format = (
+            candidate.relpath.lower().endswith(".excalidraw.md")
+            or "excalidraw-plugin" in parsed.frontmatter
+        )
+        if plugin_format:
+            findings += (
+                ScanFinding(
+                    FindingCode.PLUGIN_FORMAT_EXCLUDED,
+                    "Excalidraw format is not indexed",
+                    finding_severity(FindingCode.PLUGIN_FORMAT_EXCLUDED, secret_gate="reject"),
+                ),
+            )
+        # User frontmatter is preserved verbatim by managed writes. Scan only
+        # authored body content; the writer separately rejects secret-shaped
+        # generated ``cao`` metadata before publishing it.
+        secret = classify_secret(
+            secret_scan_text(parsed.region),
+            secret_gate=candidate.mapping.secret_gate,
+        )
+        if secret is not None:
+            findings += (ScanFinding(secret[0], secret[2], secret[1]),)
+        findings += _acceptance_findings(
+            parsed, secret_gate=candidate.mapping.secret_gate, has_secret=secret is not None
+        )
+
+        quarantined = any(finding.severity == "error" for finding in findings)
+        notes.append(
+            ScanNote(
+                vault_relpath=candidate.relpath,
+                scope=candidate.mapping.scope,
+                scope_id=candidate.mapping.scope_id,
+                status=(
+                    "unsupported" if plugin_format else "quarantined" if quarantined else "indexed"
+                ),
+                text=normalized,
+                parsed=parsed,
+                content_sha256=_sha256(normalized),
+                frontmatter_sha256=_sha256(parsed.region.raw) if parsed.region.raw else None,
+                size_bytes=after.st_size,
+                mtime_ns=after.st_mtime_ns,
+                findings=findings,
+            )
+        )
+
+    return ScanReport(
+        notes=tuple(sorted(notes, key=lambda note: note.vault_relpath.encode("utf-8"))),
+        total_bytes_scanned=total_bytes,
+        max_total_bytes=max_total_bytes,
+    )
+
+
+def _discover_candidates(
+    root: str, vault: VaultSpec
+) -> tuple[tuple[_Candidate, ...], list[ScanNote]]:
+    candidates: list[_Candidate] = []
+    notes: list[ScanNote] = []
+    root_path = Path(root)
+    for mapping in vault.mappings:
+        if not mapping.index:
+            continue
+        mapping_root = os.path.join(root, mapping.folder)
+        if not os.path.isdir(mapping_root):
+            notes.append(
+                ScanNote(
+                    mapping.folder,
+                    mapping.scope,
+                    mapping.scope_id,
+                    "skipped",
+                    findings=(
+                        ScanFinding(
+                            FindingCode.MAPPING_FOLDER_MISSING,
+                            "mapping folder is missing",
+                            finding_severity(
+                                FindingCode.MAPPING_FOLDER_MISSING, secret_gate="reject"
+                            ),
+                        ),
+                    ),
+                )
+            )
+            continue
+        if _first_symlink_component(Path(mapping_root), root_path) is not None:
+            relpath = mapping.folder
+            notes.append(
+                ScanNote(
+                    relpath,
+                    mapping.scope,
+                    mapping.scope_id,
+                    "quarantined",
+                    findings=(
+                        ScanFinding(
+                            FindingCode.SYMLINK_REFUSED,
+                            "symlinked mapping root",
+                            finding_severity(FindingCode.SYMLINK_REFUSED, secret_gate="reject"),
+                        ),
+                    ),
+                )
+            )
+            continue
+
+        def onerror(_error: OSError) -> None:
+            notes.append(
+                ScanNote(
+                    _relpath(_error.filename or mapping_root, root),
+                    mapping.scope,
+                    mapping.scope_id,
+                    "skipped",
+                    findings=(
+                        ScanFinding(
+                            FindingCode.MAPPING_FOLDER_UNREADABLE,
+                            "mapping folder is unreadable",
+                            finding_severity(
+                                FindingCode.MAPPING_FOLDER_UNREADABLE,
+                                secret_gate="reject",
+                            ),
+                        ),
+                    ),
+                )
+            )
+
+        for directory, dirnames, filenames in os.walk(
+            mapping_root, followlinks=False, onerror=onerror
+        ):
+            retained_dirs: list[str] = []
+            for name in sorted(dirnames, key=lambda item: item.encode("utf-8")):
+                path = os.path.join(directory, name)
+                relpath = _relpath(path, root)
+                if not is_supported_relpath(relpath):
+                    notes.append(
+                        ScanNote(
+                            relpath,
+                            mapping.scope,
+                            mapping.scope_id,
+                            "skipped",
+                            findings=(
+                                ScanFinding(
+                                    FindingCode.PATH_ESCAPES_ROOT,
+                                    "path is not a supported relative component path",
+                                    finding_severity(
+                                        FindingCode.PATH_ESCAPES_ROOT,
+                                        secret_gate="reject",
+                                    ),
+                                ),
+                            ),
+                        )
+                    )
+                    continue
+                if is_excluded_relpath(relpath, vault.exclude):
+                    continue
+                if _first_symlink_component(Path(path), root_path) is not None:
+                    notes.append(
+                        ScanNote(
+                            relpath,
+                            mapping.scope,
+                            mapping.scope_id,
+                            "quarantined",
+                            findings=(
+                                ScanFinding(
+                                    FindingCode.SYMLINK_REFUSED,
+                                    "symlinked path component",
+                                    finding_severity(
+                                        FindingCode.SYMLINK_REFUSED,
+                                        secret_gate="reject",
+                                    ),
+                                ),
+                            ),
+                        )
+                    )
+                    continue
+                retained_dirs.append(name)
+            dirnames[:] = retained_dirs
+            for filename in sorted(filenames, key=lambda name: name.encode("utf-8")):
+                path = os.path.join(directory, filename)
+                relpath = _relpath(path, root)
+                if not is_supported_relpath(relpath):
+                    notes.append(
+                        ScanNote(
+                            relpath,
+                            mapping.scope,
+                            mapping.scope_id,
+                            "skipped",
+                            findings=(
+                                ScanFinding(
+                                    FindingCode.PATH_ESCAPES_ROOT,
+                                    "path is not a supported relative component path",
+                                    finding_severity(
+                                        FindingCode.PATH_ESCAPES_ROOT,
+                                        secret_gate="reject",
+                                    ),
+                                ),
+                            ),
+                        )
+                    )
+                    continue
+                if is_excluded_relpath(relpath, vault.exclude) or not filename.lower().endswith(
+                    ".md"
+                ):
+                    continue
+                if _first_symlink_component(Path(path), root_path) is not None:
+                    notes.append(
+                        ScanNote(
+                            relpath,
+                            mapping.scope,
+                            mapping.scope_id,
+                            "quarantined",
+                            findings=(
+                                ScanFinding(
+                                    FindingCode.SYMLINK_REFUSED,
+                                    "symlinked path component",
+                                    finding_severity(
+                                        FindingCode.SYMLINK_REFUSED,
+                                        secret_gate="reject",
+                                    ),
+                                ),
+                            ),
+                        )
+                    )
+                    continue
+                if _sync_conflict_name(filename):
+                    notes.append(
+                        ScanNote(
+                            relpath,
+                            mapping.scope,
+                            mapping.scope_id,
+                            "skipped",
+                            findings=(
+                                ScanFinding(
+                                    FindingCode.SYNC_ARTIFACT_SKIPPED,
+                                    "sync-conflict filename",
+                                    finding_severity(
+                                        FindingCode.SYNC_ARTIFACT_SKIPPED,
+                                        secret_gate="reject",
+                                    ),
+                                ),
+                            ),
+                        )
+                    )
+                    continue
+                try:
+                    metadata = os.lstat(path)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    notes.append(
+                        ScanNote(
+                            relpath,
+                            mapping.scope,
+                            mapping.scope_id,
+                            "skipped",
+                            findings=(
+                                ScanFinding(
+                                    FindingCode.NON_REGULAR_FILE_REFUSED,
+                                    "non-regular Markdown entry",
+                                    finding_severity(
+                                        FindingCode.NON_REGULAR_FILE_REFUSED,
+                                        secret_gate="reject",
+                                    ),
+                                ),
+                            ),
+                        )
+                    )
+                    continue
+                if (
+                    stat.S_ISREG(metadata.st_mode)
+                    and metadata.st_nlink > 1
+                    and not mapping.allow_hardlinks
+                ):
+                    notes.append(
+                        ScanNote(
+                            relpath,
+                            mapping.scope,
+                            mapping.scope_id,
+                            "quarantined",
+                            findings=(
+                                ScanFinding(
+                                    FindingCode.HARDLINK_REFUSED,
+                                    "hardlink refused",
+                                    finding_severity(
+                                        FindingCode.HARDLINK_REFUSED,
+                                        secret_gate="reject",
+                                    ),
+                                ),
+                            ),
+                        )
+                    )
+                    continue
+                candidates.append(_Candidate(path, relpath, mapping, metadata))
+    return tuple(sorted(candidates, key=lambda candidate: candidate.relpath.encode("utf-8"))), notes
+
+
+def _read_stable_utf8(
+    candidate: _Candidate,
+    root: str,
+    max_note_bytes: int,
+    *,
+    max_read_bytes: Optional[int] = None,
+) -> tuple[Optional[bytes], Optional[os.stat_result], Optional[FindingCode]]:
+    """Read a single vetted inode; this is a read-window consistency check, not a lock."""
+    read_limit = min(max_note_bytes, max_note_bytes if max_read_bytes is None else max_read_bytes)
+    real_path = os.path.realpath(candidate.path)
+    # SafeAccessCheck — a bare str and single positive containment guard are
+    # colocated with this module's only path-reachable fd-open sink.
+    if not real_path.startswith(root + os.sep):
+        return None, None, FindingCode.PATH_ESCAPES_ROOT
+    try:
+        fd = open_no_follow(real_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None, None, FindingCode.UNSTABLE_SKIPPED
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            return None, before, FindingCode.NON_REGULAR_FILE_REFUSED
+        if (before.st_dev, before.st_ino) != (
+            candidate.discovery_stat.st_dev,
+            candidate.discovery_stat.st_ino,
+        ):
+            return None, before, FindingCode.PATH_ESCAPES_ROOT
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            content = handle.read(read_limit + 1)
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if len(content) > read_limit:
+        return (
+            None,
+            after,
+            (
+                FindingCode.NOTE_TOO_LARGE
+                if read_limit == max_note_bytes
+                else FindingCode.BYTE_BUDGET_EXCEEDED
+            ),
+        )
+    if _stat_identity(before) != _stat_identity(after):
+        return None, after, FindingCode.UNSTABLE_SKIPPED
+    return content, after, None
+
+
+def _read_stable_utf8_with_rereads(
+    candidate: _Candidate,
+    root: str,
+    max_note_bytes: int,
+    *,
+    max_read_bytes: Optional[int] = None,
+    max_rereads: int = MAX_UNSTABLE_REREADS,
+) -> tuple[Optional[bytes], Optional[os.stat_result], Optional[FindingCode], int]:
+    """Re-read a note whose identity changed across the read window, within a bound.
+
+    Only ``UNSTABLE_SKIPPED`` is retried; every other refusal is final. Returns
+    the last read outcome plus the number of reads performed so the caller can
+    report how long the note kept changing. The backoff is linear and short: an
+    Obsidian autosave completes in milliseconds, and the bound keeps a note that
+    is being written continuously from stalling the scan.
+    """
+    reads = 0
+    while True:
+        reads += 1
+        content, after, refusal = _read_stable_utf8(
+            candidate, root, max_note_bytes, max_read_bytes=max_read_bytes
+        )
+        if refusal != FindingCode.UNSTABLE_SKIPPED or reads > max_rereads:
+            return content, after, refusal, reads
+        time.sleep(UNSTABLE_REREAD_DELAY_SECONDS * reads)
+
+
+def _refusal_detail(code: FindingCode) -> str:
+    return {
+        FindingCode.PATH_ESCAPES_ROOT: "opened file does not match discovered in-root inode",
+        FindingCode.NOTE_TOO_LARGE: "max_note_bytes exceeded",
+        FindingCode.BYTE_BUDGET_EXCEEDED: "total scan byte budget exceeded",
+        FindingCode.NON_REGULAR_FILE_REFUSED: "opened path is not a regular file",
+        FindingCode.UNSTABLE_SKIPPED: "file changed during read",
+    }[code]
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    """Signals changed by normal in-place writes, including same-size writes."""
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _case_collision_paths(candidates: tuple[_Candidate, ...]) -> set[str]:
+    groups: dict[str, list[str]] = {}
+    for candidate in candidates:
+        key = unicodedata.normalize("NFC", candidate.relpath).casefold()
+        groups.setdefault(key, []).append(candidate.relpath)
+    return {path for group in groups.values() if len(group) > 1 for path in group}
+
+
+def _sync_conflict_name(filename: str) -> bool:
+    lowered = filename.lower()
+    return (
+        ".sync-conflict-" in lowered
+        or "conflicted copy" in lowered
+        or lowered.endswith(".icloud")
+        or lowered.startswith(".~lock.")
+    )
+
+
+def _acceptance_findings(
+    parsed: ParseResult, *, secret_gate: str, has_secret: bool
+) -> tuple[ScanFinding, ...]:
+    """Report every ``cao.secret_ok`` entry: honoured per span, or inert and why.
+
+    The record is never silent (#644 AC10): an acceptance that passes raw bytes
+    is a ``secret_accepted`` finding per span, and one that matches nothing, or
+    sits on a ``reject`` mapping where acceptances are not honoured, is a
+    ``secret_acceptance_unmatched`` warning so the operator removes it or
+    changes the mapping. Details carry pattern names only, never bytes.
+    """
+    accepted = secret_acceptances(parsed.cao)
+    if not accepted:
+        return ()
+    findings: list[ScanFinding] = []
+    if secret_gate != "warn":
+        for pattern, _digest in accepted:
+            findings.append(
+                ScanFinding(
+                    FindingCode.SECRET_ACCEPTANCE_UNMATCHED,
+                    f"{pattern}: mapping secret_gate is not warn",
+                    finding_severity(FindingCode.SECRET_ACCEPTANCE_UNMATCHED, secret_gate="reject"),
+                )
+            )
+        return tuple(findings)
+    matches: tuple[SecretMatch, ...] = ()
+    if has_secret:
+        _text, matches = redact_secrets_with_acceptances(secret_scan_text(parsed.region), accepted)
+    # ``secret_accepted`` is reported only for a span the agent receives as
+    # fingerprinted. An accepted span inside an unaccepted match (the vendor
+    # value inside ``NAME_TOKEN=value``) is still redacted, so it is reported
+    # as unmatched with the second fingerprint the operator has to accept.
+    hits = {pair: [m for m in matches if (m.pattern, m.sha256) == pair] for pair in set(accepted)}
+    for pattern, digest in accepted:
+        spans = hits[(pattern, digest)]
+        if not spans:
+            findings.append(_unmatched(f"{pattern}: no current span matches"))
+            continue
+        for match in spans:
+            if match.passed:
+                findings.append(
+                    ScanFinding(
+                        FindingCode.SECRET_ACCEPTED,
+                        match.pattern,
+                        finding_severity(FindingCode.SECRET_ACCEPTED, secret_gate="reject"),
+                    )
+                )
+            else:
+                findings.append(
+                    _unmatched(
+                        f"{pattern}: span is inside an unaccepted {match.blocked_by} match; "
+                        "accept that fingerprint too"
+                    )
+                )
+    return tuple(findings)
+
+
+def _unmatched(detail: str) -> ScanFinding:
+    return ScanFinding(
+        FindingCode.SECRET_ACCEPTANCE_UNMATCHED,
+        detail,
+        finding_severity(FindingCode.SECRET_ACCEPTANCE_UNMATCHED, secret_gate="reject"),
+    )
+
+
+def _parse_findings(parsed: ParseResult) -> tuple[ScanFinding, ...]:
+    if parsed.finding_code is None:
+        return ()
+    # Parser failures are independent of mapping secret_gate except secret_detected,
+    # which is added through classify_secret below.
+    return (
+        ScanFinding(
+            parsed.finding_code,
+            parsed.finding_detail or parsed.finding_code.value,
+            finding_severity(parsed.finding_code, secret_gate="reject"),
+        ),
+    )
+
+
+def _refused(
+    candidate: _Candidate,
+    code: FindingCode,
+    detail: str,
+    metadata: Optional[os.stat_result] = None,
+) -> ScanNote:
+    return ScanNote(
+        candidate.relpath,
+        candidate.mapping.scope,
+        candidate.mapping.scope_id,
+        "quarantined" if finding_severity(code, secret_gate="reject") == "error" else "skipped",
+        size_bytes=metadata.st_size if metadata is not None else None,
+        mtime_ns=metadata.st_mtime_ns if metadata is not None else None,
+        findings=(ScanFinding(code, detail, finding_severity(code, secret_gate="reject")),),
+    )
+
+
+def _relpath(path: str, root: str) -> str:
+    return unicodedata.normalize("NFC", os.path.relpath(path, root).replace(os.sep, "/"))
+
+
+def _normalize_line_endings(text: str) -> str:
+    """Note-level normalisation: drop a leading BOM, then apply the gate's LF rule.
+
+    The LF rule itself lives in :func:`secret_gate.normalize_line_endings`, so
+    the scan and the read boundary cannot disagree about what a line ending is.
+    """
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    return normalize_line_endings(text)
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()

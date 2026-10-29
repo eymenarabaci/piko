@@ -68,15 +68,15 @@ AO Codex pilotu ve AGY doğrudan CLI pilotu sonuçları [araştırma notunda](do
 
 | Sağlayıcı | Bağlantı | İzin/araç davranışı |
 |---|---|---|
-| Codex | Native exe veya Node CLI, `exec --json`, prompt stdin | `read-only` / `workspace-write`; kullanıcı araç yapılandırması aktarılmaz |
-| Antigravity | `agy --output-format json --print` | `plan` / `accept-edits`; global AGY araçları devralınır; çalışma başına MCP izolasyonu yok |
+| Codex | Native exe veya Node CLI, `exec --json`, prompt stdin | Doğrudan CLI modunda `read-only` / `workspace-write`; CAO adımında seçilen MCP'ler oturuma özel profile eklenir |
+| Antigravity | `agy --output-format json --print` | Doğrudan modda global araç ayarları geçerlidir; CAO adımında seçilen MCP'ler geçici profile eklenir |
 | Ollama | Yerel `127.0.0.1:11434/api/chat`, NDJSON stream | Metin yanıtı; araç/dosya yürütücüsü eklenmez |
 
 `CLI bulundu` yalnız executable keşfidir; oturum, kota veya model sağlığını garanti etmez. Devre dışı modeller reddedilir. Mevcut CLI oturumları kullanılır; anahtarlar taşınmaz veya yeniden yazılmaz. Antigravity `plan` modu işletim sistemi dosya sandbox'ı değildir; harici araçların kendi izinleri geçerlidir.
 
 ## Kapsam
 
-Planlama, model atama, bağımlı/paralel yürütme, plan düzenleme, iptal, kalıcı geçmiş, checkpoint ile devam, olay görünümü ve çıktı indirme yeniden uygulandı. Eski özel Skill/MCP seçim kataloğu, benchmark ekranı, AI denetim/onarım döngüleri, token bütçe sistemi ve artefakt rollback katmanı bu çekirdeğe taşınmadı. CLI'nın kendi araçları sağlayıcının izinleriyle kullanılabilir.
+Planlama, model atama, bağımlı/paralel yürütme, plan düzenleme, iptal, kalıcı geçmiş, checkpoint ile devam, olay görünümü ve çıktı indirme yeniden uygulandı. Paketlenmiş skill ve MCP envanteri bulunur. CAO, kurulu ve kimlik bilgisi istemeyen `context7` ile `sequential-thinking` sunucularını gerekli Codex/Antigravity adımına özel geçici persona üzerinden bağlar. Diğer MCP paketleri otomatik yetkilendirilmez; doğrudan CLI, AO ve Ollama adımlarında bu köprü kullanılmaz. CLI'nın kendi araçları sağlayıcının izinleriyle kullanılabilir.
 
 ## Kalıcılık ve kaynaklar
 

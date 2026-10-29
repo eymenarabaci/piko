@@ -1,0 +1,1413 @@
+"""Memory commands for CLI Agent Orchestrator CLI."""
+
+import asyncio
+import dataclasses
+import json
+import logging
+import os
+import re
+from pathlib import Path
+
+import click
+
+from cli_agent_orchestrator.constants import MEMORY_ARCHIVE_DEFAULT_FORMAT
+from cli_agent_orchestrator.models.memory import MemoryScope, MemoryType
+from cli_agent_orchestrator.services.memory_service import MemoryDisabledError, MemoryService
+from cli_agent_orchestrator.services.settings_service import is_non_accessing_inspection_enabled
+
+logger = logging.getLogger(__name__)
+
+
+def _get_memory_service() -> MemoryService:
+    return MemoryService()
+
+
+def _cwd_context() -> dict:
+    """Build terminal context from current working directory for scope resolution."""
+    return {"cwd": os.path.realpath(os.getcwd())}
+
+
+def _run_async(coro):
+    """Run an async coroutine synchronously."""
+    return asyncio.run(coro)
+
+
+_VALID_KEY_RE = re.compile(r"^[a-z0-9\-]+$")
+_MAX_KEY_LENGTH = 60  # mirrors MemoryService._sanitize_key
+
+
+def _validate_key(key: str) -> str:
+    """Validate memory key. Only [a-z0-9-] up to 60 chars (matches service)."""
+    if not _VALID_KEY_RE.match(key):
+        raise click.BadParameter(
+            f"Invalid key '{key}'. Keys may only contain lowercase letters, digits, and hyphens.",
+            param_hint="'KEY'",
+        )
+    if len(key) > _MAX_KEY_LENGTH:
+        raise click.BadParameter(
+            f"Key '{key}' exceeds {_MAX_KEY_LENGTH}-character limit.",
+            param_hint="'KEY'",
+        )
+    return key
+
+
+@click.group()
+def memory():
+    """Manage CAO memories."""
+
+
+@memory.command(name="repair")
+@click.option(
+    "--apply",
+    "do_apply",
+    is_flag=True,
+    default=False,
+    help="Apply metadata and index repairs. The default is a pure-read dry-run.",
+)
+@click.option(
+    "--receipt",
+    "receipt_id",
+    default=None,
+    help="Plan or apply rollback for exactly one migration receipt.",
+)
+def repair_cmd(do_apply, receipt_id):
+    """Reconcile topics into SQLite and index.md.
+
+    Reconciles the surviving canonical topics. Dry-run unless --apply.
+    """
+    from cli_agent_orchestrator.services.memory_reconciliation import (
+        MemoryReconciliationError,
+        MemoryReconciliationService,
+        MigrationReceiptNotFoundError,
+    )
+
+    service = MemoryReconciliationService()
+
+    def render_report(report):
+        click.echo(report.summary_text())
+        for record in report.records:
+            identity = record.identity
+            label = (
+                f"{identity.scope}:{identity.scope_id or '-'}:{identity.key}"
+                if identity is not None
+                else record.file_path
+            )
+            actions = ",".join(action.value for action in record.actions)
+            detail = f": {record.finding.message}" if record.finding is not None else ""
+            click.echo(f"{record.status} {label} [{actions}]{detail}")
+
+    try:
+        report = service.reconcile(apply=do_apply, receipt_id=receipt_id)
+    except MemoryReconciliationError as exc:
+        report = exc.report
+        render_report(report)
+        raise click.ClickException(str(exc))
+    except MigrationReceiptNotFoundError as exc:
+        raise click.ClickException(
+            "migration receipt not found; run `cao memory vault status` "
+            "and retry with a valid receipt id"
+        ) from exc
+    except Exception as exc:
+        raise click.ClickException(
+            f"memory repair failed: {type(exc).__name__}; run `cao memory repair --apply`"
+        ) from exc
+
+    render_report(report)
+    if report.has_unresolved:
+        raise click.exceptions.Exit(1)
+
+
+def _vault_config():
+    """Load the configured release-one vault or fail with a CLI-visible error."""
+    from cli_agent_orchestrator.services.settings_service import get_vault_config
+
+    try:
+        config = get_vault_config()
+    except Exception as exc:
+        raise click.ClickException(f"vault configuration unavailable: {exc}") from exc
+    if not config.enabled:
+        raise click.ClickException("memory vault is disabled by configuration")
+    if not config.vaults:
+        raise click.ClickException("memory vault has no configured vault")
+    return config
+
+
+def _configured_vault():
+    """Return the sole release-one vault after checking configuration."""
+    config = _vault_config()
+    return config, config.vaults[0]
+
+
+def _vault_scope_binding(scope: str, scope_id: str | None):
+    """Resolve a configured writable vault mapping for migration."""
+    from cli_agent_orchestrator.services.vault.binding import VaultBinding, resolve
+
+    config, vault = _configured_vault()
+    binding = resolve(scope, scope_id, vault_config=config)
+    if not isinstance(binding, VaultBinding):
+        raise click.ClickException(
+            f"scope '{scope}' is not mapped to a configured vault; migration requires a vault binding"
+        )
+    if binding.vault_id != vault.id:
+        raise click.ClickException(f"scope '{scope}' resolved to an unexpected vault binding")
+    if not binding.writable:
+        raise click.ClickException(f"scope '{scope}' vault mapping is not writable")
+    return vault, binding
+
+
+def _render_vault_payload(value, out_format: str) -> None:
+    """Render content-free vault operation results consistently."""
+    payload = dataclasses.asdict(value)
+    if out_format == "json":
+        click.echo(json.dumps(payload, indent=2, default=str, sort_keys=True))
+        return
+    for key, item in payload.items():
+        if isinstance(item, list):
+            item = ", ".join(f"{name}={count}" for name, count in item) if item else "-"
+        click.echo(f"{key}: {item}")
+
+
+@memory.group(name="vault")
+def vault():
+    """Inspect and maintain the configured Obsidian vault."""
+
+
+@vault.command(name="status")
+@click.option(
+    "--format",
+    "out_format",
+    type=click.Choice(["table", "json"], case_sensitive=False),
+    default="table",
+    show_default=True,
+)
+def vault_status(out_format):
+    """Show durable vault projection status and configuration warnings."""
+    from cli_agent_orchestrator.services.vault.status import get_vault_status
+
+    config = _vault_config()
+    for item in get_vault_status(config):
+        payload = dataclasses.asdict(item)
+        # A CLI invocation is a fresh process. Do not present this observation
+        # as durable status retained from earlier processes.
+        payload["process_local_unmapped_project_writes"] = (
+            "process-local; unavailable in a fresh CLI process"
+        )
+        payload["process_local_unmapped_project_identities"] = (
+            "process-local; unavailable in a fresh CLI process"
+        )
+        payload["process_local_non_writable_write_refusals"] = (
+            "process-local; unavailable in a fresh CLI process"
+        )
+        payload["process_local_secret_gate_write_refusals"] = (
+            "process-local; unavailable in a fresh CLI process"
+        )
+        payload["process_local_boundary_write_refusals"] = (
+            "process-local; unavailable in a fresh CLI process"
+        )
+        if out_format == "json":
+            click.echo(json.dumps(payload, indent=2, sort_keys=True))
+            continue
+        click.echo(f"vault_id: {payload['vault_id']}")
+        for name in (
+            "status_counts",
+            "finding_counts",
+            "recall_counters",
+            "migration_receipts",
+            "secret_acceptances",
+        ):
+            counts = payload[name]
+            click.echo(f"{name}: " + (", ".join(f"{key}={value}" for key, value in counts) or "-"))
+        for label, residual_rows in payload["inert_mappings"]:
+            click.echo(f"mapping: {label}; residual_rows={residual_rows}")
+        for warning in payload["warnings"]:
+            click.echo(f"warning: {warning}")
+        click.echo(
+            "process_local_unmapped_project_writes: "
+            "unavailable in a fresh CLI process (not durable status)"
+        )
+        click.echo(
+            "process_local_unmapped_project_identities: "
+            "unavailable in a fresh CLI process (not durable status)"
+        )
+        click.echo(
+            "process_local_non_writable_write_refusals: "
+            "unavailable in a fresh CLI process (not durable status)"
+        )
+        click.echo(
+            "process_local_secret_gate_write_refusals: "
+            "unavailable in a fresh CLI process (not durable status)"
+        )
+        click.echo(
+            "process_local_boundary_write_refusals: "
+            "unavailable in a fresh CLI process (not durable status)"
+        )
+
+
+@vault.command(name="scan")
+@click.option(
+    "--fingerprints",
+    is_flag=True,
+    default=False,
+    help=(
+        "Print pattern name and SHA-256 of every credential-shaped span in each "
+        "scanned note, the values a cao.secret_ok acceptance needs. Terminal only; "
+        "nothing is persisted."
+    ),
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Accepted for explicit review workflows; scan is always read-only.",
+)
+def vault_scan(fingerprints, dry_run):
+    """Scan vault notes (read-only).
+
+    Scans the configured vault notes without changing files or derived rows.
+    With --fingerprints, each credential-shaped span is listed as its pattern
+    name and SHA-256, the two values a per-finding cao.secret_ok acceptance in
+    that note's frontmatter needs. A span marked inside=<pattern> sits within
+    another match, as the value does in NAME_TOKEN=value; both fingerprints
+    must be accepted for it to be served raw. Fingerprints are shown only here,
+    never stored.
+    """
+    from cli_agent_orchestrator.services.secret_gate import redact_secrets_with_acceptances
+    from cli_agent_orchestrator.services.vault.parser import secret_scan_text
+    from cli_agent_orchestrator.services.vault.scan import scan_vault
+
+    _config, configured_vault = _configured_vault()
+    report = scan_vault(configured_vault)
+    if fingerprints:
+        for note in report.notes:
+            if note.parsed is None:
+                continue
+            _text, matches = redact_secrets_with_acceptances(
+                secret_scan_text(note.parsed.region), ()
+            )
+            for match in matches:
+                # A span inside another match (the value inside NAME_TOKEN=value)
+                # passes raw only when both fingerprints are accepted.
+                inside = f" inside={match.enclosed_by}" if match.enclosed_by else ""
+                click.echo(
+                    f"fingerprint: {note.vault_relpath} pattern={match.pattern} "
+                    f"sha256={match.sha256}{inside}"
+                )
+    click.echo(
+        f"Scanned {len(report.notes)} note(s); {report.total_bytes_scanned} bytes "
+        f"(limit {report.max_total_bytes})."
+    )
+    for note in report.notes:
+        click.echo(f"{note.status}: {note.vault_relpath}")
+
+
+@vault.command(name="reconcile")
+@click.option(
+    "--apply",
+    "do_apply",
+    is_flag=True,
+    default=False,
+    help="Apply the derived-state projection. The default is a dry-run.",
+)
+@click.option(
+    "--format",
+    "out_format",
+    type=click.Choice(["table", "json"], case_sensitive=False),
+    default="table",
+    show_default=True,
+)
+def vault_reconcile(do_apply, out_format):
+    """Reconcile scanned vault notes into derived state."""
+    from cli_agent_orchestrator.services.vault.reconcile import reconcile
+
+    _config, configured_vault = _configured_vault()
+    _render_vault_payload(reconcile(configured_vault, apply=do_apply), out_format)
+
+
+@vault.command(name="rebuild")
+@click.option(
+    "--apply",
+    "do_apply",
+    is_flag=True,
+    default=False,
+    help="Required: delete and re-derive vault state, resetting vault access counts.",
+)
+def vault_rebuild(do_apply):
+    """Delete and re-derive vault state.
+
+    Requires --apply; vault access counts reset by design.
+    """
+    from cli_agent_orchestrator.services.vault.reconcile import rebuild
+
+    if not do_apply:
+        raise click.ClickException(
+            "--apply is required because vault rebuild deletes and re-derives derived state"
+        )
+    _config, configured_vault = _configured_vault()
+    _render_vault_payload(rebuild(configured_vault), "table")
+
+
+@vault.command(name="migrate")
+@click.option(
+    "--scope",
+    type=click.Choice(["global", "project", "agent"], case_sensitive=False),
+    required=True,
+    help="Native memory scope to migrate.",
+)
+@click.option("--scope-id", default=None, help="Explicit scope identifier for project or agent.")
+@click.option(
+    "--apply",
+    "do_apply",
+    is_flag=True,
+    default=False,
+    help="Write managed notes. The default is a dry-run report.",
+)
+@click.option(
+    "--delete-source",
+    is_flag=True,
+    default=False,
+    help="Delete native source after a successful migration; requires both confirmation flags.",
+)
+@click.option(
+    "--confirm-delete-source",
+    is_flag=True,
+    default=False,
+    help="Second confirmation required with --delete-source.",
+)
+def vault_migrate(scope, scope_id, do_apply, delete_source, confirm_delete_source):
+    """Migrate native memories into the vault.
+
+    Writes them into a managed vault folder. Dry-run unless --apply.
+    """
+    from cli_agent_orchestrator.services.vault.migrate import migrate_scope
+
+    if delete_source and not do_apply:
+        raise click.ClickException("--delete-source requires --apply")
+    if delete_source and not confirm_delete_source:
+        raise click.ClickException("--delete-source requires --confirm-delete-source")
+
+    service = _get_memory_service()
+    if scope != MemoryScope.GLOBAL.value and scope_id is None:
+        scope_id = service.resolve_scope_id(scope, _cwd_context())
+        if scope_id is None:
+            raise click.ClickException(f"could not resolve scope_id for scope '{scope}'")
+    if scope == MemoryScope.GLOBAL.value and scope_id is not None:
+        raise click.ClickException("--scope-id is not allowed with --scope global")
+
+    configured_vault, binding = _vault_scope_binding(scope, scope_id)
+    report = migrate_scope(
+        service,
+        configured_vault,
+        binding,
+        scope=scope,
+        scope_id=scope_id,
+        apply=do_apply,
+        delete_source=delete_source,
+        confirm_delete_source=confirm_delete_source,
+    )
+    _render_vault_payload(report, "table")
+
+
+@memory.command(name="list")
+@click.option(
+    "--scope",
+    type=click.Choice([s.value for s in MemoryScope], case_sensitive=False),
+    default=None,
+    help="Filter by scope (global, project, session, agent, federated).",
+)
+@click.option(
+    "--type",
+    "memory_type",
+    type=click.Choice([t.value for t in MemoryType], case_sensitive=False),
+    default=None,
+    help="Filter by memory type (user, feedback, project, reference).",
+)
+@click.option(
+    "--all",
+    "scan_all",
+    is_flag=True,
+    default=False,
+    help="Show memories from all projects, not just the current working directory.",
+)
+@click.option("--query", default=None, help="Query for the --explain relevance diagnostic.")
+@click.option(
+    "--explain",
+    is_flag=True,
+    default=False,
+    help="Compare default and relevance recall without recording access; requires --query.",
+)
+@click.option(
+    "--limit",
+    type=click.IntRange(1, 100),
+    default=10,
+    show_default=True,
+    help="Top-result limit for --explain.",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    show_default=True,
+    help="Output format for --explain.",
+)
+def list_memories(scope, memory_type, scan_all, query, explain, limit, output_format):
+    """List stored memories.
+
+    By default shows global memories and memories for the current working directory.
+    Use --all to show memories across all projects.
+    """
+    if explain and (not query or not query.strip()):
+        raise click.UsageError("--explain requires --query.")
+    if query is not None and not explain:
+        raise click.UsageError("--query requires --explain.")
+    if not explain:
+        context = click.get_current_context()
+        for parameter, flag in (("limit", "--limit"), ("output_format", "--format")):
+            if context.get_parameter_source(parameter) is click.core.ParameterSource.COMMANDLINE:
+                raise click.UsageError(f"{flag} requires --explain.")
+    if explain:
+        from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+        if not is_memory_enabled():
+            raise click.ClickException("Memory is disabled (memory.enabled=false).")
+        try:
+            diagnostic = _run_async(
+                _get_memory_service().recall_explain(
+                    query=query,
+                    scope=scope,
+                    memory_type=memory_type,
+                    limit=limit,
+                    terminal_context=_cwd_context(),
+                    scan_all=scan_all,
+                )
+            )
+        except Exception as e:
+            logger.debug("Memory explain failed: %s", e, exc_info=True)
+            debug = os.environ.get("CAO_LOG_LEVEL", "").strip().upper() == "DEBUG"
+            if debug:
+                click.echo(f"Explain detail ({type(e).__name__}): {e}", err=True)
+            hint = "details above" if debug else "re-run with CAO_LOG_LEVEL=DEBUG for details"
+            raise click.ClickException(f"Explain failed ({type(e).__name__}); {hint}") from e
+        if diagnostic is None:
+            raise click.ClickException("Explain is disabled (memory.explain_enabled=false).")
+        if output_format == "json":
+            click.echo(json.dumps(diagnostic))
+        else:
+            _print_explain_table(diagnostic)
+        return
+
+    svc = _get_memory_service()
+    try:
+        terminal_context = {"cwd": os.path.realpath(os.getcwd())}
+        memories = _run_async(
+            svc.recall(
+                scope=scope,
+                memory_type=memory_type,
+                limit=100,
+                terminal_context=terminal_context,
+                scan_all=scan_all,
+                record_access=not is_non_accessing_inspection_enabled(),
+            )
+        )
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+    if not memories:
+        click.echo("No memories found.")
+        return
+
+    # Table header
+    header = f"{'KEY':<30} {'SCOPE':<10} {'TYPE':<12} {'TAGS':<20} {'UPDATED'}"
+    click.echo(header)
+    click.echo("-" * len(header))
+
+    for mem in memories:
+        updated = mem.updated_at.strftime("%Y-%m-%d %H:%M")
+        tags = mem.tags if mem.tags else ""
+        marker = f"  [{mem.lifecycle_status}]" if mem.lifecycle_status is not None else ""
+        click.echo(
+            f"{mem.key:<30} {mem.scope:<10} {mem.memory_type:<12} {tags:<20} {updated}{marker}"
+        )
+
+
+def _print_explain_table(diagnostic: dict) -> None:
+    """Render only the content-minimizing diagnostic fields."""
+    click.echo(f"Query: {diagnostic['query']}")
+    click.echo(
+        f"Pool: {diagnostic['pool_size']}  Candidates/source: {diagnostic['candidate_limit']}"
+    )
+    header = f"{'KEY':<30} {'SCOPE':<10} {'SRC':<8} {'TIER':<10} {'LEX':>6} {'AGE×':>6} {'REL':>6} {'REL#':>5} {'DEF#':>5} {'REC':>5} {'SUP':>5} {'INJ':>9}"
+    click.echo(header)
+    click.echo("-" * len(header))
+    for row in diagnostic["candidates"]:
+        rel_rank = row["relevance_rank"] if row["relevance_rank"] is not None else "-"
+        def_rank = row["recency_rank"] if row["recency_rank"] is not None else "-"
+        click.echo(
+            f"{row['key']:<30} {row['scope']:<10} {row['source_kind']:<8} {row['tier']:<10} "
+            f"{row['lexical']:>6.4f} {row['recency_factor']:>6.4f} {row['relevance']:>6.4f} "
+            f"{rel_rank!s:>5} {def_rank!s:>5} {str(row['recovered']):>5} {str(row['superseded']):>5} {row['injection']:>9}"
+        )
+    click.echo(
+        f"Lexical degenerate: {str(bool(diagnostic.get('lexical_degenerate', False))).lower()}"
+    )
+
+
+@memory.command()
+@click.argument("key")
+@click.option(
+    "--scope",
+    type=click.Choice([s.value for s in MemoryScope], case_sensitive=False),
+    default=None,
+    help="Scope to search in. Searches all scopes if omitted.",
+)
+def show(key, scope):
+    """Display full content of a memory."""
+    _validate_key(key)
+    svc = _get_memory_service()
+    try:
+        memories = _run_async(
+            svc.recall(
+                query=key,
+                scope=scope,
+                limit=100,
+                terminal_context=_cwd_context(),
+                scan_all=True,
+                record_access=not is_non_accessing_inspection_enabled(),
+            )
+        )
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+    # Find exact key match
+    match = None
+    for mem in memories:
+        if mem.key == key:
+            match = mem
+            break
+
+    if not match:
+        raise click.ClickException(f"Memory '{key}' not found.")
+
+    click.echo(f"Key:     {match.key}")
+    click.echo(f"Scope:   {match.scope}")
+    click.echo(f"Type:    {match.memory_type}")
+    click.echo(f"Tags:    {match.tags or '(none)'}")
+    click.echo(f"Created: {match.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    click.echo(f"Updated: {match.updated_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    if match.lifecycle_status is not None:
+        click.echo(f"Status:  {match.lifecycle_status}")
+    click.echo(f"File:    {match.file_path}")
+    click.echo()
+    click.echo(match.content)
+
+
+@memory.command()
+@click.argument("key")
+@click.option(
+    "--scope",
+    type=click.Choice([s.value for s in MemoryScope], case_sensitive=False),
+    default="project",
+    help="Scope of the memory to delete (default: project).",
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
+def delete(key, scope, yes):
+    """Delete a memory by key."""
+    _validate_key(key)
+    if not yes:
+        click.confirm(f"Delete memory '{key}'?", abort=True)
+
+    svc = _get_memory_service()
+    try:
+        deleted = _run_async(svc.forget(key=key, scope=scope, terminal_context=_cwd_context()))
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+    if deleted.action == "deleted":
+        click.echo(f"Deleted memory '{key}' (scope: {scope}).")
+    elif deleted.action == "deindexed":
+        click.echo(f"De-indexed '{key}'; the file is retained in your vault at {deleted.path}.")
+    elif deleted.action == "deleted_and_deindexed":
+        click.echo(
+            f"Deleted native memory '{key}' and de-indexed the retained vault file at {deleted.path}."
+        )
+    else:
+        raise click.ClickException(f"Memory '{key}' not found in scope '{scope}'.")
+
+
+@memory.command()
+@click.option(
+    "--scope",
+    type=click.Choice([s.value for s in MemoryScope], case_sensitive=False),
+    required=True,
+    help="Scope to clear (required). One of: global, project, session, agent, federated.",
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
+def clear(scope, yes):
+    """Clear all memories for a given scope. Requires --scope."""
+    if not yes:
+        click.confirm(f"Clear all {scope}-scoped memories?", abort=True)
+
+    svc = _get_memory_service()
+    ctx = _cwd_context()
+    try:
+        memories = _run_async(svc.recall(scope=scope, limit=1000, terminal_context=ctx))
+    except Exception as e:
+        raise click.ClickException(str(e))
+
+    if not memories:
+        click.echo(f"No {scope}-scoped memories to clear.")
+        return
+
+    deleted_count = 0
+    for mem in memories:
+        try:
+            # Pass scope_id from the recalled memory so session/agent
+            # deletes target the nested on-disk path (the CLI cwd
+            # context lacks session_name/agent_profile).
+            result = _run_async(
+                svc.forget(
+                    key=mem.key,
+                    scope=scope,
+                    terminal_context=ctx,
+                    scope_id=mem.scope_id,
+                )
+            )
+            if result.action in {"deleted", "deindexed", "deleted_and_deindexed"}:
+                deleted_count += 1
+        except Exception:
+            click.echo(f"Warning: Failed to delete '{mem.key}'.", err=True)
+
+    click.echo(f"Cleared {deleted_count} {scope}-scoped memory(ies).")
+
+
+@memory.command(name="lint")
+@click.option(
+    "--scope",
+    type=click.Choice([s.value for s in MemoryScope], case_sensitive=False),
+    default=None,
+    help="Restrict lint to one scope (default: all four).",
+)
+@click.option(
+    "--format",
+    "out_format",
+    type=click.Choice(["table", "json"], case_sensitive=False),
+    default="table",
+    show_default=True,
+    help="Output format. JSON includes ISO-8601 detected_at per row.",
+)
+def lint_cmd(scope, out_format):
+    """Run wiki lint detectors and print findings.
+
+    \b
+    Exit codes:
+      0  no error-severity issues found
+      1  one or more error-severity issues found
+      2  CLI / project resolution failure (handled by Click)
+    """
+    import json as _json
+
+    from cli_agent_orchestrator.services import settings_service
+    from cli_agent_orchestrator.services.wiki_lint import (
+        compute_exit_code,
+        run_lint,
+    )
+
+    is_json = out_format.lower() == "json"
+    if not settings_service.is_memory_lint_enabled():
+        message = (
+            "Memory lint is disabled by configuration "
+            "(memory.lint_enabled=false or CAO_MEMORY_LINT_ENABLED=false)."
+        )
+        click.echo(message, err=is_json)
+        if is_json:
+            click.echo("[]")
+        raise click.exceptions.Exit(0)
+
+    svc = _get_memory_service()
+    ctx = _cwd_context()
+    try:
+        # Resolve project_hash via the same chain `cao memory list` uses.
+        project_hash = svc.resolve_scope_id("project", ctx) or "unknown"
+    except Exception as e:
+        raise click.ClickException(f"failed to resolve project identity: {e}")
+
+    try:
+        issues = _run_async(run_lint(project_hash, scope=scope))
+    except Exception as e:
+        raise click.ClickException(f"lint run failed: {e}")
+
+    # Emit a top-line completion summary for visibility even when the result
+    # list is empty. Routed to stderr under --format json so stdout stays a
+    # clean, parseable JSON stream.
+    completion = next(
+        (
+            i.description
+            for i in issues
+            if i.issue_type == "lint_error" and i.description.startswith("lint_run_completed:")
+        ),
+        "lint_run_completed: 0/5",
+    )
+    click.echo(completion, err=is_json)
+
+    # The completion summary is echoed above; drop it from the rendered
+    # payload/table and the exit-code computation so it isn't duplicated and
+    # the "No lint issues found." branch can still fire on a clean run.
+    issues = [
+        i
+        for i in issues
+        if not (i.issue_type == "lint_error" and i.description.startswith("lint_run_completed:"))
+    ]
+
+    if is_json:
+        payload = [
+            {
+                "issue_type": i.issue_type,
+                "key": i.key,
+                "related_key": i.related_key,
+                "description": i.description,
+                "severity": i.severity,
+                "detected_at": i.detected_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            for i in issues
+        ]
+        click.echo(_json.dumps(payload, indent=2))
+    else:
+        if not issues:
+            click.echo("No lint issues found.")
+            raise click.exceptions.Exit(compute_exit_code(issues))
+        header = f"{'SEVERITY':<8} {'TYPE':<18} {'KEY':<30} {'DETECTED':<22} DESCRIPTION"
+        click.echo(header)
+        click.echo("-" * len(header))
+        for i in issues:
+            ts = i.detected_at.strftime("%Y-%m-%d %H:%M:%SZ")
+            click.echo(f"{i.severity:<8} {i.issue_type:<18} {i.key:<30} {ts:<22} {i.description}")
+
+    raise click.exceptions.Exit(compute_exit_code(issues))
+
+
+@memory.command(name="compact")
+@click.option(
+    "--scope",
+    type=click.Choice([s.value for s in MemoryScope], case_sensitive=False),
+    default="global",
+    show_default=True,
+    help="Scope to compact.",
+)
+@click.option(
+    "--key",
+    default=None,
+    help="Compact a single topic unconditionally (default: all stale topics).",
+)
+def compact_cmd(scope, key):
+    """Compact wiki topics with the LLM compiler (repair sweep).
+
+    Compiles every topic whose article changed since its last compile —
+    the catch-all for background compiles that were dropped, timed out, or
+    lost a concurrency race. Drives the locally installed coding-agent CLI
+    (claude / codex / kiro-cli); requires no API key. Compiles run one at a
+    time and can take a minute or two each.
+
+    Acts immediately; there is no confirmation prompt.
+    """
+    if key is not None:
+        key = _validate_key(key)
+
+    svc = _get_memory_service()
+    ctx = _cwd_context()
+    scope_id = None
+    if scope != MemoryScope.GLOBAL.value:
+        scope_id = svc.resolve_scope_id(scope, ctx)
+        if scope_id is None:
+            raise click.ClickException(f"could not resolve scope_id for scope '{scope}'")
+
+    try:
+        results = _run_async(svc.compact(scope=scope, scope_id=scope_id, key=key))
+    except Exception as e:
+        raise click.ClickException(f"compact failed: {e}")
+
+    summary = results.pop("_summary", {})
+    if not results:
+        click.echo("Nothing to compact — all topics are up to date.")
+        return
+    for topic_key, status in sorted(results.items()):
+        click.echo(f"{status:<22} {topic_key}")
+    click.echo(f"\nSummary: {summary}")
+
+
+@memory.command(name="heal")
+@click.option(
+    "--scope",
+    # Only global/project are resolvable from cwd context here; session/agent
+    # need a session_name/agent_profile that this CLI path cannot derive, so
+    # offering them would only ever raise "could not resolve scope_id".
+    type=click.Choice([MemoryScope.GLOBAL.value, MemoryScope.PROJECT.value], case_sensitive=False),
+    default="project",
+    show_default=True,
+    help="Scope to heal (global or project).",
+)
+@click.option(
+    "--apply",
+    "do_apply",
+    is_flag=True,
+    default=False,
+    help="Apply mutations. Without this flag, prints a dry-run plan only.",
+)
+@click.option(
+    "--aggressive",
+    is_flag=True,
+    default=False,
+    help="Enable destructive poison_frequency healing (requires --apply too).",
+)
+@click.option(
+    "--issue-type",
+    "issue_type",
+    type=click.Choice(
+        ["orphan_page", "contradiction", "stale_claim", "poison_frequency"],
+        case_sensitive=False,
+    ),
+    default=None,
+    help="Restrict healing to a single issue type.",
+)
+@click.option(
+    "--format",
+    "out_format",
+    type=click.Choice(["table", "json"], case_sensitive=False),
+    default="table",
+    show_default=True,
+    help="Output format.",
+)
+def heal_cmd(scope, do_apply, aggressive, issue_type, out_format):
+    """Repair wiki lint findings.
+
+    Covers orphan pages, contradictions, and stale claims.
+    Dry-run by DEFAULT — prints what would change. Pass --apply to mutate.
+    poison_frequency healing additionally requires --aggressive.
+    graph_density is flag-only and never mutated.
+    """
+    import json as _json
+
+    from cli_agent_orchestrator.services import settings_service, wiki_healer
+    from cli_agent_orchestrator.services.wiki_lint import run_lint
+
+    is_json = out_format.lower() == "json"
+    if not settings_service.is_memory_lint_enabled():
+        message = (
+            "Memory lint is disabled by configuration "
+            "(memory.lint_enabled=false or CAO_MEMORY_LINT_ENABLED=false)."
+        )
+        if is_json:
+            click.echo(message, err=True)
+            click.echo(_json.dumps({"disabled": True, "message": message}, indent=2))
+        else:
+            click.echo(message)
+        return
+
+    svc = _get_memory_service()
+    ctx = _cwd_context()
+
+    scope_id = None
+    if scope != MemoryScope.GLOBAL.value:
+        scope_id = svc.resolve_scope_id(scope, ctx)
+        if scope_id is None:
+            raise click.ClickException(f"could not resolve scope_id for scope '{scope}'")
+
+    project_hash = scope_id or "unknown"
+
+    try:
+        issues = _run_async(run_lint(project_hash, scope=scope))
+    except Exception as e:
+        raise click.ClickException(f"lint run failed: {e}")
+
+    if issue_type is not None:
+        issues = [i for i in issues if i.issue_type == issue_type]
+
+    try:
+        report = _run_async(
+            wiki_healer.heal(
+                issues,
+                scope=scope,
+                scope_id=scope_id,
+                apply=do_apply,
+                aggressive=aggressive,
+            )
+        )
+    except wiki_healer.HealConflictError as e:
+        raise click.ClickException(str(e))
+    except Exception as e:
+        raise click.ClickException(f"heal failed: {e}")
+
+    if is_json:
+        payload = {
+            "scope": report.scope,
+            "scope_id": report.scope_id,
+            "apply": report.apply,
+            "aggressive": report.aggressive,
+            "dry_run_summary": report.dry_run_summary,
+            "truncated_by_type": report.truncated_by_type,
+            "truncated_run_level": report.truncated_run_level,
+            "total_suppressed": report.total_suppressed,
+            "actions": [
+                {
+                    "issue_type": a.issue_type,
+                    "key": a.key,
+                    "related_key": a.related_key,
+                    "description": a.description,
+                    "status": a.status,
+                }
+                for a in report.actions
+            ],
+        }
+        click.echo(_json.dumps(payload, indent=2))
+        return
+
+    if report.dry_run_summary:
+        click.echo(report.dry_run_summary)
+    if not report.actions:
+        click.echo("Nothing to heal.")
+        return
+    header = f"{'STATUS':<10} {'TYPE':<22} {'KEY':<30} DESCRIPTION"
+    click.echo(header)
+    click.echo("-" * len(header))
+    for a in report.actions:
+        click.echo(f"{a.status:<10} {a.issue_type:<22} {a.key:<30} {a.description}")
+    if report.total_suppressed:
+        click.echo(
+            f"\n{report.total_suppressed} action(s) suppressed by caps "
+            f"(by type: {report.truncated_by_type}, run-level: {report.truncated_run_level})."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Archive export/import (#345 D6) — direct MemoryService calls like siblings
+# ---------------------------------------------------------------------------
+
+_PRIVATE_SCOPES = (MemoryScope.SESSION.value, MemoryScope.AGENT.value)
+
+
+def _resolve_export_scope_id(svc: MemoryService, scope: str) -> "str | None":
+    """Resolve scope_id for export. Project binds to the CLI's cwd (D5)."""
+    if scope == MemoryScope.PROJECT.value:
+        scope_id = svc.resolve_scope_id(scope, _cwd_context())
+        if scope_id is None:
+            raise click.ClickException(f"could not resolve scope_id for scope '{scope}'")
+        return scope_id
+    return None
+
+
+@memory.command(name="export")
+@click.option(
+    "--format",
+    "fmt",
+    default=MEMORY_ARCHIVE_DEFAULT_FORMAT,
+    show_default=True,
+    help="Archive format (registry-backed; 'okf' today).",
+)
+@click.option(
+    "--scope",
+    type=click.Choice([s.value for s in MemoryScope], case_sensitive=False),
+    required=True,
+    help="Scope to export (one bundle per scope).",
+)
+@click.option(
+    "-o",
+    "--output",
+    "output",
+    required=True,
+    help="Destination directory, or a .tar.gz file path.",
+)
+@click.option(
+    "--include-private",
+    is_flag=True,
+    default=False,
+    help="Required to export the private session/agent scopes.",
+)
+@click.option("--include-history", is_flag=True, default=False, help="Emit history/<key>.md files.")
+@click.option(
+    "--redact",
+    is_flag=True,
+    default=False,
+    help="Redact secret matches instead of skipping the topic.",
+)
+@click.option(
+    "--prune",
+    is_flag=True,
+    default=False,
+    help="Delete destination topics no longer in the scope (directory output only).",
+)
+def export_cmd(fmt, scope, output, include_private, include_history, redact, prune):
+    """Export a memory scope as an archive bundle.
+
+    The default format is an OKF directory.
+    """
+    # Private-scope gate (D5): whole-command error BEFORE any write.
+    if scope in _PRIVATE_SCOPES and not include_private:
+        raise click.ClickException(
+            f"scope '{scope}' holds private working state; pass --include-private to export it"
+        )
+
+    svc = _get_memory_service()
+    scope_id = _resolve_export_scope_id(svc, scope)
+
+    try:
+        if output.endswith(".tar.gz"):
+            from cli_agent_orchestrator.services.memory_archive import get_backend
+            from cli_agent_orchestrator.services.memory_archive.okf import export_bundle_to_tar
+
+            backend = get_backend(fmt)(svc)
+            report = export_bundle_to_tar(
+                backend,
+                scope,
+                scope_id,
+                Path(output),
+                include_history=include_history,
+                redact=redact,
+            )
+        else:
+            report = svc.export_memories(
+                fmt,
+                scope,
+                scope_id,
+                Path(output),
+                include_history=include_history,
+                redact=redact,
+                prune=prune,
+            )
+    except ValueError as e:
+        raise click.ClickException(str(e))
+
+    click.echo(f"Exported scope '{scope}' to {output}")
+    click.echo(
+        f"  exported: {report.exported}  unchanged: {report.unchanged}  "
+        f"skipped (secret): {report.skipped_secret}  redacted: {report.redacted}  "
+        f"pruned: {report.pruned}  links dropped: {report.links_dropped}"
+    )
+    for key, patterns in sorted(report.skip_reasons.items()):
+        click.echo(f"  skipped '{key}': matched {', '.join(patterns)}")
+
+
+@memory.command(name="import")
+@click.argument("path")
+@click.option(
+    "--format",
+    "fmt",
+    default=MEMORY_ARCHIVE_DEFAULT_FORMAT,
+    show_default=True,
+    help="Archive format (registry-backed; 'okf' today).",
+)
+@click.option(
+    "--scope",
+    # D5: global/project/federated only — agent is banned outright and
+    # session is not offered (bulk-writing a private tier is the exact
+    # cross-scope contamination store()'s guard prevents).
+    type=click.Choice(
+        [MemoryScope.GLOBAL.value, MemoryScope.PROJECT.value, MemoryScope.FEDERATED.value],
+        case_sensitive=False,
+    ),
+    required=True,
+    help="Target scope (required — bundles carry no scope).",
+)
+@click.option(
+    "--conflict",
+    type=click.Choice(["skip", "replace", "merge"], case_sensitive=False),
+    default="skip",
+    show_default=True,
+    help="Policy when a key already exists in the target scope.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Full parse/validate/secret pipeline, report only — no writes.",
+)
+def import_cmd(path, fmt, scope, conflict, dry_run):
+    """Import an archive bundle directory into a memory scope.
+
+    --conflict replace overwrites existing keys in the target scope.
+
+    Acts immediately; there is no confirmation prompt.
+    """
+    svc = _get_memory_service()
+    try:
+        report = svc.import_memories(
+            fmt,
+            Path(path),
+            target_scope=scope,
+            conflict_policy=conflict,
+            dry_run=dry_run,
+            terminal_context=_cwd_context(),
+        )
+    except (ValueError, MemoryDisabledError, PermissionError) as e:
+        raise click.ClickException(str(e))
+
+    mode = "DRY RUN — nothing written" if report.dry_run else "Imported"
+    dest = report.target_scope + (
+        f" (scope_id: {report.target_scope_id})" if report.target_scope_id else ""
+    )
+    click.echo(f"{mode}: {path} -> scope {dest}")
+    click.echo(
+        f"  imported: {report.imported}  replaced: {report.replaced}  "
+        f"merged: {report.merged}  skipped (conflict): {report.skipped_conflict}  "
+        f"rejected: {report.rejected}"
+    )
+    click.echo(
+        f"  see-also links dropped: {report.see_also_dropped}  "
+        f"bodies escaped: {report.bodies_escaped}  "
+        f"timestamps clamped: {report.timestamps_clamped}"
+    )
+    for rel, reason in sorted(report.errors.items()):
+        click.echo(f"  rejected '{rel}': {reason}")
+
+
+def _resolve_profile_path(agent_name: str) -> Path:
+    """Locate the writable profile .md file for ``agent_name``.
+
+    Searches the configured agent dirs (flat ``<name>.md`` and nested
+    ``<name>/agent.md`` layouts, same order as profile loading). The built-in
+    package store is deliberately NOT searched: promotion mutates files, and
+    installed-package contents are not a writable store — copy the profile
+    into an agent dir first.
+    """
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    if agent_profiles.routes_to_ephemeral_store(agent_name):
+        raise click.ClickException(f"Reserved ephemeral profile name: {agent_name}")
+
+    from cli_agent_orchestrator.services.settings_service import (
+        get_extra_agent_dirs,
+        usable_agent_dirs,
+    )
+
+    # usable_agent_dirs, not get_agent_dirs: promotion writes to the file it
+    # finds, and a blank or relative setting would make the working directory a
+    # search root (see settings_service.usable_agent_dirs).
+    search_dirs = list(dict.fromkeys(usable_agent_dirs().values())) + list(get_extra_agent_dirs())
+    for dir_path in search_dirs:
+        base = Path(dir_path)
+        for candidate in (base / f"{agent_name}.md", base / agent_name / "agent.md"):
+            if candidate.is_file():
+                return candidate
+    raise click.ClickException(
+        f"No writable profile found for agent '{agent_name}' in configured agent dirs. "
+        "Built-in profiles cannot be promoted into — copy the profile into an agent "
+        "directory first."
+    )
+
+
+def _reject_builtin_profile_path(path: Path) -> None:
+    """Refuse promotion into the built-in package agent store.
+
+    The default lookup (``_resolve_profile_path``) never returns built-in
+    profiles, but ``--profile-path`` accepts any existing file — without
+    this check the explicit route could mutate a bundled package profile,
+    which is not a writable store (edits are shared by every session and
+    silently lost on upgrade).
+    """
+    import cli_agent_orchestrator.agent_store as _agent_store_pkg
+
+    try:
+        # __path__ covers namespace/multiplexed layouts where
+        # ``str(resources.files(...))`` is not a usable filesystem path.
+        store_roots = [Path(p).resolve() for p in _agent_store_pkg.__path__]
+    except Exception:  # pragma: no cover — non-filesystem package layouts
+        return
+    resolved = path.resolve()
+    for store_root in store_roots:
+        try:
+            resolved.relative_to(store_root)
+        except ValueError:
+            continue
+        raise click.ClickException(
+            f"Refusing to promote into built-in package profile: {path}. "
+            "Built-in profiles are not a writable store — copy the profile into "
+            "an agent directory first."
+        )
+
+
+@memory.command(name="promote")
+@click.argument("agent_name")
+@click.option(
+    "--apply",
+    "do_apply",
+    is_flag=True,
+    default=False,
+    help="Apply the promotion. Without this flag, prints a dry-run plan only.",
+)
+@click.option(
+    "--min-recalls",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Minimum recall count for a lesson to qualify (default: 3).",
+)
+@click.option(
+    "--profile-path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Explicit profile .md path (overrides agent-dir lookup).",
+)
+def promote_cmd(agent_name, do_apply, min_recalls, profile_path):
+    """Promote AGENT_NAME's reinforced lessons.
+
+    Reads agent-scope memories (feedback/project types) recalled at least
+    --min-recalls times and writes them as itemized entries in the profile's
+    delimited '## Learned Patterns' block. Dry-run by DEFAULT — pass --apply
+    to mutate. Requires memory.instruction_promotion_enabled=true.
+    """
+    from cli_agent_orchestrator.services.learned_patterns import MAX_LESSONS
+    from cli_agent_orchestrator.services.promotion_service import (
+        DEFAULT_MIN_ACCESS_COUNT,
+        PromotionDisabledError,
+        PromotionService,
+    )
+
+    target = profile_path if profile_path is not None else _resolve_profile_path(agent_name)
+    if not target.is_file():
+        raise click.ClickException(f"Profile file not found: {target}")
+    # The default lookup never returns built-in profiles; enforce the same
+    # refusal on the explicit --profile-path route.
+    _reject_builtin_profile_path(target)
+
+    svc = PromotionService()
+    plan = svc.plan(
+        agent_profile=agent_name,
+        profile_path=target,
+        min_access_count=min_recalls if min_recalls is not None else DEFAULT_MIN_ACCESS_COUNT,
+    )
+
+    if plan.empty:
+        click.echo(f"No promotable lessons for '{agent_name}' (profile: {target}).")
+        return
+
+    click.echo(f"Promotion plan for '{agent_name}' -> {target}:")
+    for cand in plan.candidates:
+        click.echo(f"  [{cand.action}] {cand.key} (recalled {cand.access_count}x)")
+        click.echo(f"      {cand.text}")
+
+    if not do_apply:
+        click.echo("\nDRY RUN — nothing written. Pass --apply to promote.")
+        return
+
+    try:
+        report = svc.apply(plan)
+    except PromotionDisabledError as e:
+        raise click.ClickException(str(e))
+
+    click.echo(
+        f"\nPromoted: added={len(report.added)} updated={len(report.updated)} "
+        f"skipped={len(report.skipped)}"
+    )
+    if report.skipped:
+        click.echo(f"  skipped (at {MAX_LESSONS}-lesson cap): {', '.join(report.skipped)}")
+
+
+# --------------------------------------------------------------------------- #
+# Relationship review surface (issue #511, U7). Thin adapter over the single
+# MemoryRelationshipService — list proposals, inspect endpoints + provenance,
+# promote/reject. No SQL here (FR-2.1). Content-free output (NFR-1.7).
+# --------------------------------------------------------------------------- #
+
+
+def _relationship_service():
+    from cli_agent_orchestrator.services.memory_relationship_service import (
+        MemoryRelationshipService,
+    )
+
+    return MemoryRelationshipService()
+
+
+def _resolve_cli_scope_id(svc, scope: str):
+    """Resolve scope_id from the current terminal context (matches other memory
+    commands). Returns None for global/federated."""
+    terminal_context = {"cwd": os.path.realpath(os.getcwd())}
+    try:
+        return svc.resolve_scope_id(scope, terminal_context=terminal_context)
+    except Exception:
+        return None
+
+
+@memory.group(name="relationships")
+def relationships():
+    """Inspect and curate typed memory relationships."""
+
+
+@relationships.command(name="list")
+@click.option("--scope", default="global", help="Scope (default: global).")
+@click.option("--scope-id", default=None, help="Explicit scope_id (else resolved from cwd).")
+@click.option("--source-key", default=None, help="Filter to one source memory key.")
+@click.option(
+    "--status", "status_filter", default=None, help="Filter by status (default: active only)."
+)
+@click.option("--stale", is_flag=True, default=False, help="Only stale edges.")
+@click.option("--format", "out_format", type=click.Choice(["table", "json"]), default="table")
+def relationships_list(scope, scope_id, source_key, status_filter, stale, out_format):
+    """List relationships (default: active). Use --status proposal to review the
+    proposal queue."""
+    import json as _json
+
+    msvc = _get_memory_service()
+    sid = scope_id if scope_id is not None else _resolve_cli_scope_id(msvc, scope)
+    rsvc = _relationship_service()
+    dtos = rsvc.list_relationships(
+        scope,
+        sid,
+        source_key,
+        status=status_filter,
+        stale_only=stale,
+        include_non_active=status_filter is not None,
+    )
+    if out_format == "json":
+        click.echo(_json.dumps([d.to_dict() for d in dtos], indent=2))
+        return
+    if not dtos:
+        click.echo("No relationships found.")
+        return
+    click.echo(f"{'ID':36}  {'TYPE':13}  {'ORIGIN':18}  {'STATUS':9}  STALE  SOURCE -> TARGET")
+    for d in dtos:
+        click.echo(
+            f"{d.id:36}  {d.type:13}  {d.origin:18}  {d.status:9}  "
+            f"{'yes' if d.stale else 'no':5}  {d.source_key} -> {d.target_key}"
+        )
+
+
+@relationships.command(name="inspect")
+@click.argument("relationship_id")
+@click.option("--format", "out_format", type=click.Choice(["table", "json"]), default="table")
+def relationships_inspect(relationship_id, out_format):
+    """Show one relationship in full.
+
+    Prints its endpoints, provenance, status, and timestamps.
+    """
+    import json as _json
+
+    rsvc = _relationship_service()
+    dto = rsvc.get(relationship_id)
+    if dto is None:
+        raise click.ClickException(f"relationship not found: {relationship_id}")
+    if out_format == "json":
+        click.echo(_json.dumps(dto.to_dict(), indent=2))
+        return
+    for k, v in dto.to_dict().items():
+        click.echo(f"{k:18}: {v}")
+
+
+@relationships.command(name="promote")
+@click.argument("relationship_id")
+def relationships_promote(relationship_id):
+    """Promote a proposal to active."""
+    rsvc = _relationship_service()
+    try:
+        dto = rsvc.promote(relationship_id)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+    click.echo(f"{dto.id}: status -> {dto.status}")
+
+
+@relationships.command(name="reject")
+@click.argument("relationship_id")
+def relationships_reject(relationship_id):
+    """Reject a proposal."""
+    rsvc = _relationship_service()
+    try:
+        dto = rsvc.reject(relationship_id)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+    click.echo(f"{dto.id}: status -> {dto.status}")

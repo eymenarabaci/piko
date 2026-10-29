@@ -1,0 +1,973 @@
+"""CAO operations MCP server implementation."""
+
+from typing import Annotated, Any, Dict, List, Optional
+
+import requests  # type: ignore[import-untyped]
+from fastmcp import FastMCP
+from pydantic import Field
+
+from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
+from cli_agent_orchestrator.ops_mcp_server.models import (
+    InstallResult,
+    LaunchResult,
+    ProfileListResult,
+    SendMessageResult,
+    SessionListResult,
+)
+from cli_agent_orchestrator.security.auth import (
+    get_local_bearer,
+    local_auth_misconfig_error,
+)
+from cli_agent_orchestrator.utils.forwarded_env import (
+    ForwardedEnvError,
+    validate_forwarded_env,
+)
+from cli_agent_orchestrator.utils.init_allowance import synchronous_create_timeout
+from cli_agent_orchestrator.utils.terminal import generate_session_name
+
+JsonDict = Dict[str, Any]
+
+# (connect, read) seconds for every call to the CAO API server that it answers
+# without waiting on provider init. The server is localhost-only, so a slow
+# connect means something is wrong rather than far away; the read budget is
+# generous so a busy server is not misreported as a dead one. The ONE call the
+# server answers only after ``provider.initialize()`` -- ``POST /sessions``
+# without ``initial_message`` -- is sized separately, from
+# ``provider_init_timeout`` (issue #710); see ``_launch_session_impl``.
+_HTTP_TIMEOUT = (5, 300)
+
+mcp = FastMCP(
+    "cao-ops-mcp",
+    instructions="""
+    # CAO Operations MCP Server
+
+    Manage CLI Agent Orchestrator profiles and sessions from outside a CAO session.
+    Requires the CAO API server running at localhost:9889.
+
+    ## Typical Workflow
+    1. list_profiles to inspect available profiles
+    2. get_profile_details to review a profile's full prompt and metadata
+    3. install_profile to install a profile for a target provider
+    4. launch_session to start a new CAO session, optionally with its first task
+    5. send_session_message to deliver later prompts to a running terminal
+    6. get_terminal_status to poll a worker until it finishes a task
+    7. get_terminal_output to read a worker's result (or review its files/git diff)
+    8. read_session_output to read a terminal's captured output by session name
+    9. get_session_info or list_sessions to monitor overall progress
+    10. shutdown_session to clean up when done
+    """,
+)
+
+
+def _response_detail(response: requests.Response) -> str:
+    """Extract the most useful error detail from an API response."""
+    try:
+        payload = response.json()
+    except ValueError:
+        text = response.text.strip()
+        return text or f"HTTP {response.status_code}"
+
+    if isinstance(payload, dict):
+        detail = payload.get("detail") or payload.get("message")
+        if isinstance(detail, str) and detail:
+            return detail
+
+    text = response.text.strip()
+    return text or f"HTTP {response.status_code}"
+
+
+def _auth_headers() -> Optional[Dict[str, str]]:
+    """Return the ``Authorization`` header for the ops -> API hop, or ``None``.
+
+    Mirrors ``mcp_server/utils.py::_auth_headers``, but returns ``None`` rather
+    than ``{}`` when there is no token: every call site here passes the result
+    straight to ``requests``, and ``headers=None`` is exactly "send no header",
+    which keeps the default-off wire bytes unchanged.
+
+    Reported by review 5222539218 on #584 (item 7): the packaged ``cao-ops``
+    server sent no credential even when the operator had provisioned
+    ``CAO_AUTH_LOCAL_TOKEN``, so against an auth-enabled API every scope-gated
+    operation came back 401. No credential is ever stored in the package -- the
+    token is read from the environment of whatever client launched the server.
+    """
+
+    token = get_local_bearer()
+    return {"Authorization": f"Bearer {token}"} if token else None
+
+
+def _request_json(
+    method: str,
+    path: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    json: Optional[Any] = None,
+    operation: str,
+    timeout: tuple[float, float] = _HTTP_TIMEOUT,
+) -> tuple[Optional[Any], Optional[str]]:
+    """Execute an API request and return either JSON data or an error message.
+
+    Errors are **returned, not raised**, so every tool surfaces a structured,
+    operation-named string to the calling agent rather than a traceback, a hang,
+    or a silently empty result. That contract is what the packaged ``cao-ops``
+    Agent Plugin depends on when the operator's ``cao-server`` is not running.
+
+    ``timeout`` defaults to ``_HTTP_TIMEOUT``, right for every call the server
+    answers promptly. A caller whose request the server holds through provider
+    init passes ``synchronous_create_timeout(...)`` instead (issue #710).
+    """
+    # Surface an actionable misconfiguration instead of letting a bare 401 leak
+    # out of the API boundary (see security/auth.local_auth_misconfig_error).
+    misconfig = local_auth_misconfig_error()
+    if misconfig:
+        return None, f"{operation} failed: {misconfig}"
+
+    try:
+        response = requests.request(
+            method,
+            f"{API_BASE_URL}{path}",
+            params=params,
+            json=json,
+            headers=_auth_headers(),
+            # Bounded so "the server never answers" cannot become an
+            # indefinite hang. Connection-refused — the common case when
+            # cao-server simply is not running — already returns immediately;
+            # this covers the rest (a dropped packet, a wedged listener). A
+            # timeout is a `requests.RequestException`, so it flows through the
+            # same handler below and produces the identical structured error.
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        return None, f"{operation} failed: {exc}"
+
+    if response.status_code >= 400:
+        return None, f"{operation} failed: {_response_detail(response)}"
+
+    try:
+        return response.json(), None
+    except ValueError as exc:
+        return None, f"{operation} failed: invalid JSON response ({exc})"
+
+
+def _canonical_session_name(session_name: str) -> str:
+    """The name a CAO session is ALWAYS stored under, per the naming contract.
+
+    Both creation paths enforce it: ``terminal_service.create_terminal``
+    prepends SESSION_PREFIX ("cao-") to a new session's name unless it already
+    starts with it, and ``POST /sessions`` validates that same effective
+    prefixed name at the boundary. So every CAO session name starts with
+    "cao-", and an UNPREFIXED name can never be a CAO session -- at most it is
+    a caller's alias for one (launch_session echoes back the bare
+    ``session_name`` it was given), or an unrelated native tmux session that
+    merely shares the name.
+
+    Canonicalization is therefore total, and it is the identity rule every
+    name-taking ops tool addresses. It is a pure function of the name --
+    deliberately NOT a question about what is live right now -- for two
+    reasons: the cleanup identity has to survive the backend session being gone
+    while its registry row remains, and a successful GET on an unprefixed name
+    is not evidence of CAO identity (``session_service.get_session`` reads the
+    backend directly, without the SESSION_PREFIX filter ``list_sessions``
+    applies, and the shipped tmux backend lists native sessions too).
+    """
+    if session_name.startswith(SESSION_PREFIX):
+        return session_name
+    return f"{SESSION_PREFIX}{session_name}"
+
+
+def _request_session_json(
+    method: str,
+    session_name: str,
+    *,
+    operation: str,
+) -> tuple[Optional[Any], Optional[str]]:
+    """Request ``/sessions/{name}`` against the CANONICAL name, once.
+
+    The read paths share the delete path's identity rule
+    (``_canonical_session_name``) rather than probing the literal name first: a
+    native tmux ``review`` and a CAO ``cao-review`` can legitimately coexist and
+    both answer GET, and preferring the literal made ``get_session_info("review")``
+    return the native session with none of CAO's terminals. An unprefixed name
+    can never BE a CAO session, so a successful GET on one proves nothing about
+    CAO identity and must never select the target.
+
+    This replaces an earlier 404-triggered retry of the prefixed name: with
+    canonicalization total, there is nothing left to retry.
+    """
+    return _request_json(
+        method,
+        f"/sessions/{_canonical_session_name(session_name)}",
+        operation=operation,
+    )
+
+
+def _lookup_session(candidate: str) -> tuple[bool, Optional[str]]:
+    """Probe ``GET /sessions/{candidate}`` for one of THREE outcomes.
+
+    Returns ``(found, error)``:
+
+    * ``(True, None)``   -- resolved: the GET answered below 400.
+    * ``(False, None)``  -- confirmed absent: the GET answered 404. Only a 404
+      is evidence of absence.
+    * ``(False, error)`` -- unresolved: a transport failure, 5xx, 403 or any
+      other non-404 status. The lookup did not answer the question, so the
+      caller must not treat it as absence. ``GET /sessions/{name}`` really does
+      return 500 when reading a terminal's live status fails
+      (``api/main.py``'s handler maps any non-ValueError to 500), and a 403
+      simply means this token lacks read scope while still holding admin.
+    """
+    # A misconfigured hop is UNRESOLVED, never absence -- the same three-outcome
+    # discipline this function's docstring describes. Reporting it as absence
+    # would let `shutdown_session` act on the wrong target.
+    misconfig = local_auth_misconfig_error()
+    if misconfig:
+        return False, f"lookup of session '{candidate}' failed: {misconfig}"
+
+    try:
+        response = requests.request(
+            "get",
+            f"{API_BASE_URL}/sessions/{candidate}",
+            params=None,
+            json=None,
+            headers=_auth_headers(),
+            # Bounded for the same reason `_request_json` is: this probe gates
+            # every `shutdown_session`, so an unbounded read here hangs the tool
+            # exactly the way an unbounded request does anywhere else.
+            timeout=_HTTP_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        return False, f"lookup of session '{candidate}' failed: {exc}"
+
+    if response.status_code < 400:
+        return True, None
+    if response.status_code == 404:
+        return False, None
+    return False, f"lookup of session '{candidate}' failed: {_response_detail(response)}"
+
+
+def _resolve_session_name(session_name: str) -> tuple[Optional[str], Optional[str]]:
+    """The name to mutate: the CANONICAL one, or ``(None, error)``.
+
+    The target comes from the naming contract (``_canonical_session_name``),
+    never from which name happens to answer a GET. Probing the literal name
+    first and taking any success was how ``shutdown_session("review")`` deleted
+    an unrelated NATIVE tmux ``review`` -- reporting success -- while
+    ``cao-review`` and its registry row stayed alive.
+
+    The read-only GET that remains is a safety check on that single canonical
+    name, not a selector, because ``DELETE /sessions/{name}`` cannot report the
+    problem itself: it is idempotent -- ``session_service.delete_session()``
+    puts an absent name straight into ``deleted`` -- so it answers 200 for a
+    name that never existed. Its three outcomes (``_lookup_session``):
+
+    * Resolved (below 400) or confirmed absent (404) -- return the canonical
+      name either way, so the single DELETE lands on the CAO session when it is
+      live, and is the endpoint's idempotent "already gone" success when it is
+      not. Confirmed absence is NOT a reason to retarget: after a deferred
+      cleanup (``dismantle_terminal_runtime`` returning False keeps the row,
+      answers 409 and reports the session in ``errors``) the backend session is
+      gone -- so ``get_session``, which requires it, 404s -- while the retained
+      registry row, the only handle the retry has, still lives under the
+      canonical name.
+    * Unresolved (transport error / 5xx / 403 / any non-404) -- return
+      ``(None, error)``. NOTHING is mutated. Collapsing this into "absent" is
+      how an unresolved name became a successful no-op DELETE: the canonical
+      session and its registry row survive while the caller is told cleanup
+      happened.
+    """
+    canonical_name = _canonical_session_name(session_name)
+
+    # The "found" half is deliberately discarded: presence does not choose the
+    # target here, it only distinguishes the two outcomes that share one.
+    _found, error = _lookup_session(canonical_name)
+    if error is not None:
+        return None, error
+
+    return canonical_name, None
+
+
+def _serialize_allowed_tools(allowed_tools: Optional[List[str]]) -> Optional[str]:
+    """Serialize allowed tools for the session creation API."""
+    if not allowed_tools:
+        return None
+    return ",".join(allowed_tools)
+
+
+async def _launch_session_impl(
+    agent_profile: str,
+    provider: Optional[str] = None,
+    session_name: Optional[str] = None,
+    working_directory: Optional[str] = None,
+    allowed_tools: Optional[List[str]] = None,
+    model: Optional[str] = None,
+    initial_message: Optional[str] = None,
+    env_vars: Optional[Dict[str, str]] = None,
+) -> LaunchResult:
+    """Create a new CAO session and return the session identifiers."""
+    resolved_session_name = session_name or generate_session_name()
+
+    # Validate forwarded env at this boundary: the server silently drops a var
+    # that breaks the rules, so mirror `cao launch --env` and fail loudly here.
+    validated_env: Optional[Dict[str, str]] = None
+    if env_vars:
+        try:
+            validated_env = validate_forwarded_env(env_vars)
+        except ForwardedEnvError as exc:
+            return LaunchResult(
+                success=False,
+                message=f"Launch session failed: {exc}",
+                session_name=resolved_session_name,
+                terminal_id=None,
+            )
+
+    params: Dict[str, Any] = {
+        "agent_profile": agent_profile,
+        "session_name": resolved_session_name,
+    }
+    if provider is not None:
+        params["provider"] = provider
+    if working_directory:
+        params["working_directory"] = working_directory
+    if model is not None:
+        params["model"] = model
+
+    serialized_allowed_tools = _serialize_allowed_tools(allowed_tools)
+    if serialized_allowed_tools:
+        params["allowed_tools"] = serialized_allowed_tools
+
+    # initial_message and env_vars both travel in the JSON body (never the URL,
+    # so a forwarded secret does not land in the server access log).
+    body: Optional[Dict[str, Any]] = None
+    if initial_message is not None or validated_env:
+        body = {}
+        if initial_message is not None:
+            body["initial_message"] = initial_message
+        if validated_env:
+            body["env_vars"] = validated_env
+
+    if not session_name:
+        body = {**(body or {}), "description": None}
+
+    # Two latency regimes behind one POST (issue #710). With ``initial_message``
+    # in the body cao-server defers provider init and answers at once, so the
+    # ordinary budget applies. Without it the server holds the response until
+    # ``provider.initialize()`` returns, and the budget has to come from the
+    # ``provider_init_timeout`` the server is itself waiting out -- a flat 300s
+    # read was below a successful Antigravity init (370s at stock settings).
+    create_timeout = (
+        _HTTP_TIMEOUT if initial_message is not None else synchronous_create_timeout(agent_profile)
+    )
+    session_data, error = _request_json(
+        "post",
+        "/sessions",
+        params=params,
+        json=body,
+        operation="Launch session",
+        timeout=create_timeout,
+    )
+    if error:
+        return LaunchResult(
+            success=False,
+            message=error,
+            session_name=resolved_session_name,
+            terminal_id=None,
+        )
+
+    if not isinstance(session_data, dict) or "id" not in session_data:
+        return LaunchResult(
+            success=False,
+            message="Launch session failed: invalid session response",
+            session_name=resolved_session_name,
+            terminal_id=None,
+        )
+
+    terminal_id = str(session_data["id"])
+    launched_provider = session_data.get("provider")
+    message = (
+        f"Session '{resolved_session_name}' launched; initial message delivery is in progress"
+        if initial_message is not None
+        else f"Session '{resolved_session_name}' launched successfully"
+    )
+    return LaunchResult(
+        success=True,
+        message=message,
+        session_name=resolved_session_name,
+        terminal_id=terminal_id,
+        provider=launched_provider,
+    )
+
+
+@mcp.tool()
+async def list_profiles() -> ProfileListResult:
+    """List available agent profiles.
+
+    Scans built-in store, local store, and all configured provider agent
+    directories. Profiles are deduplicated by name with source metadata.
+
+    Returns:
+        ProfileListResult with success status and profiles list
+    """
+    data, error = _request_json("get", "/agents/profiles", operation="List profiles")
+    if error:
+        return ProfileListResult(success=False, message=error)
+    if isinstance(data, list):
+        return ProfileListResult(success=True, profiles=data)
+    return ProfileListResult(
+        success=False,
+        message="List profiles failed: invalid response payload",
+    )
+
+
+@mcp.tool()
+async def get_profile_details(
+    name: Annotated[str, Field(description="The agent profile name to inspect")],
+) -> JsonDict:
+    """Get the full parsed content of a specific agent profile.
+
+    Returns all AgentProfile fields (name, description, system_prompt, role,
+    provider, allowedTools, mcpServers, model) with None-valued fields excluded.
+
+    Args:
+        name: Agent profile name to inspect
+
+    Returns:
+        Dict with profile fields, or {"success": False, "message": ...} on error
+    """
+    data, error = _request_json(
+        "get",
+        f"/agents/profiles/{name}",
+        operation=f"Get profile details for '{name}'",
+    )
+    if error:
+        return {"success": False, "message": error}
+    if isinstance(data, dict):
+        return data
+    return {"success": False, "message": "Get profile details failed: invalid response payload"}
+
+
+@mcp.tool()
+async def install_profile(
+    source: Annotated[str, Field(description="Agent name or https:// URL to install")],
+    provider: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Target provider for the installed profile. Omit to honour the "
+                "profile's frontmatter provider, falling back to the default."
+            )
+        ),
+    ] = None,
+    env_vars: Annotated[
+        Optional[Dict[str, str]],
+        Field(description="Optional environment variables to inject before install"),
+    ] = None,
+) -> InstallResult:
+    """Install an agent profile for a target provider.
+
+    ## Source Resolution
+
+    Remote callers (HTTP API / MCP) may install by either:
+    1. https:// URL from an allow-listed host (``github.com``,
+       ``raw.githubusercontent.com`` by default; extend via the
+       ``CAO_PROFILE_ALLOWED_HOSTS`` env var on ``cao-server``).
+    2. Profile name matching ``[A-Za-z0-9_-]{1,64}`` — looked up in the local
+       store, provider dirs, then the built-in store.
+
+    Installing by local filesystem path is CLI-only and is rejected from the
+    HTTP API and this MCP tool.
+
+    ## Provider Config
+
+    - kiro_cli: JSON config written to the provider's agents directory
+    - copilot_cli: frontmatter markdown written to the Copilot agents directory
+    - claude_code, codex: context file only, no provider-specific config
+
+    Args:
+        source: Agent name or https:// URL from an allow-listed host
+        provider: Target provider. Precedence: explicit value > the profile's
+            frontmatter ``provider:`` key > the server default (kiro_cli)
+        env_vars: Optional env vars written to the managed .env before install
+
+    Returns:
+        InstallResult with success status, file paths, and unresolved env vars
+    """
+    body: Dict[str, Any] = {"source": source}
+    if provider is not None:
+        body["provider"] = provider
+    if env_vars:
+        body["env_vars"] = env_vars
+
+    data, error = _request_json(
+        "post",
+        "/agents/profiles/install",
+        json=body,
+        operation=f"Install profile '{source}'",
+    )
+    if error:
+        return InstallResult(success=False, message=error)
+    if isinstance(data, dict):
+        return InstallResult(**data)
+    return InstallResult(success=False, message="Install profile failed: invalid response payload")
+
+
+@mcp.tool()
+async def launch_session(
+    agent_profile: Annotated[str, Field(description="The agent profile to launch")],
+    provider: Annotated[
+        Optional[str],
+        Field(description="The provider to use for the launched session"),
+    ] = None,
+    session_name: Annotated[
+        Optional[str],
+        Field(description="Optional custom CAO session name"),
+    ] = None,
+    working_directory: Annotated[
+        Optional[str],
+        Field(description="Optional working directory for the launched session"),
+    ] = None,
+    allowed_tools: Annotated[
+        Optional[List[str]],
+        Field(description="Optional list of allowed tool restrictions"),
+    ] = None,
+    model: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Optional per-launch model override accepted by the resolved provider; "
+                "takes precedence over the profile model"
+            )
+        ),
+    ] = None,
+    initial_message: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Optional first task to deliver after provider initialization; "
+                "sent in the JSON request body"
+            )
+        ),
+    ] = None,
+    env_vars: Annotated[
+        Optional[Dict[str, str]],
+        Field(
+            description=(
+                "Optional environment variables forwarded into the launched "
+                "session -- the supervisor terminal and every worker it later "
+                "spawns -- the same mechanism as `cao launch --env`. Delivered "
+                "in the JSON request body (never the URL, so a forwarded secret "
+                "stays out of the server access log). Keys must be POSIX "
+                "identifiers; the CLAUDE/CODEX_/__MISE_ prefixes are reserved "
+                "for provider env. Values must be UTF-8 with no NUL byte and "
+                "<2048 bytes each; at most 256 vars totalling <128 KiB are "
+                "accepted (tmux argv limits). Invalid input returns "
+                "success=False, it does not raise."
+            )
+        ),
+    ] = None,
+) -> LaunchResult:
+    """Create a new CAO session with the given provider and agent profile.
+
+    Returns immediately with session_name and terminal_id. When
+    ``initial_message`` is provided, provider initialization and delivery
+    continue in the background; use get_terminal_status or get_session_info to
+    observe the result. Without it, use send_session_message to deliver work
+    later.
+
+    Args:
+        agent_profile: Agent profile for the new session
+        provider: CLI provider (default: profile provider or kiro_cli)
+        session_name: Optional custom session name (auto-generated if omitted)
+        working_directory: Optional working directory for the session
+        allowed_tools: Optional list of tool restrictions
+        model: Optional per-launch model override
+        initial_message: Optional first task, carried in the JSON request body
+        env_vars: Optional env vars forwarded into the session, validated the
+            same way as ``cao launch --env`` and carried in the JSON body
+
+    Returns:
+        LaunchResult with success status, session_name, and terminal_id
+    """
+    return await _launch_session_impl(
+        agent_profile=agent_profile,
+        provider=provider,
+        session_name=session_name,
+        working_directory=working_directory,
+        allowed_tools=allowed_tools,
+        model=model,
+        initial_message=initial_message,
+        env_vars=env_vars,
+    )
+
+
+@mcp.tool()
+async def send_session_message(
+    terminal_id: Annotated[str, Field(description="The terminal ID to deliver the message to")],
+    message: Annotated[str, Field(description="The message text to deliver")],
+) -> SendMessageResult:
+    """Queue a message for delivery to a running CAO terminal via the inbox service.
+
+    Messages are delivered by the CAO inbox service when the terminal reaches
+    IDLE or COMPLETED status. Use get_session_info to retrieve terminal IDs
+    from an active session.
+
+    Args:
+        terminal_id: Target terminal ID (from launch_session or get_session_info)
+        message: Message text to deliver
+
+    Returns:
+        SendMessageResult with success status and target terminal_id
+    """
+    _, error = _request_json(
+        "post",
+        f"/terminals/{terminal_id}/inbox/messages",
+        params={"sender_id": "cao-ops-mcp", "message": message},
+        operation=f"Send message to terminal '{terminal_id}'",
+    )
+    if error:
+        return SendMessageResult(success=False, message=error, terminal_id=terminal_id)
+    return SendMessageResult(
+        success=True,
+        message=f"Message queued for terminal '{terminal_id}'",
+        terminal_id=terminal_id,
+    )
+
+
+def _read_session_output_impl(
+    terminal_id: Optional[str],
+    session_name: Optional[str],
+    mode: Optional[str],
+    max_chars: Optional[int],
+) -> JsonDict:
+    """Resolve a terminal and return its captured output (sync; mirrors other helpers)."""
+    normalized = (mode or "full").lower()
+    if normalized not in ("full", "last"):
+        return {"success": False, "message": f"Invalid mode '{mode}'; expected 'full' or 'last'"}
+
+    resolved_terminal_id = terminal_id
+    if not resolved_terminal_id:
+        if not session_name:
+            return {"success": False, "message": "Provide either terminal_id or session_name"}
+        info, error = _request_session_json(
+            "get",
+            session_name,
+            operation=f"Resolve terminals for session '{session_name}'",
+        )
+        if error:
+            return {"success": False, "message": error}
+        if not isinstance(info, dict):
+            return {
+                "success": False,
+                "message": f"Session '{session_name}' returned an invalid response payload",
+            }
+        terminals = info.get("terminals", [])
+        if not isinstance(terminals, list) or any(
+            not isinstance(terminal, dict) for terminal in terminals
+        ):
+            return {
+                "success": False,
+                "message": f"Session '{session_name}' returned an invalid terminals payload",
+            }
+        if len(terminals) == 1:
+            terminal = terminals[0]
+            if not terminal.get("id"):
+                return {
+                    "success": False,
+                    "message": f"Session '{session_name}' returned a terminal without an id",
+                }
+            resolved_terminal_id = str(terminal["id"])
+        elif not terminals:
+            return {"success": False, "message": f"Session '{session_name}' has no terminals"}
+        else:
+            return {
+                "success": False,
+                "message": (
+                    f"Session '{session_name}' has {len(terminals)} terminals; "
+                    "specify terminal_id"
+                ),
+                "terminals": terminals,
+            }
+
+    data, error = _request_json(
+        "get",
+        f"/terminals/{resolved_terminal_id}/output",
+        params={"mode": normalized},
+        operation=f"Read output for terminal '{resolved_terminal_id}'",
+    )
+    if error:
+        return {"success": False, "message": error}
+    if not isinstance(data, dict) or not isinstance(data.get("output"), str):
+        return {"success": False, "message": "Read output failed: invalid response payload"}
+
+    output = data["output"]
+    total_chars = len(output)
+    truncated = False
+    if max_chars is not None and max_chars > 0 and total_chars > max_chars:
+        output = output[-max_chars:]
+        truncated = True
+
+    return {
+        "success": True,
+        "terminal_id": resolved_terminal_id,
+        "mode": normalized,
+        "output": output,
+        "truncated": truncated,
+        "total_chars": total_chars,
+    }
+
+
+@mcp.tool()
+async def read_session_output(
+    terminal_id: Annotated[
+        Optional[str],
+        Field(
+            description="Target terminal ID (from list_sessions / get_session_info). "
+            "Primary key; either terminal_id or session_name is required."
+        ),
+    ] = None,
+    session_name: Annotated[
+        Optional[str],
+        Field(
+            description="CAO session name; convenience alternative to terminal_id. "
+            "Resolved to a terminal when the session has exactly one; if it has more "
+            "than one, the terminal list is returned and terminal_id is required."
+        ),
+    ] = None,
+    mode: Annotated[
+        str,
+        Field(
+            description="'full' (default) returns the raw rolling buffer: deterministic and "
+            "best for scrollback/debugging. 'last' returns the provider-extracted final "
+            "response: best for a completed worker's final message, but can be flaky on "
+            "redraw-heavy TUIs."
+        ),
+    ] = "full",
+    max_chars: Annotated[
+        Optional[int],
+        Field(
+            description="Optional cap: return only the last max_chars of output "
+            "(guards against flooding the caller's context). Truncation is flagged "
+            "in the result. Values <= 0 are treated as no cap."
+        ),
+    ] = None,
+) -> JsonDict:
+    """Read a CAO terminal's captured scrollback with a deterministic full-buffer default.
+
+    Defaults to mode='full' because raw rolling-buffer output is deterministic and
+    best for scrollback/debugging. Use get_terminal_output, which defaults to
+    mode='last', to read a completed worker's provider-extracted final message;
+    'last' can be flaky on redraw-heavy TUIs. This tool adds session_name addressing
+    (when the session has exactly one terminal) and max_chars tail-capping, which
+    get_terminal_output does not provide.
+
+    Args:
+        terminal_id: Target terminal ID (primary key)
+        session_name: Convenience alternative; resolved to a terminal when unambiguous
+        mode: 'full' (default, rolling buffer) or 'last' (provider-extracted)
+        max_chars: Optional tail cap on returned characters
+
+    Returns:
+        Dict {success, terminal_id, mode, output, truncated, total_chars}, or
+        {success: False, message[, terminals]} on error / ambiguous session
+    """
+    return _read_session_output_impl(terminal_id, session_name, mode, max_chars)
+
+
+@mcp.tool()
+async def get_terminal_status(
+    terminal_id: Annotated[str, Field(description="The terminal ID to inspect")],
+) -> JsonDict:
+    """Get a single terminal's live status and metadata.
+
+    Use this to poll a worker an external supervisor launched: it returns the
+    current status (one of unknown / idle / processing / completed /
+    waiting_user_answer / error) so the supervisor knows when a delegated task
+    has finished before reading its output.
+
+    Args:
+        terminal_id: Target terminal ID (from launch_session or get_session_info)
+
+    Returns:
+        Dict with id, name, provider, session_name, agent_profile, status,
+        last_active — or {"success": False, "message": ...} on error
+    """
+    data, error = _request_json(
+        "get",
+        f"/terminals/{terminal_id}",
+        operation=f"Get terminal status for '{terminal_id}'",
+    )
+    if error:
+        return {"success": False, "message": error}
+    if isinstance(data, dict):
+        return data
+    return {"success": False, "message": "Get terminal status failed: invalid response payload"}
+
+
+@mcp.tool()
+async def get_terminal_output(
+    terminal_id: Annotated[str, Field(description="The terminal ID to read output from")],
+    mode: Annotated[
+        str,
+        Field(
+            description=(
+                "'last' (default) returns the provider-extracted final response: best for "
+                "a completed worker's final message, but can be flaky on redraw-heavy "
+                "TUIs. 'full' returns the raw rolling buffer: deterministic and best for "
+                "scrollback/debugging."
+            )
+        ),
+    ] = "last",
+) -> JsonDict:
+    """Read a worker terminal's output with a completed-message-oriented default.
+
+    Defaults to mode='last' because this tool is optimized for reading a completed
+    worker's provider-extracted final message, though redraw-heavy TUIs can make
+    extraction flaky. For deterministic raw rolling-buffer scrollback/debugging,
+    use read_session_output, which defaults to mode='full' and also supports
+    session_name addressing and max_chars tail-capping. For code review, prefer
+    inspecting the worker's files / git diff directly rather than relying solely
+    on terminal text.
+
+    Args:
+        terminal_id: Target terminal ID
+        mode: 'last' (final response, default) or 'full' (rolling buffer)
+
+    Returns:
+        Dict with output and mode, or {"success": False, "message": ...} on error
+    """
+    normalized = (mode or "last").lower()
+    if normalized not in ("last", "full"):
+        return {
+            "success": False,
+            "message": f"Get terminal output failed: mode must be 'last' or 'full', got '{mode}'",
+        }
+    data, error = _request_json(
+        "get",
+        f"/terminals/{terminal_id}/output",
+        params={"mode": normalized},
+        operation=f"Get terminal output for '{terminal_id}'",
+    )
+    if error:
+        return {"success": False, "message": error}
+    if isinstance(data, dict):
+        return data
+    return {"success": False, "message": "Get terminal output failed: invalid response payload"}
+
+
+@mcp.tool()
+async def list_sessions() -> SessionListResult:
+    """List active CAO sessions with terminal counts and statuses.
+
+    Returns:
+        SessionListResult with success status and sessions list
+    """
+    data, error = _request_json("get", "/sessions", operation="List sessions")
+    if error:
+        return SessionListResult(success=False, message=error)
+    if isinstance(data, list):
+        return SessionListResult(success=True, sessions=data)
+    return SessionListResult(
+        success=False,
+        message="List sessions failed: invalid response payload",
+    )
+
+
+@mcp.tool()
+async def get_session_info(
+    session_name: Annotated[str, Field(description="The CAO session name to inspect")],
+) -> JsonDict:
+    """Get detailed session metadata including per-terminal status.
+
+    Returns session fields along with a terminals array containing each
+    terminal's status, provider, profile, and last activity.
+
+    Args:
+        session_name: CAO session name to inspect
+
+    Returns:
+        Dict with session fields, or {"success": False, "message": ...} on error
+    """
+    data, error = _request_session_json(
+        "get",
+        session_name,
+        operation=f"Get session info for '{session_name}'",
+    )
+    if error:
+        return {"success": False, "message": error}
+    if isinstance(data, dict):
+        return data
+    return {"success": False, "message": "Get session info failed: invalid response payload"}
+
+
+@mcp.tool()
+async def shutdown_session(
+    session_name: Annotated[str, Field(description="The CAO session name to shut down")],
+) -> JsonDict:
+    """Cleanly shut down a CAO session.
+
+    Exits all providers, kills the tmux session, and removes database records.
+
+    A bare name is canonicalized to the name CAO actually stores the session
+    under ("cao-<name>") before anything is deleted, so an unrelated NATIVE
+    tmux session sharing the bare name is never the target. When the canonical
+    lookup cannot answer -- transport failure, 5xx, 403, anything but a 404 --
+    no delete is issued at all and the lookup failure is reported instead of a
+    false cleanup success.
+
+    Args:
+        session_name: CAO session name to shut down
+
+    Returns:
+        Dict with success status and cleanup details, or failure dict on error
+    """
+    # Resolve first, then delete exactly once against the canonical name: the
+    # DELETE route cannot report a bad target itself, because it never returns
+    # 404 for an absent session (see _resolve_session_name).
+    resolved_name, lookup_error = _resolve_session_name(session_name)
+    if lookup_error is not None or resolved_name is None:
+        # Unresolved, not absent: nothing has been mutated, and nothing will be.
+        # Deleting an unresolved alias would answer 200 and report a cleanup that
+        # never happened, so the coordinator sees the lookup problem instead.
+        return {
+            "success": False,
+            "message": (
+                f"Shutdown session '{session_name}' aborted: {lookup_error}; "
+                "no delete was issued"
+            ),
+        }
+    data, error = _request_json(
+        "delete",
+        f"/sessions/{resolved_name}",
+        operation=f"Shutdown session '{resolved_name}'",
+    )
+    if error:
+        return {"success": False, "message": error}
+    if isinstance(data, dict):
+        return data
+    return {"success": False, "message": "Shutdown session failed: invalid response payload"}
+
+
+from cli_agent_orchestrator.ops_mcp_server.decision_tools import (  # noqa: E402
+    register_decision_tools,
+)
+
+# Plugins may add operator-facing tools here too (the cao_quota plugin's
+# provider_availability / record_provider_refusal, for example): an external
+# coordinator that only speaks to cao-ops otherwise has no way to reach them.
+# Same best-effort entry-point registration the in-session server performs.
+from cli_agent_orchestrator.plugins.registry import register_mcp_server_surfaces  # noqa: E402
+
+register_decision_tools(mcp)
+register_mcp_server_surfaces(mcp)
+
+
+def main() -> None:
+    """Run the operations MCP server over stdio.
+
+    The transport is pinned: FastMCP otherwise honours ``FASTMCP_TRANSPORT`` from
+    the environment, and an ``http`` value would turn this stdio tool into a
+    network listener with no MCP-level authentication in front of the API hop.
+    """
+    mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

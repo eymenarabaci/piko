@@ -1,0 +1,1864 @@
+"""Workflow authoring commands for the CLI Agent Orchestrator CLI (issue #312, N2).
+
+Four authoring verbs — ``validate`` / ``list`` / ``get`` / ``delete`` — each a
+thin HTTP client against the ``/workflows`` endpoints on the running cao-server
+(single integration seam, B2-BR-10). This module NEVER imports
+``workflow_spec_service`` or ``database`` directly (project Forbidden rule).
+
+The run-lifecycle verbs — ``run`` / ``runs`` / ``status`` / ``wait`` / ``result``
+/ ``resume`` / ``step`` / ``cancel`` — are thin HTTP clients over the
+``/workflows/runs`` engine endpoints (N5 + issue #505 + issue #640), mirroring the
+authoring-verb style. Bare ``run`` submits asynchronously via
+``POST /workflows/runs:submit`` and then FOLLOWS the run by polling
+``GET /workflows/runs/{id}`` to a terminal state; ``--wait`` is the explicit
+blocking escape hatch over the retained ``POST /workflows/runs`` path and
+``--detach`` submits without following. ``step`` re-executes ONE step of an
+already-recorded run without re-running the workflow. This module NEVER imports
+``workflow_service`` / ``script_runner`` / ``workflow_journal`` / ``database``
+directly (project Forbidden rule + issue #505 C-2, CI import guard) — every verb
+reaches its data over the REST surface only.
+"""
+
+import json as _json
+import os
+import pathlib
+import re
+import sys
+import time
+from pathlib import Path
+from urllib.parse import quote
+
+import click
+
+from cli_agent_orchestrator.constants import (
+    API_BASE_URL,
+    MCP_REQUEST_TIMEOUT,
+    WORKFLOW_EVENTS_CONNECT_TIMEOUT,
+    WORKFLOW_EVENTS_MAX_RECONNECTS,
+    WORKFLOW_EVENTS_READ_TIMEOUT,
+    WORKFLOW_NAME_RE,
+    WORKFLOW_POLL_INTERVAL_SECONDS,
+    WORKFLOW_RUN_REQUEST_TIMEOUT,
+    WORKFLOW_STEP_REQUEST_TIMEOUT,
+)
+from cli_agent_orchestrator.utils import api_http
+from cli_agent_orchestrator.utils.workflow_events import SseFrame, parse_sse_frames
+
+
+def _attach_terminal_caller(payload: dict) -> None:
+    """Name the calling terminal on a workflow request when the CLI runs inside one.
+
+    An agent may run ``cao workflow run`` from its shell instead of the MCP tool;
+    with ``CAO_TERMINAL_ID`` set the server bounds every step the run creates by
+    that terminal's recorded delegation ceiling (``RunRecord.caller_id``,
+    ``utils/delegation.py``), the same as the MCP ``workflow_run`` tool. An
+    operator shell (no id) sends nothing and the request is byte-identical to
+    before.
+    """
+    caller = os.environ.get("CAO_TERMINAL_ID")
+    if caller:
+        payload["caller_id"] = caller
+
+
+# Whole-run states that end the follow/poll loop (mirror ``RunState``'s terminal
+# members without importing the engine model — C-2 keeps this a thin HTTP client).
+_TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
+
+
+def _authentication_failure_detail(
+    response: api_http.Response,
+    auth_headers: dict[str, str] | None,
+) -> str | None:
+    """Explain a 401 without exposing the configured credential."""
+    if response.status_code != 401:
+        return None
+    if auth_headers:
+        return (
+            "cao-server rejected the configured local authentication credential; "
+            "replace CAO_AUTH_LOCAL_TOKEN with a valid token"
+        )
+    return (
+        "cao-server requires authentication; configure CAO_AUTH_LOCAL_TOKEN "
+        "with a token for this server"
+    )
+
+
+def _render_lint_findings(findings: object) -> str:
+    """Render a 422 ``findings`` body into one human-readable line per finding.
+
+    All FOUR ``LintFinding`` fields, because ``line`` is a REQUIRED 1-based anchor (FR-2.3) and
+    dropping it would discard the field the finding exists to provide.
+
+    NEVER echoes source. ``_echo_spec_result`` records the reason and it applies verbatim here: "a spec
+    may contain credentials the operator pasted by mistake, and terminal output is the easiest place for
+    that to leak." A finding names a line so the AUTHOR can look -- the finding locates, the author
+    reads.
+
+    DUPLICATED, deliberately, with ``utils/orchestration.py::_render_lint_findings``.
+    ``render_findings`` returns ``List[dict]`` rather than strings and there is no shared renderer to
+    reuse, so unifying would mean the CLI importing orchestration internals or a new module, for two
+    call sites. The trigger for consolidating is a THIRD caller, not a second -- the same call Bolt 2
+    made for its never-raises git wrapper.
+    """
+    if not isinstance(findings, list):
+        return ""
+    lines = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        lines.append(
+            f"{finding.get('severity', '?')} {finding.get('rule_id', '?')} "
+            f"at line {finding.get('line', '?')}: {finding.get('message', '')}"
+        )
+    return "; ".join(lines)
+
+
+def _approval_refusal_envelope(response: api_http.Response) -> dict | None:
+    """Return the MCP-compatible JSON envelope for an approval refusal, if present."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    detail = body.get("detail")
+    if not isinstance(detail, dict):
+        return None
+
+    kind = detail.get("kind")
+    if kind not in ("approval_required", "plan_identity_unavailable"):
+        return None
+    message = detail.get("message")
+    refusal = {
+        "ok": False,
+        "class": kind,
+        "plan_id": detail.get("plan_id"),
+        "error": (
+            message if isinstance(message, str) and message else f"status {response.status_code}"
+        ),
+    }
+    if kind == "approval_required" and refusal["plan_id"]:
+        refusal["error"] = _approval_refusal_message(refusal)
+    return refusal
+
+
+def _approval_refusal_message(refusal: dict) -> str:
+    """Turn an approval refusal into a message that names the next action, or "" if not one.
+
+    Issue #583 Bolt 3 (``authoring-sequence``) -- the APPROVE step of FR-10's sequence. A 403 here is
+    not a permission problem to escalate: a ``plan_id`` is computed at RUN START, so the first run of a
+    new or changed plan is refused BY DESIGN, and the remedy is one command a human runs.
+
+    THE TWO KINDS GET DIFFERENT REMEDIES AND MUST NOT BE CONFLATED:
+
+    * ``approval_required`` -> present the identifier and command as the human operator's action,
+      and STOP. There is deliberately no retry: a loop around a human authorisation gate is a bypass by
+      repetition.
+    * ``plan_identity_unavailable`` -> CAO could not complete its own freeze. There is NO identifier to
+      approve, so presenting an approval prompt would send someone looking for a plan to grant when the
+      correct action is to retry.
+
+    Returns "" when the body is not a refusal, so the caller falls back to its ordinary error path --
+    including against an OLDER server that still sends a string ``detail``.
+    """
+    kind = refusal["class"]
+    message = refusal["error"]
+    if kind == "plan_identity_unavailable":
+        return (
+            f"{message}\n"
+            "No plan identifier could be computed, so there is nothing to approve. "
+            "The reason above says what to change."
+        )
+    if kind == "approval_required":
+        plan_id = refusal["plan_id"]
+        if not plan_id:
+            return ""
+        command = f"cao workflow approve {plan_id}"
+        if (
+            command not in message
+            or "human approval" not in message
+            or "Approve it with" in message
+        ):
+            message = (
+                f"Plan '{plan_id}' needs human approval before it can run: "
+                + f"an operator approves it with `{command}`, then runs it again."
+            )
+        footer = "Approval is a human decision; an agent must not grant it."
+        if not message.endswith(footer):
+            message += "\n" + footer
+        return str(message)
+    return ""
+
+
+def _extract_detail(response: api_http.Response, fallback: str) -> str:
+    """Pull a human-readable message out of a FastAPI error response.
+
+    ``detail`` IS NOT ALWAYS A STRING on this API, and the object arm is why this function changed at
+    issue #583 Bolt 3 (``authoring-sequence``). Two object shapes exist, and the set is CLOSED --
+    check ``api/main.py`` before adding a third, because a third shape is a third body contract:
+
+    * ``{kind, plan_id, message}`` -- an approval refusal (403) or a failed freeze (503).
+    * ``{findings: [...]}`` -- a 422 lint failure on the run path.
+
+    THE PREVIOUS VERSION RETURNED ``str(body["detail"])``, which for an object printed a Python dict
+    repr at a human. That is the LOUD failure of the two readers; the MCP server's equivalent fell
+    through to its fallback and lost the identifier silently.
+
+    THE STRING ARM IS PERMANENT, NOT LEGACY -- removing it would not be a cleanup. Most of this API
+    still returns a string ``detail``; only three routes carry an object, for one condition each.
+
+    A ``list`` FALLS THROUGH, and that shape is live rather than hypothetical: FastAPI's own
+    request-validation errors produce ``{"detail": [{"loc": ..., "msg": ...}]}``. Subscripting one with
+    a string key raises, so the ``isinstance`` ladder is what keeps an unfamiliar shape a fallback
+    instead of a traceback.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return fallback
+    if not isinstance(body, dict):
+        return fallback
+    detail = body.get("detail")
+    if isinstance(detail, dict):
+        message = detail.get("message")
+        if isinstance(message, str) and message:
+            return message
+        rendered = _render_lint_findings(detail.get("findings"))
+        return rendered or fallback
+    if isinstance(detail, str) and detail:
+        return detail
+    return fallback
+
+
+#: HTTP status -> the refusal class carried in the ``--json`` error envelope for the authoring verbs
+#: (issue #583 Bolt 3, ``authoring-cli-verbs``). A CLOSED set: the classes exist so a script can branch
+#: without parsing prose, which is why exit codes stay uniform at 1 rather than growing a private
+#: taxonomy the other thirteen verbs do not have.
+_AUTHORING_ERROR_CLASSES = {
+    400: "invalid_request",
+    404: "not_found",
+}
+
+
+def _emit_json_failure(envelope: dict) -> None:
+    """Write exactly one JSON failure document to stdout, then preserve exit status 1."""
+    click.echo(_json.dumps(envelope, indent=2))
+    raise click.exceptions.Exit(1)
+
+
+def _quoted_workflow_name(name: str, as_json: bool) -> str:
+    """Validate a bare workflow name and return its URL-safe path segment."""
+    if re.fullmatch(WORKFLOW_NAME_RE, name):
+        return quote(name, safe="")
+
+    message = f"invalid workflow name '{name}': must match [A-Za-z0-9_-]{{1,64}}"
+    if as_json:
+        _emit_json_failure(
+            {
+                "ok": False,
+                "class": "invalid_request",
+                "message": message,
+            }
+        )
+    raise click.ClickException(message)
+
+
+def _authoring_failure(
+    response: api_http.Response,
+    as_json: bool,
+    fallback: str,
+    operation: str,
+    auth_headers: dict[str, str] | None = None,
+) -> "click.ClickException":
+    """Build the exception for a refused authoring call, honouring ``--json``.
+
+    Exit stays 1 for every class (matching every other ``cao workflow`` verb); the machine-readable
+    distinction rides the envelope instead. Create and update use the same vocabulary as MCP:
+    ``already_exists`` and ``stale_hash`` respectively. Lint failures arrive as 400 invalid-request
+    responses; there is no live authoring 422 branch.
+    """
+    detail = _authentication_failure_detail(response, auth_headers) or _extract_detail(
+        response, fallback
+    )
+    if not as_json:
+        return click.ClickException(detail)
+    error_class = _AUTHORING_ERROR_CLASSES.get(response.status_code, "error")
+    if response.status_code == 409:
+        error_class = "already_exists" if operation == "create" else "stale_hash"
+    envelope = {
+        "ok": False,
+        "class": error_class,
+        "status": response.status_code,
+        "message": detail,
+    }
+    _emit_json_failure(envelope)
+    raise AssertionError("unreachable")
+
+
+def _auth_not_configured(
+    exc: api_http.AuthNotConfiguredError, as_json: bool
+) -> "click.ClickException":
+    """Report an authentication refusal without labelling the server unreachable."""
+    if as_json:
+        _emit_json_failure({"ok": False, "class": "auth_not_configured", "message": str(exc)})
+    return click.ClickException(str(exc))
+
+
+def _unreachable(exc: Exception, as_json: bool) -> "click.ClickException":
+    """A transport failure is not a refusal, and must not read like one.
+
+    The operator's action differs completely — start the server versus fix the spec — so this carries
+    its own class rather than being folded into the refusal set above.
+    """
+    if not as_json:
+        return click.ClickException(f"could not reach cao-server: {exc}")
+    _emit_json_failure(
+        {"ok": False, "class": "unreachable", "message": f"could not reach cao-server: {exc}"}
+    )
+    raise AssertionError("unreachable")
+
+
+def _echo_spec_result(record: dict, as_json: bool, verb: str) -> None:
+    """Report a successful create/update.
+
+    The ``content_hash`` is printed deliberately: ``update`` REQUIRES an ``--expected-hash``, so handing
+    the new one back is what keeps the next call a one-liner instead of forcing a ``cao workflow get``
+    in between. The SOURCE is never echoed — a spec may contain credentials the operator pasted by
+    mistake, and terminal output is the easiest place for that to leak.
+    """
+    if as_json:
+        click.echo(_json.dumps({**record, "ok": True}, indent=2))
+        return
+    click.echo(f"{verb} {record['name']}")
+    click.echo(f"  path: {record.get('path')}")
+    click.echo(f"  hash: {record.get('content_hash')}")
+    rendered_findings = _render_lint_findings(record.get("findings"))
+    if rendered_findings:
+        click.echo(f"  {rendered_findings}")
+
+
+@click.group()
+def workflow():
+    """Author and inspect CAO workflow specs."""
+
+
+@workflow.command(name="create", short_help="Create a Python workflow spec.")
+@click.argument("name")
+@click.option(
+    "--from-file",
+    "from_file",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Path to the Python source for the new spec.",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def create_cmd(name, from_file, as_json):
+    """Create a NEW workflow spec named NAME from a Python source file.
+
+    Refuses to overwrite an existing spec — use `cao workflow update` for that. Python only; a
+    YAML-tier name is refused with a message naming the restriction.
+
+    The source is sent as TEXT and the SERVER decides where it lands: validation, the lint gate, path
+    containment, the atomic write and the index update all happen there. This command opens exactly one
+    file — the one you named — and never touches the spec directory itself.
+
+    Prints the new spec's `content_hash`, which is what `cao workflow update` will want next.
+
+    Exit codes:
+      0  created
+      1  refused, or the request errored (`--json` carries a machine-readable class)
+    """
+    try:
+        source = pathlib.Path(from_file).read_text()
+    except (OSError, ValueError) as e:
+        raise click.ClickException(f"could not read {from_file}: {e}")
+
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
+    try:
+        response = api_http.post(
+            f"{API_BASE_URL}/workflows",
+            json={"name": name, "source": source},
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
+    except api_http.exceptions.RequestException as e:
+        raise _unreachable(e, as_json)
+
+    if response.status_code not in (200, 201):
+        # The server's own message is surfaced verbatim rather than replaced by a generic phrase: the
+        # over-cap refusal names the actual byte limit, and the YAML refusal names the restriction.
+        # Substituting "invalid request" here would throw away the only actionable part.
+        raise _authoring_failure(
+            response, as_json, f"status {response.status_code}", "create", auth_headers
+        )
+
+    _echo_spec_result(response.json(), as_json, "created")
+
+
+@workflow.command(name="update", short_help="Update a Python workflow spec.")
+@click.argument("name")
+@click.option(
+    "--from-file",
+    "from_file",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Path to the replacement Python source.",
+)
+@click.option(
+    "--expected-hash",
+    "expected_hash",
+    required=True,
+    help="The content_hash you believe the spec currently has (see `cao workflow get`).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def update_cmd(name, from_file, expected_hash, as_json):
+    """Replace an EXISTING workflow spec's source, refusing a stale update.
+
+    Refuses to create — use `cao workflow create` for that.
+
+    `--expected-hash` IS REQUIRED AND IS NEVER COMPUTED FOR YOU, deliberately. It is your assertion
+    about what you believe you are replacing, and that assertion is the whole mechanism: a hash derived
+    from the file about to be overwritten would always match, so the check would pass unconditionally
+    and a concurrent edit between read and write is exactly what would slip through. There is no
+    `--force` for the same reason — an unguarded path that exists is a path that gets used.
+
+    Get the current hash from `cao workflow get NAME` (it is on the `Hash:` line), or from the
+    `hash` field this command and `create` print on success.
+
+    Exit codes:
+      0  updated
+      1  refused, or the request errored (`--json` carries a machine-readable class)
+    """
+    quoted_name = _quoted_workflow_name(name, as_json)
+    try:
+        source = pathlib.Path(from_file).read_text()
+    except (OSError, ValueError) as e:
+        raise click.ClickException(f"could not read {from_file}: {e}")
+
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
+    try:
+        response = api_http.put(
+            f"{API_BASE_URL}/workflows/{quoted_name}",
+            json={"source": source, "expected_hash": expected_hash},
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
+    except api_http.exceptions.RequestException as e:
+        raise _unreachable(e, as_json)
+
+    if response.status_code != 200:
+        raise _authoring_failure(
+            response, as_json, f"status {response.status_code}", "update", auth_headers
+        )
+
+    _echo_spec_result(response.json(), as_json, "updated")
+
+
+@workflow.command(name="validate")
+@click.argument("file")
+@click.option(
+    "--json", "as_json", is_flag=True, default=False, help="Emit the ValidationResult as JSON."
+)
+def validate_cmd(file, as_json):
+    """Validate a workflow spec file WITHOUT running it.
+
+    Requires a running cao-server.
+
+    \b
+    Exit codes:
+      0  spec is valid (pass or pass_reserved)
+      1  spec failed validation, or the request errored
+    """
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
+    try:
+        response = api_http.post(
+            f"{API_BASE_URL}/workflows/validate",
+            json={"path": file},
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
+    except api_http.exceptions.RequestException as e:
+        raise _unreachable(e, as_json)
+
+    if response.status_code != 200:
+        raise _authoring_failure(
+            response,
+            as_json,
+            f"status {response.status_code}",
+            "validate",
+            auth_headers,
+        )
+
+    result = response.json()
+    if as_json:
+        click.echo(_json.dumps(result, indent=2))
+    else:
+        status = result.get("status", "fail")
+        if status in ("pass", "pass_reserved"):
+            click.echo("valid")
+            for note in result.get("reserved_notes", []):
+                click.echo(f"  note: {note}")
+        else:
+            click.echo("invalid", err=True)
+            for err in result.get("errors", []):
+                click.echo(f"  error: {err}", err=True)
+
+    if result.get("status") == "fail":
+        raise click.exceptions.Exit(1)
+
+
+@workflow.command(name="list")
+@click.option("--dir", "scan_dir", default=None, help="Directory to scan for spec files.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the rows as JSON.")
+def list_cmd(scan_dir, as_json):
+    """List indexed workflows (rebuilt from the spec files on disk).
+
+    Requires a running cao-server.
+    """
+    params = {}
+    if scan_dir is not None:
+        params["dir"] = scan_dir
+    try:
+        response = api_http.get(
+            f"{API_BASE_URL}/workflows",
+            params=params,
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
+    except api_http.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    if response.status_code == 400:
+        raise click.ClickException(_extract_detail(response, "invalid request"))
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+
+    rows = response.json()
+    if as_json:
+        click.echo(_json.dumps(rows, indent=2))
+        return
+    if not rows:
+        click.echo("No workflows found.")
+        return
+    header = f"{'NAME':<30} {'MODE':<12} {'STEPS':<6} DESCRIPTION"
+    click.echo(header)
+    click.echo("-" * len(header))
+    for row in rows:
+        # A script-tier spec has no static step count (it is determined at run
+        # time), so its index row carries ``step_count=None``. Render that as a
+        # ``-`` placeholder — formatting ``None`` with the ``:<6`` numeric field
+        # would raise a TypeError and crash the whole listing.
+        step_count = row.get("step_count")
+        steps_cell = "-" if step_count is None else str(step_count)
+        click.echo(
+            f"{row['name']:<30} {row['mode']:<12} {steps_cell:<6} {row.get('description', '')}"
+        )
+
+
+@workflow.command(name="get")
+@click.argument("name")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the spec as JSON.")
+def get_cmd(name, as_json):
+    """Show the parsed and validated spec for an indexed workflow name."""
+    quoted_name = _quoted_workflow_name(name, as_json)
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
+    try:
+        response = api_http.get(
+            f"{API_BASE_URL}/workflows/{quoted_name}",
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
+    except api_http.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    authentication_detail = _authentication_failure_detail(response, auth_headers)
+    if authentication_detail:
+        raise click.ClickException(authentication_detail)
+    if response.status_code == 404:
+        raise click.ClickException(f"unknown workflow '{name}'")
+    if response.status_code == 400:
+        raise click.ClickException(_extract_detail(response, "invalid request"))
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+
+    spec = response.json()
+    if as_json:
+        click.echo(_json.dumps(spec, indent=2))
+        return
+    click.echo(f"Name:        {spec['name']}")
+    mode = spec.get("mode") or ("script" if "source" in spec else None)
+    if mode:
+        click.echo(f"Mode:        {mode}")
+    click.echo(f"Description: {spec.get('description', '') or '(none)'}")
+    steps = spec.get("steps")
+    if isinstance(steps, list):
+        click.echo(f"Steps:       {len(steps)}")
+    # issue #583 Bolt 3 (``authoring-cli-verbs``): ``cao workflow update`` requires an
+    # ``--expected-hash`` and this was the only place a human could have found it — it was in the
+    # ``--json`` output all along but absent from the table, so the required flag would have meant
+    # piping through jq for the one verb that needs it most. GUARDED rather than unconditional: a YAML
+    # spec carries no content_hash, and printing "Hash: None" on every YAML spec would be noise that
+    # reads like a defect.
+    content_hash = spec.get("content_hash")
+    if content_hash:
+        click.echo(f"Hash:        {content_hash}")
+    for step in spec.get("steps", []):
+        click.echo(f"  - {step['id']} ({step['provider']}/{step['agent']})")
+
+
+@workflow.command(name="approve")
+@click.argument("plan_id")
+@click.option(
+    "--json", "as_json", is_flag=True, default=False, help="Emit the approval record as JSON."
+)
+def approve_cmd(plan_id, as_json):
+    """Approve PLAN_ID so its runs may start.
+
+    A plan identifier is computed at RUN START from the workflow's execution-affecting fields, so a
+    NEW OR CHANGED PLAN IS REFUSED ONCE before it can be approved: run it, copy the plan_id from the
+    refusal, and have an operator record approval here before running again. Approval enforcement is
+    on by default for script workflows unless an operator has disabled enforcement.
+
+    Approving twice is harmless and changes nothing: the original approver and timestamp are kept and
+    reported back, so "already approved" is distinguishable from "just approved by me".
+
+    THERE IS NO WAY TO REVOKE AN APPROVAL, deliberately. An update path could point an existing
+    approval at a changed plan, which would let work nobody reviewed execute with a genuine approval
+    behind it.
+
+    The recorded approver is the local OS account. It is PROVENANCE, NOT IDENTITY — nothing verifies
+    it, and CAO runs as the invoking user.
+
+    Requires a running cao-server.
+
+    \b
+    Exit codes:
+      0  the plan is approved (whether this call approved it or found it already approved)
+      1  the request was rejected or the server could not be reached
+    """
+    try:
+        response = api_http.post(
+            f"{API_BASE_URL}/workflows/plans/approve",
+            # plan_id rides the BODY, never the path: it contains a ':' and must reach the server
+            # verbatim, because a normalisation is how two distinct plans could share one approval.
+            json={"plan_id": plan_id},
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
+    except api_http.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    if response.status_code == 400:
+        raise click.ClickException(_extract_detail(response, "invalid request"))
+    if response.status_code == 403:
+        raise click.ClickException(
+            _extract_detail(response, "forbidden: approving a plan requires the cao:admin scope")
+        )
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+
+    record = response.json()
+    if as_json:
+        click.echo(_json.dumps(record, indent=2))
+        return
+
+    if record.get("changed"):
+        click.echo(f"approved {record['plan_id']}")
+    else:
+        click.echo(f"{record['plan_id']} was already approved (no change)")
+    click.echo(f"  at: {record.get('approved_at')}")
+    click.echo(f"  by: {record.get('approved_by')}  (local account; provenance, not identity)")
+
+
+@workflow.command(name="delete")
+@click.argument("name")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def delete_cmd(name, yes, as_json):
+    """Delete a workflow's spec file and its index row."""
+    quoted_name = _quoted_workflow_name(name, as_json)
+    if not yes:
+        click.confirm(f"Delete workflow '{name}'?", abort=True)
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
+    try:
+        response = api_http.delete(
+            f"{API_BASE_URL}/workflows/{quoted_name}",
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
+    except api_http.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    authentication_detail = _authentication_failure_detail(response, auth_headers)
+    if authentication_detail:
+        raise click.ClickException(authentication_detail)
+    if response.status_code == 404:
+        raise click.ClickException(f"unknown workflow '{name}'")
+    if response.status_code == 400:
+        raise click.ClickException(_extract_detail(response, "invalid request"))
+    if response.status_code not in (200, 204):
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+    if as_json:
+        click.echo(_json.dumps({"ok": True, "name": name}, indent=2))
+        return
+    click.echo(f"deleted '{name}'")
+
+
+def _parse_inputs(pairs):
+    """Parse ``--input k=v`` pairs into an inputs dict with light type coercion.
+
+    Each value is coerced from its string form: ``true``/``false`` -> bool,
+    a bare integer -> int, everything else stays a string. This keeps the CLI
+    ergonomic while the engine still validates every value against the spec's
+    declared ``InputDecl`` types (a coercion that disagrees with the declared
+    type surfaces as a 400 from the engine).
+    """
+    inputs = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise click.ClickException(f"--input must be k=v (got '{pair}')")
+        key, _, raw = pair.partition("=")
+        key = key.strip()
+        if not key:
+            raise click.ClickException(f"--input key is empty (got '{pair}')")
+        inputs[key] = _coerce(raw)
+    return inputs
+
+
+# The decisions ``cao workflow resume --decide`` accepts (issue #583, FR-7, BR-10).
+# Mirrors ``RecoveryDecision``'s members WITHOUT importing the model, exactly as
+# ``_TERMINAL_RUN_STATES`` above mirrors ``RunState`` — C-2 keeps this a thin HTTP
+# client. ``test_recovery_decision_intake.py`` pins this tuple against the enum, so a
+# rename or a third member fails loudly instead of leaving the CLI rejecting a value
+# the server accepts (or worse, accepting one the server rejects).
+_RECOVERY_DECISIONS = ("rerun", "skip")
+
+
+def _parse_decisions(pairs):
+    """Parse ``--decide <step_id>=<rerun|skip>`` pairs into a decisions dict (FR-7).
+
+    Rejected locally rather than round-tripped, so a typo costs no request and the
+    operator is told the accepted values. The server re-validates and remains the
+    authority — this check exists to agree with it, never to replace it (BR-10).
+
+    A REPEATED ``step_id`` is an error rather than last-wins: two decisions for one
+    step is an operator mistake, and silently dropping one would apply a permission
+    the operator did not think they were granting.
+    """
+    decisions = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise click.ClickException(f"--decide must be <step_id>=<decision> (got '{pair}')")
+        step_id, _, raw = pair.partition("=")
+        step_id = step_id.strip()
+        value = raw.strip()
+        if not step_id:
+            raise click.ClickException(f"--decide step id is empty (got '{pair}')")
+        if value not in _RECOVERY_DECISIONS:
+            accepted = " | ".join(_RECOVERY_DECISIONS)
+            raise click.ClickException(
+                f"--decide {step_id}: '{value[:40]}' is not a recovery decision "
+                f"(accepted: {accepted})"
+            )
+        if step_id in decisions:
+            raise click.ClickException(f"--decide names step '{step_id}' more than once")
+        decisions[step_id] = value
+    return decisions
+
+
+def _coerce(raw):
+    """Coerce a raw ``--input`` value string to bool / int / str."""
+    low = raw.strip().lower()
+    if low in ("true", "false"):
+        return low == "true"
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+def _render_snapshot(snapshot):
+    """Human-render one status snapshot line-set (run id, state, current, steps)."""
+    click.echo(f"Run:     {snapshot.get('run_id')}")
+    click.echo(f"State:   {snapshot.get('state')}")
+    click.echo(f"Current: {snapshot.get('current_step_id') or '(none)'}")
+    for step in snapshot.get("steps", []):
+        kind = f" [{step['error_kind']}]" if step.get("error_kind") else ""
+        click.echo(f"  - {step['id']}: {step['state']}{kind} (attempts={step.get('attempts')})")
+
+
+def _render_result(result):
+    """Human-render a terminal run result (run id, state, per-step lines).
+
+    U5 renders the plain result; U9 enriches the human render with the failure
+    envelope (``failing_step`` / ``attempt`` / ``error_kind`` / ``terminal_reference``
+    / ``next_command``) for a failed/cancelled run. ``--json`` emits the server body
+    verbatim (the envelope is already in the body), so this human-only enrichment
+    never touches the machine contract (NFR-3).
+    """
+    click.echo(f"Run:   {result.get('run_id')}")
+    click.echo(f"State: {result.get('state')}")
+    kind = result.get("kind")
+    if kind:
+        click.echo(f"Kind:  {kind}")
+    for step in result.get("steps", []):
+        click.echo(f"  - {step['id']}: {step['state']} (attempts={step.get('attempts')})")
+    _render_failure_envelope(result.get("failure_envelope"))
+    if result.get("state") == "failed" and result.get("warnings"):
+        click.echo("Diagnostics:")
+        for warning in result["warnings"]:
+            click.echo(f"  {warning}")
+
+
+#: The human phrasing of each failure classification (issue #583 Bolt 3, ``failure-classification``).
+#: PHRASED AS AN ACTION rather than echoing the enum, because the taxonomy exists to answer "what do I
+#: do next" and a human line that makes the reader translate a token has not finished that job. The
+#: machine-readable value stays the raw enum in ``--json``, which is what FR-10's criterion and the
+#: branch-on-the-field contract require.
+#:
+#: An UNKNOWN key is deliberately absent from this map, so a future fourth value degrades to silence in
+#: the human view while still appearing in ``--json`` — better than printing a token no phrasing was
+#: written for.
+_CLASSIFICATION_ACTIONS = {
+    "transient": "Retry — transient failure",
+    "artifact_defect": "Fix the spec — artifact defect",
+    "cancelled": "Cancelled by a human",
+}
+
+
+def _render_failure_envelope(envelope):
+    """Human-render the U9 failure envelope beneath a failed/cancelled result (FR-7.1).
+
+    A no-op when ``envelope`` is absent (a completed/non-terminal run carries none).
+    The ``next_command`` hint points the operator at the diagnostic command.
+
+    The ``what to do`` line is issue #583's FR-10 classification, rendered as an action. It sits above
+    ``error kind`` deliberately: the kind is the CAUSE and the classification is the NEXT ACTION, and an
+    operator scanning a failure wants the second first.
+    """
+    if not envelope:
+        return
+    click.echo("Failure:")
+    action = _CLASSIFICATION_ACTIONS.get(envelope.get("classification"))
+    if action:
+        click.echo(f"  what to do:         {action}")
+    click.echo(f"  failing step:       {envelope.get('failing_step') or '(none)'}")
+    click.echo(f"  attempt:            {envelope.get('attempt')}")
+    click.echo(f"  error kind:         {envelope.get('error_kind') or '(none)'}")
+    click.echo(f"  terminal reference: {envelope.get('terminal_reference')}")
+    click.echo(f"  next command:       {envelope.get('next_command')}")
+
+
+def _exit_for_state(state):
+    """Exit-code contract (U5-EC-1): ``completed`` -> 0, any other terminal -> 1.
+
+    Applies identically on a TTY, a non-TTY, and under ``--json`` (EC-2/EC-3) — the
+    output FORMAT changes but the exit code always mirrors the terminal state.
+    """
+    if state != "completed":
+        raise click.exceptions.Exit(1)
+
+
+def _machine_mode(as_json):
+    """Whether the async follower should emit stable machine output (EC-2/EC-3).
+
+    Machine mode is on when ``--json`` is set OR stdout is not a TTY. A non-TTY
+    follow (a pipe, a CI log, a captured subprocess) still follows to terminal and
+    still exits by the terminal-status contract, but emits a single stable JSON
+    object instead of the interactive human progress stream — so an automated
+    consumer gets a parseable result and the mandated non-TTY exit-code test
+    (NFR-2b) holds regardless of the render path.
+    """
+    return bool(as_json) or not sys.stdout.isatty()
+
+
+def _poll_to_terminal(run_id, as_json):
+    """Poll ``GET /workflows/runs/{run_id}`` until the run reaches a terminal state.
+
+    ADR-4 Option A: a fixed-interval poll of the snapshot route (NOT the events
+    stream — that live follower is U10, FP-2). Renders progress between polls
+    unless ``as_json`` is set (a machine consumer wants only the final JSON, not a
+    stream of human lines). Progress is keyed on the ``(state, current_step_id)`` PAIR,
+    not the run state alone — the run state is ``running`` for the ENTIRE drive, so
+    state-only keying prints one line and then goes silent for the whole run (FP-6).
+    Each poll uses the normal per-call ``MCP_REQUEST_TIMEOUT``
+    (FP-4 — the long ``WORKFLOW_RUN_REQUEST_TIMEOUT`` bounds only the ``--wait``
+    blocking call, never a single snapshot read), sleeping
+    ``WORKFLOW_POLL_INTERVAL_SECONDS`` between polls (FP-5).
+
+    A poll transport error is NOT run death (FP-3): after ONE bounded retry it
+    prints a "lost contact ... run continues" hint and returns ``None`` so the
+    caller can exit 0 (a lost socket must never be reported as a failed run).
+    Returns the terminal state string, or ``None`` on lost contact.
+    """
+    transport_failures = 0
+    last_state = None
+    last_step = None
+    while True:
+        try:
+            response = api_http.get(
+                f"{API_BASE_URL}/workflows/runs/{run_id}",
+                timeout=MCP_REQUEST_TIMEOUT,
+            )
+        except api_http.AuthNotConfiguredError as exc:
+            raise _auth_not_configured(exc, as_json)
+        except api_http.exceptions.RequestException as e:
+            transport_failures += 1
+            if transport_failures > 1:
+                # One bounded retry exhausted — a lost socket is not a failed run.
+                click.echo(
+                    f"lost contact with cao-server ({e}); run '{run_id}' continues — "
+                    f"use `cao workflow status {run_id}` to reconnect.",
+                    err=True,
+                )
+                return None
+            time.sleep(WORKFLOW_POLL_INTERVAL_SECONDS)
+            continue
+
+        if response.status_code == 404:
+            raise click.ClickException(f"unknown run '{run_id}'")
+        if response.status_code != 200:
+            refusal = _approval_refusal_envelope(response)
+            if refusal:
+                raise click.ClickException(_approval_refusal_message(refusal))
+            raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+
+        # A successful poll resets the bounded-retry budget.
+        transport_failures = 0
+        snapshot = response.json()
+        state = snapshot.get("state")
+        current = snapshot.get("current_step_id") or "(none)"
+        # Print on a change of EITHER the run state OR the current step (FP-6). Run
+        # state alone is not enough to be a progress display: it is ``running`` for
+        # the ENTIRE drive, so a keying-on-state-only loop prints one line and then
+        # goes silent until the run finishes — a 10-step, 40-minute workflow looked
+        # identical to a hung one. ``current_step_id`` is already in the snapshot and
+        # advances per step, so keying on the (state, step) PAIR turns the same poll
+        # into real per-step progress with no extra api_http.
+        if not as_json and (state, current) != (last_state, last_step):
+            click.echo(f"[{state}] current: {current}")
+            last_state = state
+            last_step = current
+
+        if state in _TERMINAL_RUN_STATES:
+            return state
+        time.sleep(WORKFLOW_POLL_INTERVAL_SECONDS)
+
+
+@workflow.command(name="run")
+@click.argument("name_or_path")
+@click.option("--input", "inputs", multiple=True, help="Run input as k=v (repeatable).")
+@click.option("--run-id", "run_id", default=None, help="Optional explicit run id.")
+@click.option(
+    "--working-directory",
+    type=click.Path(file_okay=False, path_type=str),
+    default=None,
+    help="Project root for script execution and approval fingerprinting.",
+)
+@click.option(
+    "--detach",
+    is_flag=True,
+    default=False,
+    help="Submit and return the run id immediately without following (exit 0 on submit).",
+)
+@click.option(
+    "--wait",
+    is_flag=True,
+    default=False,
+    help="Block on the server inline until the run finishes (the retained blocking path).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def run_cmd(name_or_path, inputs, run_id, working_directory, detach, wait, as_json):
+    """Run a workflow.
+
+    By default `run` SUBMITS the run asynchronously, prints the run id
+    immediately, then FOLLOWS it — polling status to a terminal state.
+    Ctrl-C during the follow DETACHES (the run keeps running server-side; it is
+    never cancelled). `--detach` submits and returns the id without following.
+    `--wait` is the explicit blocking escape hatch (the retained inline path).
+
+    Requires a running cao-server.
+
+    \b
+    Exit codes (identical on a TTY, a non-TTY, and under `--json`):
+      0  run reached COMPLETED (or `--detach` submitted, or Ctrl-C detached)
+      1  run reached FAILED / CANCELLED, or the request errored
+    """
+    parsed = _parse_inputs(inputs)
+    payload = {
+        "name_or_path": name_or_path,
+        "inputs": parsed,
+        "working_directory": os.path.abspath(working_directory or os.getcwd()),
+    }
+    if run_id is not None:
+        payload["run_id"] = run_id
+    _attach_terminal_caller(payload)
+
+    # --- --wait: the retained blocking path (VR-2, FR-4.5). ------------------
+    # ``--wait`` blocks on the server inline until the whole workflow finishes, so
+    # it keeps the worst-case-covering WORKFLOW_RUN_REQUEST_TIMEOUT — the flat 30s
+    # MCP_REQUEST_TIMEOUT would report a still-running run as a failure.
+    if wait:
+        try:
+            response = api_http.post(
+                f"{API_BASE_URL}/workflows/runs",
+                json=payload,
+                timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
+            )
+        except api_http.AuthNotConfiguredError as exc:
+            raise _auth_not_configured(exc, as_json)
+        except api_http.exceptions.RequestException as e:
+            raise click.ClickException(f"could not reach cao-server: {e}")
+        if response.status_code == 404:
+            raise click.ClickException(
+                _extract_detail(response, f"unknown workflow '{name_or_path}'")
+            )
+        # The APPROVE step of FR-10's sequence: name the identifier and the command, never just 403.
+        refusal = _approval_refusal_envelope(response)
+        if refusal:
+            if as_json:
+                _emit_json_failure(refusal)
+            raise click.ClickException(_approval_refusal_message(refusal))
+        if response.status_code != 200:
+            raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+        result = response.json()
+        if as_json:
+            click.echo(_json.dumps(result, indent=2))
+        else:
+            _render_result(result)
+        _exit_for_state(result.get("state"))
+        return
+
+    # --- default + --detach: submit asynchronously via the :submit spine. ----
+    try:
+        response = api_http.post(
+            f"{API_BASE_URL}/workflows/runs:submit",
+            json=payload,
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
+    except api_http.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    if response.status_code == 404:
+        raise click.ClickException(_extract_detail(response, f"unknown workflow '{name_or_path}'"))
+    # The APPROVE step of FR-10's sequence: name the identifier and the command, never just 403.
+    refusal = _approval_refusal_envelope(response)
+    if refusal:
+        if as_json:
+            _emit_json_failure(refusal)
+        raise click.ClickException(_approval_refusal_message(refusal))
+    if response.status_code != 202:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+
+    submitted = response.json()
+    submitted_run_id = submitted.get("run_id")
+    links = submitted.get("links", {})
+    machine = _machine_mode(as_json)
+
+    # FP-1: surface the run id IMMEDIATELY on the 202, before any follow loop, so
+    # the handle survives a Ctrl-C on the very first poll. In machine mode the id
+    # is carried by the final JSON object (and by the interrupt hint on stderr) —
+    # a human "Run: id" line here would corrupt the stdout JSON.
+    if not machine:
+        click.echo(f"Run:   {submitted_run_id}")
+        click.echo(f"State: {submitted.get('state')}")
+
+    # --- --detach: return right after a successful submit (VR-1, FR-4.4). ----
+    if detach:
+        if machine:
+            click.echo(_json.dumps(submitted, indent=2))
+        else:
+            for name, href in links.items():
+                click.echo(f"  {name}: {href}")
+            click.echo(f"detached; follow with `cao workflow wait {submitted_run_id}`")
+        return
+
+    # --- bare run: FOLLOW to terminal. Ctrl-C detaches, never cancels (CC-1). -
+    try:
+        terminal_state = _poll_to_terminal(submitted_run_id, machine)
+    except KeyboardInterrupt:
+        # CC-1 (load-bearing): a Ctrl-C during the follow DETACHES — it prints the
+        # handle + hint (to stderr, so it never corrupts stdout JSON) and exits 0.
+        # It MUST NOT POST the cancel route; the run keeps running server-side.
+        click.echo(
+            f"\ndetached from '{submitted_run_id}'; run still running — "
+            f"use `cao workflow status {submitted_run_id}` or "
+            f"`cao workflow cancel {submitted_run_id}`.",
+            err=True,
+        )
+        return
+
+    # FP-3: lost contact (poll transport error, retry exhausted) is not run death —
+    # ``_poll_to_terminal`` already printed the hint and returns None; exit 0.
+    if terminal_state is None:
+        return
+
+    if machine:
+        # EC-2/EC-3: a non-TTY or ``--json`` follow emits ONE stable machine object.
+        click.echo(_json.dumps({"run_id": submitted_run_id, "state": terminal_state}, indent=2))
+    else:
+        click.echo(f"State: {terminal_state}")
+
+    # EC-1/EC-2: the exit code mirrors the terminal state on every output mode.
+    _exit_for_state(terminal_state)
+
+
+def _resolve_latest_run_id():
+    """Resolve the most-recently-started run id via ``GET /workflows/runs?limit=1``.
+
+    Backs no-id ``status`` (VR-4, FR-4.8): the list route is ORDER BY
+    ``started_at DESC, run_id DESC`` (U1/U4), so the first row is the most recent.
+    Returns ``None`` when no runs exist (the caller prints "no runs found").
+    """
+    try:
+        response = api_http.get(
+            f"{API_BASE_URL}/workflows/runs",
+            params={"limit": 1},
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, False)
+    except api_http.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+    rows = response.json()
+    if not rows:
+        return None
+    return rows[0].get("run_id")
+
+
+@workflow.command(name="status")
+@click.argument("run_id", required=False, default=None)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the snapshot as JSON.")
+def status_cmd(run_id, as_json):
+    """Show a point-in-time status snapshot for a run.
+
+    With no RUN_ID, resolves the most-recently-started run and shows that one;
+    an empty run list prints "no runs found" and exits 0.
+
+    Requires a running cao-server.
+    """
+    if run_id is None:
+        run_id = _resolve_latest_run_id()
+        if run_id is None:
+            click.echo("no runs found")
+            return
+
+    try:
+        response = api_http.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}",
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
+    except api_http.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    if response.status_code == 404:
+        raise click.ClickException(f"unknown run '{run_id}'")
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+
+    snapshot = response.json()
+    if as_json:
+        click.echo(_json.dumps(snapshot, indent=2))
+        return
+    _render_snapshot(snapshot)
+
+
+@workflow.command(name="runs")
+@click.option("--state", "state", default=None, help="Filter by run state (e.g. running, failed).")
+@click.option("--limit", "limit", type=int, default=None, help="Max rows to return (server caps).")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the rows as JSON.")
+def runs_cmd(state, limit, as_json):
+    """List workflow runs, newest first.
+
+    `cao workflow runs` shows submitted/finished runs and their state;
+    `cao workflow list` shows the indexed workflow SPECS on disk. Optional
+    `--state` filters by run state and `--limit` caps the row count.
+
+    Requires a running cao-server.
+    """
+    params = {}
+    if state is not None:
+        params["state"] = state
+    if limit is not None:
+        params["limit"] = limit
+    try:
+        response = api_http.get(
+            f"{API_BASE_URL}/workflows/runs",
+            params=params,
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
+    except api_http.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    if response.status_code == 400:
+        raise click.ClickException(_extract_detail(response, "invalid request"))
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+
+    rows = response.json()
+    if as_json:
+        click.echo(_json.dumps(rows, indent=2))
+        return
+    if not rows:
+        click.echo("No runs found.")
+        return
+    header = f"{'RUN_ID':<28} {'WORKFLOW':<24} {'STATE':<10} {'TIER':<8} STARTED"
+    click.echo(header)
+    click.echo("-" * len(header))
+    for row in rows:
+        click.echo(
+            f"{row.get('run_id', ''):<28} {row.get('workflow_name', ''):<24} "
+            f"{row.get('state', ''):<10} {row.get('tier', ''):<8} {row.get('started_at', '')}"
+        )
+
+
+@workflow.command(name="wait")
+@click.argument("run_id")
+@click.option(
+    "--json", "as_json", is_flag=True, default=False, help="Emit the terminal state as JSON."
+)
+def wait_cmd(run_id, as_json):
+    """Wait for an existing run to finish.
+
+    Polls the run's status until it reaches a terminal state.
+
+    Requires a running cao-server.
+
+    \b
+    Exit codes (identical on a TTY, a non-TTY, and under `--json`):
+      0  run reached COMPLETED (or contact with the server was lost mid-follow)
+      1  run reached FAILED / CANCELLED, or the request errored
+    """
+    terminal_state = _poll_to_terminal(run_id, as_json)
+    # FP-3: lost contact is not run death — the helper printed the hint; exit 0.
+    if terminal_state is None:
+        return
+    if as_json:
+        click.echo(_json.dumps({"run_id": run_id, "state": terminal_state}, indent=2))
+    else:
+        click.echo(f"Run:   {run_id}")
+        click.echo(f"State: {terminal_state}")
+    _exit_for_state(terminal_state)
+
+
+@workflow.command(name="result")
+@click.argument("run_id")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def result_cmd(run_id, as_json):
+    """Show the retained result for a run.
+
+    Shows the complete retained result of a finished or in-flight run.
+
+    Requires a running cao-server.
+    """
+    try:
+        response = api_http.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/result",
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
+    except api_http.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    if response.status_code == 404:
+        raise click.ClickException(f"unknown run '{run_id}'")
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+
+    result = response.json()
+    if as_json:
+        # EC-3 / NFR-3: emit the server body verbatim so it is stable/round-trippable.
+        click.echo(_json.dumps(result, indent=2))
+        return
+    _render_result(result)
+
+
+@workflow.command(name="resume")
+@click.argument("run_id")
+@click.option(
+    "--decide",
+    "decide",
+    multiple=True,
+    metavar="STEP_ID=DECISION",
+    help=(
+        "Resolve a halted step: --decide <step_id>=rerun|skip. 'rerun' authorises "
+        "re-executing it; 'skip' authorises using its stored result. Repeatable."
+    ),
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def resume_cmd(run_id, decide, as_json):
+    """Resume a crashed or failed run.
+
+    Re-drives the run from its durable journal and blocks until it is done.
+
+    A script-tier resume RE-EXECUTES THE SCRIPT TOP-TO-BOTTOM; completed steps are
+    NOT skipped. Each step is decided as it arrives and is either REPLAYED (its
+    stored result is returned and nothing runs), EXECUTED (it runs again), or HALTED
+    (CAO will not decide alone, so the run stops there and waits for a --decide).
+    A step whose script changed at the same key DIVERGES and fails the run instead.
+
+    `--decide` carries a decision for a step the run halted on.
+    Each decision authorises exactly ONE attempt: if that attempt crashes before it
+    settles, the next resume asks again rather than re-executing on old consent.
+
+    Requires a running cao-server.
+
+    \b
+    Exit codes:
+      0  run reached COMPLETED
+      1  run reached FAILED / CANCELLED, or the request errored
+    """
+    decisions = _parse_decisions(decide)
+    try:
+        # Resume re-drives the run inline (the server awaits it), so use the
+        # worst-case-covering run timeout, not the flat MCP_REQUEST_TIMEOUT.
+        # ``json=None`` sends NO body, so a decision-free resume is byte-identical to
+        # the pre-#583 request.
+        resume_body = {"decisions": decisions} if decisions else {}
+        _attach_terminal_caller(resume_body)
+        response = api_http.post(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
+            json=resume_body or None,
+            timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
+    except api_http.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    if response.status_code == 404:
+        raise click.ClickException(f"unknown run '{run_id}'")
+    # A resume is gated too (the fifth check in resume_script_run's admission ladder), so the same
+    # actionable refusal applies -- a resume of a run whose plan was never approved is refused.
+    refusal = _approval_refusal_envelope(response)
+    if refusal:
+        if as_json:
+            _emit_json_failure(refusal)
+        raise click.ClickException(_approval_refusal_message(refusal))
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+
+    result = response.json()
+    if as_json:
+        click.echo(_json.dumps(result, indent=2))
+    else:
+        click.echo(f"Run:   {result.get('run_id')}")
+        click.echo(f"State: {result.get('state')}")
+        for step in result.get("steps", []):
+            click.echo(f"  - {step['id']}: {step['state']} (attempts={step.get('attempts')})")
+
+    if result.get("state") != "completed":
+        raise click.exceptions.Exit(1)
+
+
+def _render_step_replay(result):
+    """Human-render a single-step replay: identity, the resolved prompt, the output.
+
+    The resolved prompt is printed because it is the thing being iterated on — a
+    replay whose output looks wrong is usually a prompt that resolved differently
+    than the author expected, and that is invisible without showing it.
+    """
+    click.echo(f"Run:      {result.get('run_id')}")
+    click.echo(
+        f"Step:     {result.get('step_id')} ({result.get('provider')}/{result.get('agent')})"
+    )
+    click.echo(f"Terminal: {result.get('terminal_id') or '(none)'}")
+    click.echo("Prompt:")
+    click.echo(result.get("prompt") or "")
+    error = result.get("error")
+    if error:
+        click.echo(f"Error:    {error} (kind: {result.get('error_kind') or 'unknown'})", err=True)
+        return
+    output = result.get("output")
+    if output is None:
+        click.echo("Output:   (no structured output)")
+    else:
+        click.echo(f"Output (validated={result.get('validated')}):")
+        click.echo(_json.dumps(output, indent=2))
+    message = result.get("last_message")
+    if message:
+        click.echo("Message:")
+        click.echo(message)
+
+
+@workflow.command(name="step")
+@click.argument("run_id")
+@click.argument("step_id")
+@click.option(
+    "--prompt-file",
+    "prompt_file",
+    default=None,
+    help="Read the replacement prompt from this file (excludes --prompt-override).",
+)
+@click.option(
+    "--prompt-override",
+    "prompt_override",
+    default=None,
+    help="Replacement prompt text (excludes --prompt-file).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def step_cmd(run_id, step_id, prompt_file, prompt_override, as_json):
+    """Re-execute one step of a recorded run.
+
+    Does not re-run the workflow. Resolves the step's prompt from the RECORDED
+    run (journaled inputs + predecessor outputs), runs it live, and prints the
+    resolved prompt and the output. The source run is left untouched, so a step
+    can be re-probed as many times as it takes to get its prompt right.
+    YAML-tier runs only.
+
+    `--prompt-file` / `--prompt-override` replace the prompt TEMPLATE for this one
+    execution; `{{workflow.inputs.*}}` / `{{steps.*.output.*}}` references in the
+    replacement still resolve against the recorded run.
+
+    Requires a running cao-server.
+
+    \b
+    Exit codes:
+      0  the step ran
+      1  the step failed, or the request errored
+    """
+    if prompt_file is not None and prompt_override is not None:
+        raise click.ClickException("--prompt-file and --prompt-override are mutually exclusive")
+    if prompt_file is not None:
+        try:
+            prompt_override = Path(prompt_file).read_text(encoding="utf-8")
+        except OSError as e:
+            raise click.ClickException(f"could not read --prompt-file '{prompt_file}': {e}")
+    # Caught here as well as server-side so an empty file costs no round trip and the
+    # message can name the flag the operator actually typed.
+    if prompt_override is not None and not prompt_override.strip():
+        source = (
+            f"--prompt-file '{prompt_file}'" if prompt_file is not None else "--prompt-override"
+        )
+        raise click.ClickException(
+            f"{source} is empty; omit it to re-run the step's recorded prompt "
+            f"(a blank prompt would run the step with no instructions)"
+        )
+
+    payload = {}
+    if prompt_override is not None:
+        payload["prompt_override"] = prompt_override
+    _attach_terminal_caller(payload)
+
+    try:
+        # A single step still runs an agent inline on the server, so this is a
+        # BLOCKING path — never the flat MCP_REQUEST_TIMEOUT (which would report a
+        # still-running step as a failure). But it runs at most ONE step, capped
+        # server-side at WORKFLOW_STEP_TIMEOUT, so it uses the single-step ceiling
+        # rather than the multi-step WORKFLOW_RUN_REQUEST_TIMEOUT: a genuinely hung
+        # server surfaces in minutes, not hours.
+        response = api_http.post(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/steps/{step_id}:replay",
+            json=payload,
+            timeout=WORKFLOW_STEP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
+    except api_http.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    if response.status_code == 404:
+        raise click.ClickException(_extract_detail(response, f"unknown run '{run_id}'"))
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+
+    result = response.json()
+    if as_json:
+        click.echo(_json.dumps(result, indent=2))
+    else:
+        _render_step_replay(result)
+
+    # A failed step is a 200 with ``error`` set (the server reports it as data), so
+    # the exit code comes from the body, not the status line.
+    if result.get("error"):
+        raise click.exceptions.Exit(1)
+
+
+@workflow.command(name="cancel")
+@click.argument("run_id")
+def cancel_cmd(run_id):
+    """Cooperatively cancel a running workflow.
+
+    Requires a running cao-server.
+    """
+    try:
+        response = api_http.post(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/cancel",
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, False)
+    except api_http.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    if response.status_code == 404:
+        raise click.ClickException(f"unknown run '{run_id}'")
+    if response.status_code == 409:
+        raise click.ClickException(_extract_detail(response, "run is already finished"))
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+    click.echo(f"cancelling '{run_id}'")
+
+
+# ===========================================================================
+# events — U10 live-event follower (issue #505, FR-4.9). A CLIENT-SIDE consumer
+# of #504's events-follow SSE route (``GET /workflows/runs/{id}/events`` with
+# ``Accept: text/event-stream``). Thin HTTP client: it opens the stream, renders
+# the DECLARED frames, resumes exactly via ``?after_seq``, and closes on a
+# terminal projection state — importing NO engine / journal / event DAL (FR-7.4).
+# ===========================================================================
+def _open_events_stream(run_id: str, cursor):
+    """Open the SSE variant of the events route, resuming from ``cursor`` when set.
+
+    Requests ``Accept: text/event-stream`` for the live-follow variant. When a
+    cursor (last-seen ``seq``) is present it is sent as ``?after_seq=<cursor>``
+    (the authority — the contract has ``?after_seq`` WIN over ``Last-Event-ID``)
+    AND mirrored into the ``Last-Event-ID`` header, so resume is exact and
+    dedupe-free (RS-1/RS-3). A ``(connect, read)`` timeout tuple keeps a quiet
+    run from tripping a spurious read timeout between frames.
+    """
+    params = {}
+    headers = {"Accept": "text/event-stream"}
+    if cursor is not None:
+        params["after_seq"] = cursor
+        headers["Last-Event-ID"] = str(cursor)
+    return api_http.get(
+        f"{API_BASE_URL}/workflows/runs/{run_id}/events",
+        params=params,
+        headers=headers,
+        stream=True,
+        timeout=(WORKFLOW_EVENTS_CONNECT_TIMEOUT, WORKFLOW_EVENTS_READ_TIMEOUT),
+    )
+
+
+def _events_route_or_run_missing(run_id: str) -> click.ClickException:
+    """Turn an ambiguous 404 from the events route into the RIGHT error (CD-1).
+
+    The events route (``GET /workflows/runs/{run_id}/events``) ships with issue
+    #504. Until that lands, every request to it 404s — for healthy runs included —
+    and the naive reading ("unknown run") is actively misleading: it points the
+    operator at their run instead of at the missing capability.
+
+    The snapshot route is present in every build, so it discriminates: if the run
+    is READABLE there, the 404 came from the absent route, not a missing run.
+    A transport failure on the probe falls back to the run-scoped message rather
+    than asserting a server capability it could not verify.
+    """
+    try:
+        probe = api_http.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}",
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, False)
+    except api_http.exceptions.RequestException:
+        return click.ClickException(f"unknown run '{run_id}'")
+    if probe.status_code == 200:
+        return click.ClickException(
+            f"this cao-server has no live event stream for run '{run_id}' "
+            f"(GET /workflows/runs/{run_id}/events is not available on this build); "
+            f"the run itself is fine — follow it with `cao workflow wait {run_id}` "
+            f"or read a snapshot with `cao workflow status {run_id}`."
+        )
+    return click.ClickException(f"unknown run '{run_id}'")
+
+
+def _render_event_frame(frame: SseFrame, machine: bool) -> None:
+    """Render one NORMAL event frame (event_type, step_id, state, seq), in order.
+
+    Machine mode emits one stable JSON line per frame (a JSONL follow stream);
+    the human render is a single progress line.
+    """
+    if machine:
+        click.echo(
+            _json.dumps(
+                {
+                    "kind": "event",
+                    "seq": frame.seq(),
+                    "run_id": frame.data.get("run_id"),
+                    "event_type": frame.event,
+                    "step_id": frame.data.get("step_id"),
+                    "state": frame.data.get("state"),
+                    "ts": frame.data.get("ts"),
+                }
+            )
+        )
+    else:
+        step = frame.data.get("step_id") or "(run)"
+        click.echo(f"[seq {frame.seq()}] {frame.event}: {step} -> {frame.data.get('state')}")
+
+
+def _render_gap_frame(frame: SseFrame, machine: bool) -> None:
+    """Render a SERVER-DECLARED ``event: gap`` frame verbatim — RENDER, do not infer.
+
+    Load-bearing (GD-1): this renders exactly what the gap frame's data DECLARES
+    (``after_seq`` / ``before_seq`` / ``missing_count`` / ``reason``). It NEVER
+    computes a gap from ``seq`` arithmetic — a gap exists on-screen iff the server
+    sent an ``event: gap`` frame, so an independent client inference can never
+    disagree with the server's authoritative declaration.
+    """
+    d = frame.data
+    if machine:
+        click.echo(
+            _json.dumps(
+                {
+                    "kind": "gap",
+                    "after_seq": d.get("after_seq"),
+                    "before_seq": d.get("before_seq"),
+                    "missing_count": d.get("missing_count"),
+                    "reason": d.get("reason"),
+                }
+            )
+        )
+    else:
+        click.echo(
+            f"⚠ gap: {d.get('missing_count')} event(s) lost between seq "
+            f"{d.get('after_seq')} and {d.get('before_seq')} (reason: {d.get('reason')})"
+        )
+
+
+def _stream_event_frames(run_id: str, cursor):
+    """Open ONE SSE connection and YIELD its frames (a generator).
+
+    Raises ``click.ClickException`` on 404 / non-200 (a hard error, never a
+    reconnect). A transport error raised by the streamed ``iter_lines`` read
+    propagates OUT of this generator to the caller — which is why the caller
+    tracks the resume cursor in ITS OWN scope as frames are yielded: on a dropped
+    connection the cursor is already advanced to the last seen ``seq``, so the
+    reconnect resumes exactly (``?after_seq=<cursor>``) with no re-delivery.
+
+    FD-1 (PR #525 review): the response is closed on EVERY exit path via
+    ``try``/``finally``, matching the hardening already applied to the MCP twin
+    ``workflow_events``. ``stream=True`` holds the connection open until it is
+    explicitly closed or fully drained, and this generator is routinely abandoned
+    WITHOUT draining: the caller ``break``s out of its loop the moment a terminal
+    frame arrives, and every reconnect leaves the prior generator suspended. Without
+    the ``finally`` the socket/FD survives until the generator is garbage collected —
+    so a long follow with repeated reconnects accumulates live sockets. The ``finally``
+    runs on the terminal-frame break too, because abandoning a suspended generator
+    raises ``GeneratorExit`` into it at collection.
+    """
+    response = _open_events_stream(run_id, cursor)
+    try:
+        if response.status_code == 404:
+            # A 404 here is AMBIGUOUS and the two causes need opposite messages (CD-1):
+            # the RUN may be unknown, or the events ROUTE may not exist on this server
+            # (it ships with issue #504; until that merges, this path 404s for every
+            # perfectly healthy run). Reporting "unknown run" for a live run sends the
+            # operator hunting a nonexistent problem, so discriminate against the
+            # snapshot route — which this build always has — before naming the cause.
+            raise _events_route_or_run_missing(run_id)
+        if response.status_code != 200:
+            raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+        yield from parse_sse_frames(response.iter_lines(decode_unicode=True))
+    finally:
+        response.close()
+
+
+def _final_events_status(run_id: str):
+    """Read the snapshot route ONCE; return the terminal state, or ``None``.
+
+    The F-1 terminal-guard safety net for the follower: if the stream ends (or the
+    reconnect budget is exhausted) before a terminal EVENT was seen, this proves
+    whether the run is actually terminal without depending on that swallowed
+    event. A transport error or a non-terminal state both yield ``None`` — a lost
+    socket is never reported as a failed run.
+    """
+    try:
+        response = api_http.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}",
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        # A missing credential is not a lost socket: surface it (exit 1) rather
+        # than answering "not terminal" and letting the follow end with exit 0.
+        raise click.ClickException(str(exc)) from exc
+    except api_http.exceptions.RequestException:
+        return None
+    if response.status_code != 200:
+        return None
+    state = response.json().get("state")
+    return state if state in _TERMINAL_RUN_STATES else None
+
+
+def _events_batch_read(run_id: str, after_seq, as_json: bool) -> None:
+    """One-shot batch read (``--no-follow``): the JSON variant of the same route.
+
+    Content-negotiated: with no ``Accept: text/event-stream`` the route returns the
+    batch EventRow list. Optional ``?after_seq`` trims to ``seq > n``. Still a thin
+    consumer — no streaming, no engine import.
+    """
+    params = {}
+    if after_seq is not None:
+        params["after_seq"] = after_seq
+    try:
+        response = api_http.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/events",
+            params=params,
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
+    except api_http.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    if response.status_code == 404:
+        # Same ambiguity as the follow path (CD-1) — the batch variant lives on the
+        # SAME route, so it is equally absent until #504 lands.
+        raise _events_route_or_run_missing(run_id)
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+
+    rows = response.json()
+    if as_json:
+        click.echo(_json.dumps(rows, indent=2))
+        return
+    if not rows:
+        click.echo("no events")
+        return
+    for row in rows:
+        step = row.get("step_id") or "(run)"
+        click.echo(f"[seq {row.get('seq')}] {row.get('event_type')}: {step} -> {row.get('state')}")
+
+
+@workflow.command(name="events")
+@click.argument("run_id")
+@click.option(
+    "--follow/--no-follow",
+    "follow",
+    default=True,
+    help="Stream live SSE progress (default). --no-follow does a one-shot batch read.",
+)
+@click.option(
+    "--after-seq",
+    "after_seq",
+    type=int,
+    default=None,
+    help="Resume strictly after this per-run seq (exact, dedupe-free).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit each frame as JSON.")
+def events_cmd(run_id, follow, after_seq, as_json):
+    """Follow a run's live event stream.
+
+    Renders per-run ordered progress from the server's events-follow SSE route
+    (`Accept: text/event-stream`). Each normal frame renders as a progress line
+    (or a JSON line under `--json` / non-TTY); a server-DECLARED `event: gap`
+    frame is rendered verbatim (the gap is DATA the server sends — the follower
+    never computes one from seq numbering). On a dropped connection the follow
+    reconnects, resuming exactly via `?after_seq=<last-seen seq>` so no event is
+    re-delivered. Ctrl-C DETACHES (prints the handle + a hint, exits 0, never
+    cancels).
+
+    Requires a running cao-server.
+
+    \b
+    Exit codes (identical on a TTY, a non-TTY, and under `--json`):
+      0  run reached COMPLETED — or Ctrl-C detached, or the stream ended without a
+         terminal (a final status check confirms the run is not yet terminal)
+      1  run reached FAILED / CANCELLED
+    """
+    if not follow:
+        _events_batch_read(run_id, after_seq, as_json)
+        return
+
+    machine = _machine_mode(as_json)
+    cursor = after_seq
+    reconnects = 0
+    terminal_state = None
+
+    try:
+        while True:
+            saw_terminal = False
+            try:
+                for frame in _stream_event_frames(run_id, cursor):
+                    if frame.is_gap:
+                        _render_gap_frame(frame, machine)
+                        # A gap frame carries no ``id:``: it never advances the
+                        # cursor and is never terminal — the stream continues.
+                        continue
+                    _render_event_frame(frame, machine)
+                    seq = frame.seq()
+                    if seq is not None:
+                        # Advance the cursor in THIS scope so a mid-stream drop
+                        # reconnects exactly after the last seen seq (RS-1/RS-3).
+                        cursor = seq
+                    if frame.is_terminal:
+                        terminal_state = frame.terminal_state
+                        saw_terminal = True
+                        break
+            except api_http.AuthNotConfiguredError as exc:
+                # Not a dropped connection: the server wants a bearer and this
+                # shell has none to send. Retrying cannot change that, and the
+                # final status read would swallow it into ``stream_ended`` with
+                # exit 0. Fail loudly with the actionable message instead.
+                raise click.ClickException(str(exc)) from exc
+            except api_http.exceptions.RequestException:
+                # A dropped connection is not run death — reconnect from the last
+                # seen seq (exact resume), bounded so a flapping stream cannot spin
+                # forever. Budget exhausted -> fall through to the final status read.
+                reconnects += 1
+                if reconnects > WORKFLOW_EVENTS_MAX_RECONNECTS:
+                    break
+                time.sleep(WORKFLOW_POLL_INTERVAL_SECONDS)
+                continue
+            # A clean drain (terminal frame or the server closing the stream)
+            # resets the reconnect budget and ends the follow loop.
+            reconnects = 0
+            if saw_terminal:
+                break
+            # The stream ended with no terminal frame — stop and let the final
+            # status check (below) settle the outcome.
+            break
+    except KeyboardInterrupt:
+        # CC-1 (consistent with U5's follow): Ctrl-C DETACHES — print the handle +
+        # hint to stderr (so it never corrupts stdout JSON) and exit 0. It MUST NOT
+        # POST cancel; the run keeps running server-side.
+        click.echo(
+            f"\ndetached from '{run_id}'; run still running — "
+            f"use `cao workflow status {run_id}` or `cao workflow cancel {run_id}`.",
+            err=True,
+        )
+        return
+
+    # F-1 terminal guard: the follow must not hang on a swallowed terminal EVENT.
+    # If no terminal frame arrived (stream ended / reconnect budget spent), a final
+    # snapshot read closes the follow on the true terminal state.
+    if terminal_state is None:
+        terminal_state = _final_events_status(run_id)
+
+    if terminal_state is None:
+        # Stream gone AND the run is not (yet) terminal — report the stream ended;
+        # never a false failure (exit 0).
+        if machine:
+            click.echo(_json.dumps({"kind": "stream_ended", "run_id": run_id, "state": None}))
+        else:
+            click.echo(
+                f"stream ended; run '{run_id}' is not yet terminal — "
+                f"reconnect with `cao workflow events {run_id}` or "
+                f"`cao workflow status {run_id}`.",
+                err=True,
+            )
+        return
+
+    if machine:
+        click.echo(_json.dumps({"kind": "terminal", "run_id": run_id, "state": terminal_state}))
+    else:
+        click.echo(f"State: {terminal_state}")
+    # EC-1: the exit code mirrors the terminal state on every output mode.
+    _exit_for_state(terminal_state)

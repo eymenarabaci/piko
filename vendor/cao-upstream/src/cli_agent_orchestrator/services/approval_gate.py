@@ -1,0 +1,234 @@
+"""Refuse an unapproved script-tier run (issue #583 Bolt 2, unit ``approval-gate``).
+
+FR-8's enforcement half. ``approval_store`` can say whether a ``plan_id`` is approved and
+``manifest_freeze`` computes that ``plan_id`` at run start; this module is the first code in Bolt 2
+that can actually STOP a run, and both freeze call sites already carry the written promise that
+something will — "writes NULL and fails CLOSED at the approval gate".
+
+ENFORCEMENT DEFAULTS **ON** SINCE BOLT 3 (``approval-enforcement-default``). It defaulted OFF in
+Bolt 2, and the reason was specific rather than timid: ``manifest_freeze.build_manifest_json`` is
+total, so it returns ``None`` on any failure, which writes a NULL manifest, which refuses here. Each
+of those is individually right. Composed under an always-on gate they meant a TRANSIENT freeze
+failure refused a run with nothing wrong with it, and there was no in-product way to grant approval
+until Bolt 3.
+
+Both halves of that reasoning are now addressed, which is what licenses the flip. The freeze failure
+is no longer indistinguishable from a missing approval: it raises
+:class:`PlanIdentityUnavailableError` and the API transports it as **503** (cause-specific guidance; retry only when it can help),
+while a genuinely unapproved plan stays **403** (approve this identifier). And Bolt 3 ships the
+authoring sequence that presents a plan and takes approval BEFORE running. Left opt-in, FR-8's
+guarantee would simply never apply in a default installation.
+
+THE GATE REPORTS; IT DOES NOT FORM AN OPINION ABOUT WHETHER AN APPROVAL EXISTS.
+``approval_store`` is the sole authority. The gate consults it through ONE call —
+``approval_store.approval_state`` — and maps its three answers: APPROVED proceeds, ABSENT refuses as
+``PlanApprovalRequiredError`` (403), and UNKNOWN (the store faulted) refuses as
+``PlanApprovalUnavailableError`` (503, issue #696). A store fault stays fail-closed exactly as before
+— it never admits a run — but it is no longer collapsed into "not approved", because telling an
+operator whose database is unreadable to approve a plan names a remedy that cannot work. A second
+opinion here would be the copy that drifts, so the gate reads the store once and routes on that.
+
+IT SITS BEFORE THE FIRST IRREVERSIBLE ACT ON BOTH PATHS, and the two placements are not symmetric
+because what they protect is not the same thing:
+
+* **start** — before the ``workflow_run`` INSERT. A refused start leaves NO row: a run row is a
+  record of a run, and every first run of every new plan is refused by design, so recording them
+  would durably record runs that never happened.
+* **resume** — as a fifth check in ``resume_script_run``'s admission ladder, AFTER its existing four
+  (absent / live / not-resumable / corrupt) and BEFORE the generation bump. The bump fences out any
+  still-live process for that run, so bumping and then refusing would kill a possibly-healthy run on
+  behalf of a resume that was itself rejected. Two losses from one refusal.
+
+YAML RUNS ARE OUTSIDE THIS GATE BY CONSTRUCTION, not by a check that could pass for the wrong reason:
+the tier is already recorded on every run (``insert_run``'s ``tier: str = "yaml"``, with script runs
+passing ``"script"`` explicitly), so C-1 is met structurally.
+
+THIS IS A SAME-USER LOCAL CONTROL, NOT A PRIVILEGE BOUNDARY. CAO runs as the invoking user and a
+workflow script runs as that same user, so a script could edit ``settings.json`` or write to
+``workflow_plan_approval`` directly. That is inherent to a local single-user tool. What the gate does
+provide is that a plan cannot execute UNNOTICED under an approval granted for a different plan, which
+is FR-8's property and is worth having on its own terms. Documenting it as stronger than it is would
+be the actual defect.
+"""
+
+import json
+import logging
+from typing import Optional
+
+from cli_agent_orchestrator.services import approval_store
+from cli_agent_orchestrator.services.settings_service import is_workflow_approval_required
+from cli_agent_orchestrator.utils.git_baseline import normalize_unavailable_reason
+
+logger = logging.getLogger(__name__)
+
+SCRIPT_TIER = "script"
+
+
+_IDENTITY_PREFIX = (
+    "CAO could not compute a plan identifier for this run, so there is nothing to approve. "
+)
+_IDENTITY_MESSAGES = {
+    "untracked_too_large": "The working directory has more than 64 MiB of untracked files that are not gitignored, which is more than CAO fingerprints. Gitignore or commit them, or run from a different working directory. Repeating the run will not help.",
+    "untracked_unsupported": "Its untracked files include an unreadable or unsupported entry (a FIFO, socket or device, or a path under a symlinked directory). Remove or gitignore it. Repeating the run will not help.",
+    "repository_unreadable": "Git could not read the repository there. It may have no commits yet, or git may refuse it (for example a safe.directory check). Make sure `git rev-parse HEAD` succeeds in that directory. Repeating the run will not help.",
+    "git_unavailable": "Git could not be run in the working directory (git is missing, or the server cannot read the directory). Repeating the run will not help.",
+    "git_timeout": "A git command there did not finish within 10 seconds. Retry once; if it fails again, run from a smaller working directory.",
+    "changed_during_snapshot": "Files changed while CAO was reading them. Retry.",
+    "internal": "This is a CAO-side failure. Retry; if it repeats, check the server log.",
+    "no_recorded_identity": "This run was started without a recorded plan identity (before approval was enforced, or on an older CAO), so it cannot be resumed while approval is enforced. Start a new run.",
+    "profiles_unreadable": "Could not read the agent profile set for this script run, so its approval cannot be bound.",
+}
+
+
+def _identity_message(reason: str) -> str:
+    reason = normalize_unavailable_reason(reason)
+    if reason == "profiles_unreadable":
+        return _IDENTITY_MESSAGES[reason]
+    return _IDENTITY_PREFIX + _IDENTITY_MESSAGES[reason]
+
+
+class PlanApprovalRequiredError(Exception):
+    """A script-tier run was refused because its ``plan_id`` has no approval.
+
+    DELIBERATELY NOT A ``ValueError``. The API's resume handler ends with ``except ValueError -> 400``,
+    so subclassing it would silently transport this as a bad request. It is also deliberately NOT
+    ``ResumeNotAllowedError`` (409): that means "this run cannot be resumed" — a fact about the run —
+    whereas this is a fact about the PLAN, and the operator's next action is entirely different
+    (approve a ``plan_id`` versus investigate a stuck run). ``unit-of-work.md`` names this seam: the
+    failure must be "distinguishable from an ordinary execution error so a caller can tell 'needs
+    approval' from 'the run broke'". Transported as 403.
+
+    ``plan_id`` is carried explicitly because it is the operator's ONLY handle on what to approve. It
+    is ``None`` only when the manifest was absent or unparseable, and the message says so.
+    """
+
+    def __init__(self, message: str, plan_id: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.plan_id = plan_id
+
+
+class PlanIdentityUnavailableError(PlanApprovalRequiredError):
+    """No plan identifier could be read from the run's frozen manifest (issue #583 Bolt 3).
+
+    THE CALLER DID NOTHING WRONG, WHICH IS THE WHOLE REASON THIS TYPE EXISTS. A NULL or unparseable
+    manifest means ``manifest_freeze.build_manifest_json`` failed — CAO could not complete its own
+    freeze. Reporting that as 403 asserts the caller lacked permission and sends an operator looking
+    for an approval to grant, when the message must explain the cause and whether retrying can help. The API transports this as **503**
+    and its parent as 403, so the difference is visible to every HTTP client without parsing prose.
+
+    DELIBERATELY A SUBCLASS OF :class:`PlanApprovalRequiredError`, so the change is additive: every
+    existing ``except PlanApprovalRequiredError`` site keeps catching this condition and no path can
+    start returning an unhandled 500. The corollary is an ORDERING REQUIREMENT at each handler — the
+    narrow clause must precede the broad one, because Python matches ``except`` clauses in order and
+    the wrong order silently returns 403, which READS AS CORRECT rather than failing.
+
+    ``plan_id`` is inherited and is ALWAYS ``None`` for this type, by definition of the condition:
+    the identifier that is the operator's only handle on what to approve is exactly what could not
+    be read. The attribute is kept rather than removed because narrowing a parent's contract in a
+    subclass would be the worse trade.
+    """
+
+    def __init__(
+        self, message: str, plan_id: Optional[str] = None, *, reason: str = "internal"
+    ) -> None:
+        super().__init__(message, plan_id=None)
+        self.reason = normalize_unavailable_reason(reason)
+
+
+class PlanApprovalUnavailableError(Exception):
+    """Approval could not be checked because the store is unavailable.
+
+    Refuse the run with HTTP 503 so callers can distinguish a database fault from
+    a missing approval (403). Neither condition permits execution.
+    """
+
+    def __init__(self, message: str, plan_id: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.plan_id = plan_id
+
+
+def plan_id_from_manifest(manifest_json: Optional[str]) -> Optional[str]:
+    """Extract ``plan_id`` from a frozen manifest, or ``None`` if it cannot be read.
+
+    Total by design: a malformed manifest is an expected condition here, not an error. Every way this
+    can answer ``None`` converges on a refusal at :func:`ensure_plan_approved`, so absence never
+    becomes permission.
+
+    NEVER RECOMPUTES the identifier. On resume, recomputation would re-read the script from disk, so a
+    source edit between start and resume would produce a different ``plan_id`` and refuse a run whose
+    approval is perfectly valid for what it actually froze. Rejecting a stale source hash is a
+    separate mechanism, deferred to Bolt 3. Using one extraction on both paths also means the start
+    and resume gates cannot disagree about what the identifier is.
+    """
+    if not manifest_json:
+        return None
+    try:
+        document = json.loads(manifest_json)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    plan_id = document.get("plan_id")
+    return plan_id if isinstance(plan_id, str) and plan_id else None
+
+
+def ensure_plan_approved(
+    *, tier: str, manifest_json: Optional[str], unavailable_reason: Optional[str] = None
+) -> None:
+    """Refuse missing approval or an unavailable approval store before execution.
+
+    Returns ``None`` on every permitted path. Called from three places — the async start arm, the
+    blocking start arm, and resume admission — as ONE function rather than three inline checks,
+    because three copies of an authorisation check is three chances for one to drift, and both start
+    arms must agree or a run's approvability would depend on which route started it.
+
+    Raises :class:`PlanIdentityUnavailableError` when the manifest carries no readable identifier,
+    :class:`PlanApprovalRequiredError` when the identifier is unapproved, and
+    :class:`PlanApprovalUnavailableError` when the approval store cannot be read.
+
+    Two independent gates on applicability, both kept on purpose. The tier check is structural and
+    the setting is operational; either alone would satisfy C-1's letter. THE FLIP OF THE DEFAULT HAS
+    NOW HAPPENED (Bolt 3, ``approval-enforcement-default``) and the tier check is why it did not
+    start gating YAML — which is exactly what keeping both was for.
+    """
+    if tier != SCRIPT_TIER:
+        return
+    if not is_workflow_approval_required():
+        # Explicitly disabled in settings; do not consult the approval store.
+        return
+
+    plan_id = plan_id_from_manifest(manifest_json)
+    if plan_id is None:
+        # Fail closed, exactly as both freeze call sites already promise in writing. A freeze that
+        # failed wrote NULL, and NULL is indistinguishable from a YAML run at the column level — but
+        # not here, because the tier already told us this is a script run.
+        logger.warning(
+            "workflow approval gate: refusing a script run with no readable plan_id in its "
+            "frozen manifest (approval is required by settings)"
+        )
+        reason = normalize_unavailable_reason(unavailable_reason)
+        raise PlanIdentityUnavailableError(_identity_message(reason), reason=reason)
+
+    state = approval_store.approval_state(plan_id)
+    if state == approval_store.APPROVED:
+        return
+
+    if state == approval_store.UNKNOWN:
+        logger.error("workflow approval store unavailable for plan_id %s", plan_id)
+        raise PlanApprovalUnavailableError(
+            f"Could not read the approval store for plan '{plan_id}'. "
+            "The run was refused. Restore database access and retry.",
+            plan_id=plan_id,
+        )
+
+    # state == ABSENT — a genuine absence of approval.
+    # A control that refuses without saying which plan cannot be operated. plan_id is an opaque
+    # digest, so logging it adds nothing sensitive.
+    logger.warning("workflow approval gate: refusing unapproved plan_id %s", plan_id)
+    raise PlanApprovalRequiredError(
+        f"Plan '{plan_id}' needs human approval before it can run: "
+        + f"an operator approves it with `cao workflow approve {plan_id}`, then runs it again. "
+        + "A plan_id is computed at run start, so the first run of a new or changed plan "
+        + "is refused by design.",
+        plan_id=plan_id,
+    )

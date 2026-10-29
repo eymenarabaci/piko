@@ -2402,8 +2402,11 @@ function applySettings() {
   updateBackendNote();
   $('#timeout-seconds').value = state.settings.timeout_seconds || 900;
   $('#max-parallel').value = state.settings.max_parallel || 4;
-  $('#workspace-summary').textContent = state.settings.workspace || state.bootstrap?.workspace_default || 'Proje klasörünü ayarlayın';
-  $('#workspace-summary').title = $('#workspace-summary').textContent;
+  const workspaceSummary = $('#workspace-summary');
+  if (workspaceSummary) {
+    workspaceSummary.textContent = state.settings.workspace || state.bootstrap?.workspace_default || 'Proje klasörünü ayarlayın';
+    workspaceSummary.title = workspaceSummary.textContent;
+  }
 }
 
 function openSettings() {

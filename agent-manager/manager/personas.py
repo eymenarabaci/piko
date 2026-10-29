@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 
 class PersonaManager:
@@ -23,6 +26,25 @@ class PersonaManager:
                 d.mkdir(parents=True, exist_ok=True)
             except Exception:
                 pass
+        self._seed_default_personas()
+
+    def _seed_default_personas(self) -> None:
+        """Copy tracked defaults into CAO runtime store without overwriting user edits."""
+        sources = (
+            self.workspace_root / "vendor" / "cao-upstream" / "src" / "cli_agent_orchestrator" / "agent_store",
+            self.workspace_root / "agent-manager" / "default-personas",
+        )
+        for source in sources:
+            if not source.is_dir():
+                continue
+            for profile in source.glob("*.md"):
+                target = self.cao_agent_store_dir / profile.name
+                if target.exists():
+                    continue
+                try:
+                    target.write_bytes(profile.read_bytes())
+                except OSError:
+                    pass
 
     def list_skills(self) -> list[dict[str, str]]:
         """List built-in skills available in the project, including vendor skills."""
@@ -57,18 +79,10 @@ class PersonaManager:
         return skills
 
     def list_mcps(self) -> list[dict[str, str]]:
-        """List supported MCP servers configured in orchestrator catalog."""
-        try:
-            from orchestrator.mcp_catalog import SPECS
-            return [{"id": name, "capabilities": spec[0]} for name, spec in SPECS.items()]
-        except Exception:
-            return [
-                {"id": "firebase", "capabilities": "firebase cloud backend"},
-                {"id": "github", "capabilities": "git github repository"},
-                {"id": "playwright", "capabilities": "browser testing frontend"},
-                {"id": "sqlite", "capabilities": "database sqlite analysis"},
-                {"id": "context7", "capabilities": "documentation research"},
-            ]
+        """Report MCP packages that are actually installed in this export."""
+        from .mcp_catalog import list_installed_mcps
+
+        return list_installed_mcps(self.workspace_root)
 
     def _get_skill_desc(self, readme_path: Path) -> str:
         if readme_path.is_file():
@@ -153,6 +167,24 @@ class PersonaManager:
     def get_persona(self, name: str) -> dict[str, Any] | None:
         all_p = {p["name"]: p for p in self.list_personas()}
         return all_p.get(name)
+
+    def create_mcp_session_persona(self, name: str, servers: dict[str, dict]) -> tuple[str, Path]:
+        """Give one CAO step its own MCP profile without changing shared personas."""
+        base = self.ensure_persona_in_cao(name)
+        source = Path(base["file_path"]).read_text(encoding="utf-8")
+        parts = source.split("---", 2)
+        if len(parts) != 3 or parts[0].strip():
+            raise ValueError("CAO persona ön bilgisi geçersiz.")
+        metadata = yaml.safe_load(parts[1]) or {}
+        if not isinstance(metadata, dict):
+            raise ValueError("CAO persona ön bilgisi geçersiz.")
+        session_name = f"mcp_{uuid.uuid4().hex}"
+        metadata["name"] = session_name
+        metadata["mcpServers"] = {**(metadata.get("mcpServers") or {}), **servers}
+        target = self.cao_agent_store_dir / f"{session_name}.md"
+        target.write_text("---\n" + yaml.safe_dump(metadata, allow_unicode=True, sort_keys=False)
+                          + "---" + parts[2], encoding="utf-8")
+        return session_name, target
 
     def ensure_persona_in_cao(
         self, name: str, instructions: str = "", skills: list[str] | None = None, is_writer: bool = True

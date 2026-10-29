@@ -1,0 +1,196 @@
+"""Skill catalog injection helpers for installed Copilot agent files.
+
+Kiro CLI uses native ``skill://`` resources with progressive loading, so it
+does not need prompt-based catalog baking or refresh-on-skill-change.
+"""
+
+import logging
+from pathlib import Path
+from typing import Iterator, List, Optional
+
+import frontmatter
+
+from cli_agent_orchestrator.constants import (
+    AGENT_CONTEXT_DIR,
+    COPILOT_AGENTS_DIR,
+)
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.utils import agent_profiles
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
+from cli_agent_orchestrator.utils.path_validation import (
+    flatten_path_separators,
+    validate_path_component,
+)
+from cli_agent_orchestrator.utils.skills import build_skill_catalog
+
+logger = logging.getLogger(__name__)
+
+
+def compose_agent_prompt(profile: AgentProfile, base_prompt: Optional[str] = None) -> Optional[str]:
+    """Compose the baked prompt from profile prompt and global skill catalog.
+
+    When *base_prompt* is provided it is used instead of ``profile.prompt``.
+    This is needed for providers like Copilot where the effective prompt is
+    resolved from ``system_prompt`` falling back to ``prompt``.
+    """
+    parts: list[str] = []
+
+    if base_prompt is not None:
+        effective = base_prompt.strip()
+    else:
+        effective = profile.prompt.strip() if profile.prompt else ""
+
+    if effective:
+        parts.append(effective)
+
+    # Unfiltered on purpose: this baked/native path (Q CLI, Copilot) advertises
+    # the full catalog. Per-agent `skills` scoping applies only to the
+    # runtime-prompt providers, which build their catalog in terminal_service.
+    catalog = build_skill_catalog()
+    if catalog:
+        parts.append(catalog)
+
+    if not parts:
+        return None
+
+    return "\n\n".join(parts)
+
+
+def refresh_agent_md_prompt(md_path: Path, profile: AgentProfile) -> bool:
+    """Atomically rewrite the body of one installed Copilot ``.agent.md`` file.
+
+    Preserves the YAML frontmatter (name, description) while replacing the
+    Markdown body with the composed prompt (profile base prompt + skill catalog).
+
+    The whole load-recompute-replace cycle runs under the same
+    inter-process lock ``locked_atomic_rewrite`` uses for ``md_path``, so a
+    concurrent refresh of the same file (another CLI invocation, or
+    cao-server handling two profile-change events back to back) can never
+    interleave temp files or publish a half-written file — the same failure
+    mode fixed for the memory plugins in ``plugins/builtin/*_memory.py``.
+    """
+    for name in (profile.name, md_path.name.removesuffix(".agent.md")):
+        if agent_profiles.routes_to_ephemeral_store(name):
+            raise FileNotFoundError(f"Reserved ephemeral profile name: {name}")
+
+    if not md_path.exists():
+        return False
+
+    def compute_new_content(_existing: str) -> str:
+        # Re-read via frontmatter.load() (not `_existing`) because we need the
+        # parsed YAML frontmatter structure, not raw text, and the read must
+        # happen inside the lock to avoid racing a concurrent writer's replace.
+        post = frontmatter.load(md_path)
+        system_prompt = profile.system_prompt.strip() if profile.system_prompt else ""
+        base = system_prompt or (profile.prompt.strip() if profile.prompt else "")
+        new_body = compose_agent_prompt(profile, base_prompt=base)
+        post.content = (new_body or "").rstrip()
+        return frontmatter.dumps(post)
+
+    locked_atomic_rewrite(md_path, compute_new_content)
+    return True
+
+
+def refresh_installed_agent_for_profile(profile_name: str) -> List[Path]:
+    """Refresh installed Copilot agents for one source profile."""
+    profile = load_agent_profile(profile_name)
+    # Flatten both separators (see install_service): this filename derives from
+    # the attacker-controlled resolved profile name, and a backslash is a
+    # separator on Windows. Defence in depth — install now rejects a
+    # separator-bearing name, so such a profile cannot have been installed.
+    safe_name = flatten_path_separators(profile.name)
+    refreshed_paths: List[Path] = []
+
+    copilot_path = COPILOT_AGENTS_DIR / f"{safe_name}.agent.md"
+    if refresh_agent_md_prompt(copilot_path, profile):
+        refreshed_paths.append(copilot_path)
+
+    return refreshed_paths
+
+
+def refresh_all_cao_managed_agents() -> List[Path]:
+    """Refresh every installed Copilot agent managed by CAO."""
+    refreshed_paths: List[Path] = []
+
+    # Copilot .agent.md agents — identified by matching context file in AGENT_CONTEXT_DIR
+    for md_path in _iter_installed_copilot_agents():
+        post = frontmatter.load(md_path)
+        profile_name = post.metadata.get("name")
+        if not isinstance(profile_name, str) or not profile_name:
+            logger.warning("Skipping Copilot agent with missing name: %s", md_path)
+            continue
+
+        if not _is_cao_managed_copilot_agent(profile_name):
+            continue
+
+        if any(
+            agent_profiles.routes_to_ephemeral_store(name)
+            for name in (md_path.name.removesuffix(".agent.md"), profile_name)
+        ):
+            logger.warning(
+                "Skipping CAO-managed Copilot agent '%s' at %s: reserved ephemeral profile name",
+                profile_name,
+                md_path,
+            )
+            continue
+
+        try:
+            profile = load_agent_profile(profile_name)
+        except Exception as exc:
+            logger.warning(
+                "Skipping CAO-managed Copilot agent '%s' at %s: "
+                "source profile could not be loaded: %s",
+                profile_name,
+                md_path,
+                exc,
+            )
+            continue
+
+        if agent_profiles.routes_to_ephemeral_store(profile.name):
+            logger.warning(
+                "Skipping CAO-managed Copilot agent '%s' at %s: reserved ephemeral profile name",
+                profile.name,
+                md_path,
+            )
+            continue
+
+        if refresh_agent_md_prompt(md_path, profile):
+            refreshed_paths.append(md_path)
+
+    return refreshed_paths
+
+
+def _iter_installed_copilot_agents() -> Iterator[Path]:
+    """Yield installed Copilot ``.agent.md`` files."""
+    if not COPILOT_AGENTS_DIR.exists():
+        return
+    yield from sorted(COPILOT_AGENTS_DIR.glob("*.agent.md"))
+
+
+def _is_cao_managed_copilot_agent(name: str) -> bool:
+    """Return True when a corresponding CAO context file exists for this agent name.
+
+    ``name`` comes from the frontmatter of a file already sitting in the Copilot
+    agents directory, so it is not trusted. Validate it as a single path segment
+    before joining: an unsafe name simply is not CAO-managed (install would have
+    refused to write its context copy), so returning False is both correct and
+    keeps a traversal out of the join.
+    """
+    try:
+        safe_name = validate_path_component(name, description="agent name")
+    except ValueError:
+        return False
+    # Same directories the install writer and the ownership guard use: the
+    # configured ``agents.dirs.cao_installed`` when it departs from its default,
+    # plus the default itself while an override is active, because copies
+    # written before the writer honoured the setting live there (see
+    # settings_service.installed_context_lookup_dirs).
+    from cli_agent_orchestrator.services.settings_service import (
+        installed_context_lookup_dirs,
+    )
+
+    return any(
+        (context_dir / f"{safe_name}.md").exists()
+        for context_dir in installed_context_lookup_dirs(AGENT_CONTEXT_DIR)
+    )

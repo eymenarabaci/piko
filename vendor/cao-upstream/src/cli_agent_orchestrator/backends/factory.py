@@ -1,0 +1,97 @@
+"""BackendFactory — constructs the configured TerminalBackend at startup.
+
+Reads `terminal.backend` via ConfigService (CLI flag > CAO_TERMINAL_BACKEND
+env var > settings.json > "tmux" default). "herdr" is opt-in and experimental.
+"""
+
+import logging
+from typing import Optional
+
+from cli_agent_orchestrator.backends.base import TerminalBackend
+from cli_agent_orchestrator.services.config_service import (
+    DEFAULT_TERMINAL_BACKEND,
+    ConfigService,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class ConfigurationError(Exception):
+    """Raised when the backend configuration is invalid."""
+
+    pass
+
+
+class BackendFactory:
+    """Factory that reads config and returns the appropriate backend instance."""
+
+    @staticmethod
+    def create(backend_override: Optional[str] = None) -> TerminalBackend:
+        """Create a TerminalBackend based on configuration.
+
+        Args:
+            backend_override: Explicit backend name that takes precedence over
+                both the ``CAO_TERMINAL_BACKEND`` env var and the config file
+                (e.g. from ``cao-server --terminal herdr``). Other keys (such
+                as ``herdr_session``) are still resolved normally.
+
+        Returns:
+            A configured TerminalBackend instance
+
+        Raises:
+            ConfigurationError: If terminal_backend value is unrecognized
+        """
+        backend_name = ConfigService.get(
+            "terminal.backend", default=DEFAULT_TERMINAL_BACKEND, override=backend_override
+        )
+
+        if backend_name == "tmux":
+            from cli_agent_orchestrator.backends.tmux_backend import (
+                DEFAULT_PANE_WINDOW,
+                SPAWN_MODES,
+                TmuxBackend,
+            )
+            from cli_agent_orchestrator.clients.tmux import (
+                DEFAULT_PANE_LAYOUT,
+                PANE_LAYOUTS,
+            )
+
+            spawn_mode = ConfigService.get("terminal.spawn_mode", default="window")
+            if spawn_mode not in SPAWN_MODES:
+                logger.warning(
+                    f"Unknown terminal.spawn_mode '{spawn_mode}'; expected one of "
+                    f"{', '.join(sorted(SPAWN_MODES))}. Falling back to 'window'."
+                )
+                spawn_mode = "window"
+
+            pane_layout = ConfigService.get("terminal.pane_layout", default=DEFAULT_PANE_LAYOUT)
+            if pane_layout not in PANE_LAYOUTS:
+                logger.warning(
+                    f"Unknown terminal.pane_layout '{pane_layout}'; expected one of "
+                    f"{', '.join(sorted(PANE_LAYOUTS))}. Falling back to '{DEFAULT_PANE_LAYOUT}'."
+                )
+                pane_layout = DEFAULT_PANE_LAYOUT
+
+            return TmuxBackend(
+                spawn_mode=spawn_mode,
+                pane_window=ConfigService.get("terminal.pane_window", default=DEFAULT_PANE_WINDOW),
+                pane_layout=pane_layout,
+            )
+        elif backend_name == "herdr":
+            from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+            herdr_session = ConfigService.get("terminal.herdr_session", default="cao")
+            logger.info(
+                "[EXPERIMENTAL] terminal_backend='herdr' is experimental. "
+                "Report issues at https://github.com/awslabs/cli-agent-orchestrator/issues"
+            )
+            return HerdrBackend(herdr_session=herdr_session)
+        elif backend_name == "windows":
+            from cli_agent_orchestrator.backends.windows_backend import WindowsBackend
+
+            return WindowsBackend()
+        else:
+            raise ConfigurationError(
+                f"Unknown terminal_backend: '{backend_name}'. "
+                f"Valid options are: 'tmux', 'herdr' [EXPERIMENTAL], 'windows'"
+            )

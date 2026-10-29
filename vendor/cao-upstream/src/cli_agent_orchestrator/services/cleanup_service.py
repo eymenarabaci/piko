@@ -1,0 +1,433 @@
+"""Cleanup service for old terminals, messages, and logs."""
+
+import logging
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome
+from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.clients.database import (
+    IdempotencyKeyModel,
+    InboxModel,
+    SessionLocal,
+    TerminalModel,
+    delete_old_handoff_results,
+)
+from cli_agent_orchestrator.constants import (
+    LOG_DIR,
+    MEMORY_BASE_DIR,
+    RETENTION_DAYS,
+    TERMINAL_LOG_DIR,
+)
+from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.services.output_stream import output_stream_manager
+from cli_agent_orchestrator.services.memory_format import parse_index_entry
+from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+logger = logging.getLogger(__name__)
+
+
+def stale_terminal_runtime_is_live(terminal: TerminalModel) -> bool:
+    """Is the agent behind this aged-out registry row still running? (#708)
+
+    Retention selects rows on ``last_active``, which is written ONLY on input
+    delivery (``send_input`` / ``send_special_key``), so a perfectly healthy
+    agent that nobody has messaged for ``RETENTION_DAYS`` is indistinguishable
+    by that column from an abandoned one. Deleting its row does not stop it --
+    ``delete_terminal_row`` drops the registry record without killing the tmux
+    window or the provider process -- but it does make it permanently
+    UNADDRESSABLE: ``create_inbox_message`` rejects a receiver with no row, and
+    ``list_pending_receiver_ids_older_than`` inner-joins ``terminals``, so every
+    message already PENDING for that receiver silently leaves the
+    reconciliation sweep forever while still reporting PENDING.
+
+    Fails CLOSED. ``cleanup_terminal_exact(..., close=False)`` proves identity
+    from the terminal's own ``@cao_terminal_id`` option rather than its
+    (reusable) session/window name, and only ``ABSENT`` -- positive proof no
+    live object carries this id -- is read as "gone". Both ``STILL_PRESENT``
+    and ``UNKNOWN`` (an unreadable listing, an ambiguous identity, or any
+    other unanswerable lookup) are treated as live and retained, because a
+    wrong "gone" is irreversible and silent whereas a wrong "live" only
+    defers the row's deletion to the next sweep.
+    """
+    backend = get_backend()
+    terminal_id = str(terminal.id)
+    session_name = str(terminal.tmux_session)
+    window_name = str(terminal.tmux_window)
+    try:
+        result = backend.cleanup_terminal_exact(terminal_id, session_name, window_name, close=False)
+    except Exception as exc:  # noqa: BLE001 — unanswerable liveness fails closed
+        logger.warning(
+            "Could not establish liveness for stale terminal %s (%s:%s); retaining it: %s",
+            terminal_id,
+            session_name,
+            window_name,
+            exc,
+        )
+        return True
+
+    if result.outcome == TerminalCleanupOutcome.ABSENT:
+        return False
+    if result.outcome == TerminalCleanupOutcome.UNKNOWN:
+        logger.warning(
+            "Could not establish liveness for stale terminal %s (%s:%s); retaining it: %s",
+            terminal_id,
+            session_name,
+            window_name,
+            result.detail,
+        )
+    return True
+
+
+def cleanup_old_data():
+    """Clean up terminals, inbox messages, and log files older than RETENTION_DAYS."""
+    try:
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+        logger.info(
+            f"Starting cleanup of data older than {RETENTION_DAYS} days (before {cutoff_date})"
+        )
+
+        # Clean up old terminals. Deferred-init external-owner/failure rows are
+        # lifecycle tombstones: age alone must never erase failure truth before
+        # the external owner acknowledges it. Ordinary stale rows keep the
+        # historical FIFO/status/Grok cleanup posture, but row deletion now
+        # flows through terminal_service.delete_terminal_row so lifecycle
+        # sidecars are removed atomically with the registry record instead of
+        # being orphaned by a bulk SQL DELETE.
+        with SessionLocal() as db:
+            old_terminals = list(
+                db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).all()
+            )
+
+        from cli_agent_orchestrator.services import terminal_service
+
+        deleted_terminals = 0
+        for terminal in old_terminals:
+            terminal_id = str(terminal.id)
+            try:
+                if terminal_service.should_retain_deferred_failure_tombstone(terminal_id):
+                    logger.info(
+                        "Retaining old deferred-init terminal %s until external-owner cleanup",
+                        terminal_id,
+                    )
+                    continue
+            except Exception as exc:  # noqa: BLE001 — uncertain ownership fails closed
+                logger.warning(
+                    "Could not establish deferred-init ownership for stale terminal %s; "
+                    "retaining it: %s",
+                    terminal_id,
+                    exc,
+                )
+                continue
+
+            # Age is not death (#708). A live agent's row is the only thing
+            # that makes it addressable, so never age one out.
+            if stale_terminal_runtime_is_live(terminal):
+                logger.info(
+                    "Retaining aged-out terminal %s: its runtime is still live", terminal_id
+                )
+                continue
+
+            backend = get_backend()
+            if backend.supports_output_stream():
+                output_stream_manager.stop(terminal_id)
+            elif not backend.supports_event_inbox():
+                fifo_manager.stop_reader(terminal_id)
+            status_monitor.clear_terminal(terminal_id)
+            if (
+                terminal.provider == ProviderType.GROK_CLI.value
+                and provider_manager.cleanup_provider(terminal_id) is False
+            ):
+                logger.warning(
+                    "Retaining stale Grok terminal %s while cleanup is deferred", terminal_id
+                )
+                continue
+
+            try:
+                metadata = terminal_service.get_terminal_metadata(terminal_id)
+                if terminal_service.delete_terminal_row(terminal_id, metadata, registry=None):
+                    deleted_terminals += 1
+            except Exception as exc:  # noqa: BLE001 — retention sweep is best-effort
+                logger.warning("Failed to delete stale terminal %s: %s", terminal_id, exc)
+
+        logger.info(f"Deleted {deleted_terminals} old terminals from database")
+
+        # Clean up old inbox messages
+        with SessionLocal() as db:
+            deleted_messages = (
+                db.query(InboxModel).filter(InboxModel.created_at < cutoff_date).delete()
+            )
+            db.commit()
+            logger.info(f"Deleted {deleted_messages} old inbox messages from database")
+
+        # Clean up old idempotency-key mappings (review on PR #634, issue
+        # #616): these are never swept elsewhere, so without this they grow
+        # unbounded with terminal-creation rate.
+        with SessionLocal() as db:
+            deleted_keys = (
+                db.query(IdempotencyKeyModel)
+                .filter(IdempotencyKeyModel.created_at < cutoff_date)
+                .delete()
+            )
+            from cli_agent_orchestrator.decisions.settings import load_settings
+            from cli_agent_orchestrator.decisions.store import DecisionStore
+
+            try:
+                decision_cutoff = datetime.now(timezone.utc) - timedelta(
+                    days=load_settings().retention_days
+                )
+                DecisionStore(sessions=SessionLocal).purge(before=decision_cutoff, session=db)
+            except Exception:
+                logger.warning("Failed to clean up old decision records")
+            db.commit()
+            logger.info(f"Deleted {deleted_keys} old idempotency keys from database")
+
+        # Clean up old terminal log files
+        terminal_logs_deleted = 0
+        if TERMINAL_LOG_DIR.exists():
+            for pattern in ("*.log", "*.scrollback", "*.snapshot.json"):
+                for log_file in TERMINAL_LOG_DIR.glob(pattern):
+                    if log_file.stat().st_mtime < cutoff_date.timestamp():
+                        log_file.unlink()
+                        terminal_logs_deleted += 1
+        logger.info(f"Deleted {terminal_logs_deleted} old terminal log files")
+
+        # Clean up old server log files
+        server_logs_deleted = 0
+        if LOG_DIR.exists():
+            for log_file in LOG_DIR.glob("*.log"):
+                if log_file.stat().st_mtime < cutoff_date.timestamp():
+                    log_file.unlink()
+                    server_logs_deleted += 1
+        logger.info(f"Deleted {server_logs_deleted} old server log files")
+
+        # Clean up old handoff result records (issue #447).
+        handoff_cutoff = cutoff_date
+        try:
+            deleted_handoff = delete_old_handoff_results(handoff_cutoff)
+            logger.info(f"Deleted {deleted_handoff} old handoff result records")
+        except Exception as e:
+            logger.warning(f"Failed to clean up old handoff results: {e}")
+
+        logger.info("Cleanup completed successfully")
+
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+
+
+# =============================================================================
+# Memory Cleanup — tiered retention
+# =============================================================================
+
+# Scope-keyed retention policy. ``user`` and ``feedback`` memory_types
+# are operator-curated and stay forever regardless of scope. Anything
+# else expires per the scope of the entry.
+SCOPE_RETENTION_DAYS: dict[str, int | None] = {
+    "global": None,
+    "agent": None,
+    "project": 90,
+    "session": 14,
+    "federated": None,
+}
+PERMANENT_MEMORY_TYPES: frozenset[str] = frozenset({"user", "feedback"})
+
+
+async def cleanup_expired_memories() -> None:
+    """Delete expired memories based on scope-keyed retention policy.
+
+    - session scope: 14 days
+    - project scope: 90 days
+    - global scope:  never expires
+    - agent scope:   never expires
+    - memory_type ``user`` or ``feedback``: never expires (regardless of scope)
+
+    Idempotent — safe to run multiple times.
+    """
+    import asyncio
+
+    try:
+        now = datetime.now(timezone.utc)
+        expired_count = 0
+
+        if not MEMORY_BASE_DIR.exists():
+            return
+
+        # Lazy-import to avoid circular imports at module level
+        from cli_agent_orchestrator.services.memory_service import MemoryService
+        from cli_agent_orchestrator.services.vault.binding import (
+            ScopeBinding,
+            VaultBinding,
+            VaultConfigUnavailableError,
+            _load_vault_config,
+            resolve,
+        )
+
+        memory_service = MemoryService(base_dir=MEMORY_BASE_DIR)
+        try:
+            vault_config = _load_vault_config()
+        except VaultConfigUnavailableError as exc:
+            logger.warning(
+                "vault configuration unavailable; expiring native copies only: %s",
+                exc,
+            )
+            vault_config = None
+        resolved_bindings: dict[tuple[str, str | None], ScopeBinding] = {}
+        refused_bindings: set[tuple[str, str | None]] = set()
+
+        # Walk project dirs: {MEMORY_BASE_DIR}/{project_dir}/wiki/index.md
+        # Glob and parse are sync I/O; offload to a thread so the event
+        # loop stays responsive when there are many projects.
+        index_paths = await asyncio.to_thread(lambda: list(MEMORY_BASE_DIR.glob("*/wiki/index.md")))
+        for index_path in index_paths:
+            expired_entries = await asyncio.to_thread(_find_expired_entries, index_path, now)
+            if not expired_entries:
+                continue
+
+            # Extract scope_id from path: .../memory/{scope_id}/wiki/index.md
+            # "global"/"federated" dirs → scope_id=None (flat, machine-wide),
+            # project hash dirs → scope_id=hash
+            project_dir_name = index_path.parent.parent.name
+            scope_id = None if project_dir_name in ("global", "federated") else project_dir_name
+
+            for entry in expired_entries:
+                try:
+                    # Prefer the entry's own scope_id (parsed from the
+                    # nested wiki path) so per-session and per-agent
+                    # files resolve correctly. Fall back to the
+                    # container's scope_id otherwise.
+                    effective_scope_id = entry.get("scope_id") or scope_id
+                    binding_key = (entry["scope"], effective_scope_id)
+                    target = "native"
+                    if vault_config is not None:
+                        resolved_binding = resolved_bindings.get(binding_key)
+                        if resolved_binding is None:
+                            resolved_binding = resolve(
+                                entry["scope"],
+                                effective_scope_id,
+                                vault_config=vault_config,
+                            )
+                            resolved_bindings[binding_key] = resolved_binding
+
+                        if isinstance(resolved_binding, VaultBinding):
+                            if binding_key not in refused_bindings:
+                                logger.warning(
+                                    "vault-bound memory retention preserves vault note "
+                                    "scope=%s scope_id=%s",
+                                    entry["scope"],
+                                    effective_scope_id,
+                                )
+                                refused_bindings.add(binding_key)
+                        else:
+                            target = "binding"
+                    # ``forget()`` is declared async but its body is
+                    # sync FS work (unlink + flock + index rewrite).
+                    # Offload to a thread so the event loop stays
+                    # responsive when many entries expire.
+                    await asyncio.to_thread(
+                        _forget_sync,
+                        memory_service,
+                        entry["key"],
+                        entry["scope"],
+                        effective_scope_id,
+                        target,
+                    )
+                    expired_count += 1
+                    logger.info(
+                        f"Expired memory: key={entry['key']} scope={entry['scope']} "
+                        f"type={entry['memory_type']}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to expire memory key={entry['key']}: {e}")
+
+        if expired_count > 0:
+            logger.info(f"Memory cleanup: expired {expired_count} memories")
+        else:
+            logger.debug("Memory cleanup: no expired memories found")
+
+    except Exception as e:
+        logger.error(f"Error during memory cleanup: {e}")
+
+
+def _forget_sync(
+    memory_service, key: str, scope: str, scope_id: str | None, target: str = "binding"
+) -> None:
+    """Run MemoryService.forget() synchronously in a worker thread.
+
+    forget() is declared async but its body is sync; we invoke it
+    via asyncio.run inside the worker thread so the outer event
+    loop is not blocked by the unlink + flock + index rewrite.
+    """
+    import asyncio as _asyncio
+
+    _asyncio.run(memory_service.forget(key=key, scope=scope, scope_id=scope_id, target=target))
+
+
+def _find_expired_entries(index_path: Path, now: datetime) -> list[dict]:
+    """Parse an index.md and return entries that have exceeded their retention."""
+    expired: list[dict] = []
+
+    try:
+        content = index_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return expired
+
+    current_scope: str | None = None
+
+    for line in content.splitlines():
+        # Detect scope section headers: ## global, ## session, etc.
+        if line.startswith("## "):
+            section = line[3:].strip()
+            if section in ("global", "project", "session", "agent", "federated"):
+                current_scope = section
+            continue
+
+        if not current_scope:
+            continue
+
+        # Parse entry: - [key](scope/key.md) — type:X tags:Y ~Ntok updated:Z
+        match = parse_index_entry(line)
+        if not match:
+            continue
+
+        key = match.group("key")
+        relative_path = match.group("path")
+        memory_type = match.group("type")
+        updated_str = match.group("updated")
+
+        # Extract scope_id from nested path for session/agent scopes:
+        #   session/<scope_id>/<key>.md  →  scope_id
+        # Flat paths (project, global) leave entry_scope_id = None.
+        entry_scope_id: str | None = None
+        path_parts = relative_path.split("/")
+        if len(path_parts) >= 3 and path_parts[0] in ("session", "agent"):
+            entry_scope_id = path_parts[1]
+
+        # Parse updated_at timestamp
+        try:
+            updated_at = datetime.strptime(updated_str, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            continue
+
+        age_days = (now - updated_at).days
+
+        # ``user`` and ``feedback`` memory_types are curated knowledge;
+        # they never expire regardless of scope.
+        if memory_type in PERMANENT_MEMORY_TYPES:
+            continue
+
+        retention_days = SCOPE_RETENTION_DAYS.get(current_scope)
+        if retention_days is not None and age_days > retention_days:
+            expired.append(
+                {
+                    "key": key,
+                    "scope": current_scope,
+                    "scope_id": entry_scope_id,
+                    "memory_type": memory_type,
+                }
+            )
+
+    return expired

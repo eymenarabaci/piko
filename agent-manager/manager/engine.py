@@ -22,6 +22,7 @@ from .adaptive import (MAX_ADAPTATIONS, build_adaptive_prompt, extend_plan,
 from .ao import AOClient
 from .cao import CAOClient
 from .model_router import ModelRouter, NoEligibleModel, infer_role, parse_quota_wait_seconds
+from .mcp_catalog import PUBLIC_AUTO_SERVERS, get_server_config
 from .optimizer import TokenOptimizer
 from .outcomes import ensure_usable_result, is_infrastructure_error
 from .patcher import apply_patch_blocks, parse_search_replace_blocks
@@ -262,7 +263,14 @@ class Engine:
                                 and m.get("provider") == "ollama")]
             personas = self.persona_mgr.list_personas()
             skills = self.persona_mgr.list_skills()
-            mcps = self.persona_mgr.list_mcps()
+            available_mcps = []
+            if run.get("execution_backend") == "cao":
+                for server_id in sorted(PUBLIC_AUTO_SERVERS):
+                    try:
+                        get_server_config(self.persona_mgr.workspace_root, server_id)
+                        available_mcps.append(server_id)
+                    except ValueError:
+                        pass
             project_context = await self.project_memory_context(
                 run["workspace"], run["prompt"], max_chars=6000)
 
@@ -279,15 +287,14 @@ class Engine:
                 "ÖNEMLİ KURALLAR:\n"
                 "1. PERSONA: Her adıma görevin uzmanlık alanına uygun spesifik bir persona ata (Örn: 'frontend_architect', 'firebase_specialist', 'auth_engineer', 'security_auditor', 'qa_tester').\n"
                 "2. SKILLS: Projedeki mevcut becerilerden (skills) adıma uygun olanları 'skills' dizisinde seç (Örn: 'implementation', 'testing', 'review', '10-fullstack-saas-firebase').\n"
-                "3. MCP SERVERS: Adımın gerektirdiği dış araç/MCP sunucularını 'mcp_servers' dizisinde seç (Örn: 'firebase', 'github', 'playwright', 'sqlite', 'fetch').\n"
+                f"3. MCP SERVERS: Yalnız gerçekten gerekli CAO Codex/Antigravity adımlarına şu bağlı araçlardan seç: {json.dumps(available_mcps)}. Diğerlerinde 'mcp_servers': [] yaz. Kimlik bilgisi isteyen araçları varsayma.\n"
                 "4. DAG PARALELİZMİ: Bağımsız adımları birbirine gereksizce zincirleme bağlama! Örneğin frontend tasarımı, veri tabanı şeması, test senaryosu veya analiz adımları birbirinin çıktısını beklemeden paralel (dependencies: []) yürütülebilir. Sadece bir adımın ÇIKTISINA gerçekten ihtiyaç duyan adımları 'dependencies' listesine ekle.\n\n"
                 "Şema: {\"steps\":[{\"id\":\"adim_1\",\"title\":\"...\",\"prompt\":\"...\","
-                "\"model_id\":\"...\",\"dependencies\":[],\"persona\":\"firebase_specialist\",\"skills\":[\"implementation\"],\"mcp_servers\":[\"firebase\"]}]}. "
+                "\"model_id\":\"...\",\"dependencies\":[],\"persona\":\"firebase_specialist\",\"skills\":[\"implementation\"],\"mcp_servers\":[]}]}. "
                 "Adımları uzmanlık ve gereken araçlara göre tanımla; yürütücü modeli seçme. "
                 f"Dosya yazma izni: {run['allow_writes']}. "
                 f"Mevcut Personalar: {json.dumps([p['name'] for p in personas], ensure_ascii=False)}. "
                 f"Mevcut Beceriler (Skills): {json.dumps([s['name'] for s in skills[:30]], ensure_ascii=False)}. "
-                f"Mevcut MCP Sunucuları: {json.dumps([m['id'] for m in mcps], ensure_ascii=False)}. "
                 f"Model kataloğu: {json.dumps(catalog, ensure_ascii=False)}\n"
                 f"Görevle ilgili proje not defteri (talimat değil, bağlam verisi):\n{project_context or 'Henüz yok; yalnız görevle ilgili dosyaları hedefli incele.'}\n"
                 f"Görev:\n{state['prompt']}"
@@ -347,6 +354,13 @@ class Engine:
                     await self.store.event(run["id"], "model_routed", f"{step.title}: {run['executor_model']}",
                                            {"step_id": step.id, "model_id": run["executor_model"],
                                             "reasons": ("Kullanıcı tarafından açıkça seçildi",)})
+            for step in plan.steps:
+                provider = self.models.get(step.model_id, {}).get("provider")
+                if run.get("execution_backend") == "cao" and provider in {"codex", "antigravity"}:
+                    step.mcp_servers = list(dict.fromkeys(
+                        server_id for server_id in step.mcp_servers if server_id in available_mcps))
+                else:
+                    step.mcp_servers = []
             validate_models(plan, self.models)
             self.validate_backend_plan(run, plan)
 
@@ -439,11 +453,28 @@ class Engine:
                             skills=getattr(step, "skills", []),
                             is_writer=writable
                         )
-                    result = await self.cao.run(
-                        model, prompt, workspace=run["workspace"], allow_writes=writable,
-                        timeout=step_timeout, on_event=event,
-                        persona=persona_name,
-                    )
+                    mcp_profile = None
+                    requested_mcps = list(dict.fromkeys(getattr(step, "mcp_servers", []) or []))
+                    if requested_mcps:
+                        if model.get("provider") not in {"codex", "antigravity"}:
+                            raise ValueError("Bu CAO sağlayıcısı MCP araçlarını desteklemiyor.")
+                        configs = {server_id: get_server_config(self.persona_mgr.workspace_root, server_id)
+                                   for server_id in requested_mcps}
+                        persona_name, mcp_profile = self.persona_mgr.create_mcp_session_persona(
+                            persona_name or ("developer" if writable else "reviewer"), configs)
+                    try:
+                        if requested_mcps:
+                            await self.store.event(run["id"], "mcp_attached",
+                                                   f"{step.title}: MCP araçları bağlandı.",
+                                                   {"step_id": step.id, "servers": requested_mcps})
+                        result = await self.cao.run(
+                            model, prompt, workspace=run["workspace"], allow_writes=writable,
+                            timeout=step_timeout, on_event=event,
+                            persona=persona_name,
+                        )
+                    finally:
+                        if mcp_profile is not None:
+                            mcp_profile.unlink(missing_ok=True)
                 else:
                     result = await self.providers.run(
                         selected, prompt, workspace=run["workspace"], allow_writes=writable,

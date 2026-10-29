@@ -1,0 +1,1989 @@
+"""Workflow run engine (issue #312, Bolt 3 / N5).
+
+The deterministic, in-memory orchestration engine: it holds the process-local run
+registry and the sequencing / bounded-retry / reprompt-once / templating logic that
+drives a validated ``WorkflowSpec`` through ``run_agent_step`` one step at a time.
+
+Boundary discipline (B3-BR-14/B3-BR-15):
+
+- The engine runs IN the API process and calls ``run_agent_step`` directly,
+  in-process — it NEVER reaches back through the HTTP API (single seam).
+- A step failure is recorded as ``StepState.FAILED`` ON THE RUN RECORD; it does
+  NOT raise into the run loop. Only engine-internal invariant violations raise the
+  typed ``WorkflowEngineError`` (mapped to HTTP 500 at the boundary). Domain errors
+  map narrowly at the boundary: unknown run/spec -> 404, invalid spec/inputs -> 400,
+  cancel-of-finished -> 409.
+- Reserved seams (parallel / loop / resume) raise ``NotBuiltYetError`` when reached
+  — never silently downgraded to sequential (B3-BR-10, honest-tiering).
+
+The algorithm is implemented exactly per ``functional-design/business-logic-model.md``
+(§1 start_run, §2/§2a the two nested loops, §3 _collect_structured_output, §4
+_substitute, §5 cancel_run, §6 get_run_status, §7 reserved seams).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Set, Union
+
+if TYPE_CHECKING:  # avoid a runtime circular import (script_runner imports this module)
+    from cli_agent_orchestrator.services.script_runner import ScriptRunRecord
+
+from pydantic import ValidationError
+
+from cli_agent_orchestrator.constants import (
+    WORKFLOW_DEFAULT_STEP_RETRIES,
+    WORKFLOW_STEP_TIMEOUT,
+)
+from cli_agent_orchestrator.models.workflow import (
+    InputDecl,
+    NotBuiltYetError,
+    RunState,
+    StepState,
+    WorkflowSpec,
+    WorkflowStep,
+)
+from cli_agent_orchestrator.models.workflow_runtime import (
+    RunStatus,
+    StepOutputRecord,
+    StepResult,
+    StepStatus,
+    WorkflowRunResult,
+)
+from cli_agent_orchestrator.providers.base import OutputExtractionError
+from cli_agent_orchestrator.services import workflow_journal
+from cli_agent_orchestrator.services.agent_step import (
+    StepCancelledError,
+    StepExecutionError,
+    _best_effort_teardown,
+    run_agent_step,
+)
+from cli_agent_orchestrator.services.step_output_store import (
+    _validate_key_part,
+    step_output_store,
+)
+
+# RE-EXPORT, not a use (issue #583, unit ``workflow-errors``, BR-2/INV-5). ADR-583-9 MOVED
+# these two exceptions to the ``workflow_errors`` leaf so ``workflow_journal`` can import them
+# at module level instead of inside ``lookup_replay`` — the function-local import there was a
+# workaround for a cycle with THIS module. A move carries a compatibility obligation a
+# creation does not, and this one is verified rather than defensive:
+# ``test_script_journal_extension.py`` imports ``ReplayDivergenceError`` from here, so
+# dropping the rebind would fail that module AT COLLECTION, taking its whole file down.
+#
+# The redundant ``as`` aliases are the explicit re-export form (PEP 484): they say "this name
+# is deliberately part of this module's surface" to a reader and to a type checker, rather
+# than leaving the intent to be inferred from an import nothing in this file uses. There is no
+# Ruff in this repository, so nothing would have flagged it either way — which is the point;
+# relying on the absence of a checker is not the same as saying what you mean.
+#
+# ``StaleGenerationError`` deliberately did NOT move (BR-7): it is raised inside this module,
+# so no cycle involves it, and breaking a cycle is the leaf's only warrant.
+from cli_agent_orchestrator.services.workflow_errors import (
+    RecoveryDecisionRequired as RecoveryDecisionRequired,
+)
+from cli_agent_orchestrator.services.workflow_errors import (
+    ReplayDivergenceError as ReplayDivergenceError,
+)
+from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
+
+logger = logging.getLogger(__name__)
+
+# Event record format version stamped on every emitted ``workflow_run_event`` row
+# (FR-1.1). Bumped when the event field set changes so a reader can evolve without
+# breaking on an older-format record. U2 emits version 1.
+EVENT_SCHEMA_VERSION = 1
+
+
+class WorkflowEngineError(Exception):
+    """An engine-internal invariant violation (mapped to HTTP 500 at the boundary).
+
+    Distinct from a step run-failure (recorded as ``StepState.FAILED`` on the
+    record, NOT raised) and from domain input errors (``ValueError`` -> 400). This
+    is raised only when the engine reaches a state that should be impossible —
+    e.g. a template references an upstream step that never produced output
+    (an authoring error surfaced loudly, never a silent blank fill, B3-BR-14).
+    """
+
+
+class ResumeNotAllowedError(ValueError):
+    """Resume rejected because the run is terminal or still live (B4-BR-7/7a -> 409).
+
+    A ``ValueError`` subclass so any caller catching ``ValueError`` broadly still
+    works (no contract break); the resume route catches THIS type before any bare
+    ``ValueError`` to map it to 409 (business-logic-model §5, reviewer N1).
+    """
+
+
+class ResumeCorruptError(ValueError):
+    """Resume rejected because ``spec_snapshot`` will not deserialize (B4 -> 422).
+
+    A ``ValueError`` subclass; the resume route catches it before any bare
+    ``ValueError`` to map an undeserializable snapshot to 422 (business-logic-model
+    §5). The run is unresumable and the failure is surfaced clearly, never silently.
+    """
+
+
+class StaleGenerationError(ValueError):
+    """A script ``run-step`` call carried an old generation (A3, ADR-9 -> 409).
+
+    U3 addition (issue #312, script-tier journal extension, C3). A ``ValueError``
+    subclass so a broad ``except ValueError`` at the API boundary still maps it,
+    but the route should catch this type BEFORE any bare ``ValueError`` to map it
+    to 409 specifically (business-rules DR-5, same precedent as
+    ``ResumeNotAllowedError``). Raised by ``check_generation`` when the caller's
+    generation does not match the run's current journaled generation — this is
+    what fences an orphaned/reparented predecessor subprocess out after a resume
+    or cancel bumps the generation (INV-6).
+    """
+
+
+# ---------------------------------------------------------------------------
+# In-memory run aggregate (engine-internal; never crosses the HTTP seam)
+# ---------------------------------------------------------------------------
+@dataclass
+class StepRunState:
+    """Per-step run state (domain-entities ``StepRunState``).
+
+    Loop fields (``which_guard_fired`` / ``iterations_run``) are RESERVED for N8
+    and always None in the MVP (B3-BR-11).
+    """
+
+    step_id: str
+    state: StepState = StepState.PENDING
+    attempts: int = 0
+    reprompted: bool = False
+    output: Optional[StepOutputRecord] = None
+    terminal_id: Optional[str] = None
+    error: Optional[str] = None
+    # Structured failure kind, mirrored from ``StepExecutionError.kind`` on a
+    # failed attempt and cleared when the step later settles (issue #638). Carried
+    # in memory so ``_build_result`` can surface it on the run's result envelope;
+    # the DURABLE copy is the ``workflow_run_step.error_kind`` column.
+    error_kind: Optional[str] = None
+    # In-memory carrier for the step's ``v2`` call fingerprint (issue #583, unit
+    # ``settlement-rewire``, BR-2/TD-3). ``run_agent_step`` COMPUTES the value in the one
+    # window BR-5 permits — after working-directory resolution, before terminal creation —
+    # and cannot publish it itself: this module imports ``run_agent_step``, so the reverse
+    # import would be circular. It therefore travels as the terminal-ready hook's second
+    # argument and is published here by ``script_runner``'s hook closure, beside the
+    # ``terminal_id`` that closure already writes.
+    #
+    # IN-MEMORY ONLY — no schema change, no migration. The DURABLE
+    # ``workflow_run_step.call_fingerprint`` column already exists and is
+    # ``workflow_journal.begin_step``'s to write (unit 6 BR-7/BR-9); this field only carries
+    # the value between two callbacks inside one process.
+    call_fingerprint: Optional[str] = None
+    which_guard_fired: Optional[str] = None  # RESERVED (N8) — always None in MVP
+    iterations_run: Optional[int] = None  # RESERVED (N8) — always None in MVP
+
+
+@dataclass
+class RunRecord:
+    """The run aggregate root (domain-entities ``RunRecord``), held in the registry."""
+
+    run_id: str
+    workflow_name: str
+    spec: WorkflowSpec
+    inputs: Dict[str, Any]
+    state: RunState = RunState.RUNNING
+    current_step_id: Optional[str] = None
+    cancelled: bool = False
+    step_states: Dict[str, StepRunState] = field(default_factory=dict)
+    started_at: str = ""
+    finished_at: Optional[str] = None
+    # Per-run event sequence counter (U2, issue #504). Additive in-memory-only
+    # field — NOT journaled directly as a column; it is the allocator for the
+    # ``workflow_run_event.seq`` ordering key. Advanced by ``_next_event_seq`` at
+    # each emission and re-seeded on a rebuild to
+    # ``max(persisted_high_water, max_event_seq)`` so a resume never reuses a slot.
+    event_seq: int = 0
+    # Set by cancel_run to interrupt the CURRENTLY in-flight step wait (issue
+    # #409b). Without it, cancel was only observed at the NEXT step boundary — so
+    # exactly the runs hung inside a long/never-settling step wait (the codex-IDLE
+    # case #409a targets) could not be cancelled at all. ``asyncio.Event`` is
+    # constructed here; it binds to the running loop lazily on first await, so
+    # building a RunRecord outside a loop (unit tests) is safe.
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # The terminal that started this run, when an agent did
+    # (``WorkflowRunRequest.caller_id``, sent by the MCP workflow tools and by
+    # ``cao workflow`` from inside a terminal). Every step's worker is created
+    # with ``delegating_terminal_id=caller_id`` so its tools are bounded by that
+    # terminal's RECORDED delegation ceiling (utils/delegation.py). Persisted on
+    # the journal row (``workflow_run.caller_id``) at start, so a resume or a
+    # recovery after a restart re-binds to the ORIGINAL starter through
+    # ``bound_caller`` and never widens; only a run started with no caller
+    # takes the resumer's bound. None for operator-started runs (CLI, curl),
+    # which are unbounded.
+    caller_id: Optional[str] = None
+
+
+# Process-local run registry (ADR-8, B3-LC-2 singleton). A process restart loses
+# in-flight runs — the explicit, documented pre-N6 gap (A-5).
+#
+# U4 (issue #312, script tier, C1) widens the value type to a union: a script run
+# registers a ``ScriptRunRecord`` (a separate dataclass carrying a live subprocess
+# handle) in the SAME map YAML runs use, so status/cancel dispatch is one lookup
+# path (code-generation-plan CONTRADICTION #6). U5 dispatches by tier via
+# ``getattr(record, "tier", "yaml")`` — ``RunRecord`` has no ``tier`` attribute, so
+# the default keeps YAML records on the YAML path.
+run_registry: Dict[str, Union[RunRecord, "ScriptRunRecord"]] = {}
+
+# run_ids whose drive loop is executing IN THIS PROCESS right now (B4-BR-7a / F4).
+# The registry alone cannot answer "is anything actually driving this run?" — a
+# status read may rebuild a crash remnant into the cache with state == RUNNING
+# even though nothing is executing. Membership here is the liveness truth: added
+# when a drive starts (start_run / _drive_resume), removed in a ``finally`` on
+# EVERY exit path (complete, fail, engine error, cancel).
+_active_drives: Set[str] = set()
+
+
+def _now() -> str:
+    """ISO-8601 Z timestamp (bookkeeping only — never an ordering key)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------------------
+# N6 — durable run journal write-through (best-effort, B4-BR-5)
+# ---------------------------------------------------------------------------
+# Every engine transition mutates the in-memory ``RunRecord`` FIRST (preserving
+# the FR-5.5 live-read floor), THEN writes the journal here. A write failure is
+# logged and SWALLOWED — it must NEVER raise into the engine drive loop (only
+# durability/resumability is degraded for that run, B4-BR-5 / B4-RD-1). The
+# terminal run-state write is logged at WARNING because it gates resumability;
+# the per-step/current-step writes are logged at DEBUG.
+
+
+def _output_json(record: Optional[StepOutputRecord]) -> Optional[str]:
+    """Serialize a step's structured output to JSON, or ``None`` (E2)."""
+    if record is None:
+        return None
+    return json.dumps(record.output)
+
+
+def _record_from_json(output_json: Optional[str]) -> Optional[StepOutputRecord]:
+    """Rebuild a minimal ``StepOutputRecord`` carrying the persisted output (§2).
+
+    On rebuild only the structured ``output`` map is needed for ``{{step.field}}``
+    templating into successors — a kept (COMPLETED) step's output is reused. The
+    record is reconstructed as ``validated=True`` (it was persisted as a settled
+    output); ``errors`` is empty. Returns ``None`` when no output was persisted.
+    A malformed JSON blob degrades to ``None`` (never raises into the rebuild).
+    """
+    if output_json is None:
+        return None
+    try:
+        data = json.loads(output_json)
+    except (ValueError, TypeError) as e:
+        logger.debug("journal: dropping unparseable step output_json: %s", e)
+        return None
+    if not isinstance(data, dict):
+        return None
+    return StepOutputRecord(
+        run_id="",
+        step_id="",
+        output=data,
+        validated=True,
+        errors=[],
+        state=StepState.COMPLETED,
+    )
+
+
+def bound_caller(original: Optional[str], resumer: Optional[str]) -> Optional[str]:
+    """The terminal whose ceiling bounds a resumed run: the original starter if known.
+
+    Journaled ``caller_id`` (the agent that started the run) wins over whoever
+    resumes it, so an operator or a wider agent resuming a reviewer's run does
+    not widen its steps. A run started with no caller is bounded by the resumer,
+    which can only narrow it.
+    """
+    return original if original else resumer
+
+
+def _journal_insert_run(record: RunRecord) -> None:
+    """Best-effort INSERT of the run + its seeded steps at ``start_run`` (§1)."""
+    try:
+        workflow_journal.insert_run(
+            run_id=record.run_id,
+            workflow_name=record.workflow_name,
+            spec_snapshot=record.spec.model_dump_json(),
+            inputs_json=json.dumps(record.inputs),
+            state=record.state.value,
+            started_at=record.started_at,
+            # Only when an agent started the run, so operator runs write the
+            # same call as before.
+            **({"caller_id": record.caller_id} if record.caller_id else {}),
+        )
+        workflow_journal.insert_steps(
+            record.run_id,
+            [(step.id, StepState.PENDING.value) for step in record.spec.steps],
+            _now(),
+        )
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal write is best-effort; in-memory floor still serves live reads
+        logger.warning("journal: insert_run for '%s' failed (run continues): %s", record.run_id, e)
+
+
+def _journal_step(record: RunRecord, step_id: str, error_kind: Optional[str] = None) -> None:
+    """Best-effort UPDATE of one step's durable state from the in-memory record.
+
+    U2 (issue #504) adds the optional ``error_kind`` param (default ``None``):
+    on a failure transition (``step.attempt.failed`` / ``step.failed``) the engine
+    passes the ``StepExecutionError.kind`` so the additive
+    ``workflow_run_step.error_kind`` column (U1) carries the structured kind — a
+    post-restart cold read then surfaces it with no event replay (BR-6). Every
+    non-failure call keeps the default ``None`` (writes NULL), which also clears a
+    stale kind when a retried step later settles, so the projection stays honest.
+    """
+    st = record.step_states[step_id]
+    try:
+        workflow_journal.update_step(
+            run_id=record.run_id,
+            step_id=step_id,
+            state=st.state.value,
+            attempts=st.attempts,
+            updated_at=_now(),
+            output_json=_output_json(st.output),
+            error=st.error,
+            error_kind=error_kind,
+        )
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal write is best-effort; in-memory floor still serves live reads
+        logger.debug("journal: update_step '%s/%s' failed: %s", record.run_id, step_id, e)
+
+
+def _journal_current_step(record: RunRecord) -> None:
+    """Best-effort UPDATE of ``workflow_run.current_step_id``."""
+    try:
+        workflow_journal.update_run_current_step(record.run_id, record.current_step_id)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal write is best-effort; in-memory floor still serves live reads
+        logger.debug("journal: update_run_current_step '%s' failed: %s", record.run_id, e)
+
+
+def _journal_run_state(record: RunRecord) -> None:
+    """Best-effort UPDATE of the terminal run state (logged at WARNING — gates resume)."""
+    try:
+        workflow_journal.update_run_state(record.run_id, record.state.value, record.finished_at)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal write is best-effort; in-memory floor still serves live reads
+        logger.warning(
+            "journal: terminal state write for '%s' failed (resumability degraded): %s",
+            record.run_id,
+            e,
+        )
+
+
+async def _ajournal(fn: Any, *args: Any, **kwargs: Any) -> None:
+    """Run a sync best-effort journal helper off the event loop.
+
+    The journal helpers do blocking sqlite3 I/O; from async engine code they must
+    not stall the loop. ``to_thread`` is awaited sequentially at each call site,
+    so write ordering is preserved; the no-raise promise holds because the
+    try/except lives inside the sync helper itself. Sync callers (the
+    ``get_run_status`` rebuild path) keep calling the helpers directly.
+
+    ``**kwargs`` are forwarded to the helper (additive for U2's ``_journal_event``,
+    whose ``append_event`` write carries keyword-only fields); the existing
+    positional-only callers are unaffected.
+    """
+    await asyncio.to_thread(fn, *args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# U2 — event emission into the durable event log (issue #504, best-effort, BR-2)
+# ---------------------------------------------------------------------------
+# The engine already write-through-projects each transition to the run/step tables
+# (above). U2 ADDS a second, best-effort emission ALONGSIDE those projections at
+# each transition site: one immutable ``workflow_run_event`` row per transition.
+# The two writes here (high-water then append) are wrapped so neither raises into
+# ``_drive`` (FR-3.2 / BR-2) — an event-append failure degrades only the forensic
+# timeline for that run, never the run itself. ``seq`` is allocated in-memory
+# BEFORE either write, so a swallowed append leaves a permanent, declared gap in
+# the sequence — never a renumber (BR-1). Every caller mutates the in-memory
+# ``RunRecord`` FIRST, then emits (in-memory first, BR-1), so the live-read floor
+# never regresses.
+
+
+def _next_event_seq(record: RunRecord) -> int:
+    """Allocate the next per-run event ``seq`` from the in-memory counter (U1 Algorithm 1).
+
+    Advances ``record.event_seq`` and returns it. Side-effect-free w.r.t. the DB:
+    the counter moves BEFORE any durable write, so a swallowed append leaves a
+    permanent hole in the sequence (a declared gap on read), never a renumber
+    (BR-1). Monotonic within a process; re-seeded across a restart by the rebuild
+    to resume strictly above the recovered high-water.
+    """
+    record.event_seq += 1
+    return record.event_seq
+
+
+async def _journal_event(
+    record: RunRecord,
+    event_type: str,
+    *,
+    step_id: Optional[str] = None,
+    **fields: Any,
+) -> None:
+    """Emit one durable ``workflow_run_event`` for a drive-loop transition (U2).
+
+    Allocates the per-run ``seq``, then persists the high-water BEFORE the append
+    so the common single-fault case still records the allocated slot durably (a
+    rebuild resumes strictly above it, BR-3). Both writes go off the loop through
+    the sequential ``_ajournal(asyncio.to_thread)`` path so per-run event order
+    matches transition order (BR-3). Each write is wrapped best-effort: a raise is
+    logged (WARNING for both — losing the append loses journal CONTENT and is the
+    more consequential of the two) and NEVER propagated
+    into ``_drive`` (FR-3.2 / BR-2), matching the swallow posture of the
+    ``_journal_*`` write-through helpers. ``iteration`` / ``which_guard_fired`` are
+    left unset (NULL, reserved, FR-1.5).
+    """
+    seq = _next_event_seq(record)
+    try:
+        await _ajournal(workflow_journal.persist_high_water, record.run_id, seq)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — event high-water write is best-effort; must NOT raise into _drive (BR-2)
+        logger.warning(
+            "journal: event high-water write for '%s' seq %d failed "
+            "(event durability degraded): %s",
+            record.run_id,
+            seq,
+            e,
+        )
+    try:
+        await _ajournal(
+            workflow_journal.append_event,
+            record.run_id,
+            seq,
+            event_type,
+            event_schema_version=EVENT_SCHEMA_VERSION,
+            ts=_now(),
+            step_id=step_id,
+            **fields,
+        )
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — event append is best-effort; a lost event leaves a declared gap, never raises (BR-2)
+        # WARNING, not DEBUG: losing an actual event is the more consequential
+        # loss of the two best-effort writes on this path (the high-water write
+        # ABOVE degrades durability metadata; this loses journal CONTENT and
+        # punches a hole the reader must declare as a gap).
+        logger.warning(
+            "journal: append_event '%s' seq %d (%s) failed: %s",
+            record.run_id,
+            seq,
+            event_type,
+            e,
+        )
+
+
+# ---------------------------------------------------------------------------
+# §4 — prompt templating (closed-form; no eval / format / f-string evaluation)
+# ---------------------------------------------------------------------------
+# ONLY two reference shapes resolve (FR-4.2; richer templating is reserved):
+#   {{workflow.inputs.<name>}}     -> record.inputs[name]
+#   {{steps.<id>.output.<field>}}  -> record.step_states[id].output.output[field]
+# Everything else is left untouched UNLESS it is a {{...}} placeholder we cannot
+# resolve, which is a hard WorkflowEngineError (B3-BR-14). The regex captures the
+# inner reference text; a dict lookup resolves it — NEVER str.format(**record),
+# NEVER an f-string, NEVER eval (B3-SD-2/4, honest tiering).
+_PLACEHOLDER_RE = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+_INPUT_REF_RE = re.compile(r"^workflow\.inputs\.([A-Za-z0-9_-]+)$")
+_STEP_REF_RE = re.compile(r"^steps\.([A-Za-z0-9_-]+)\.output\.([A-Za-z0-9_-]+)$")
+
+
+def _substitute(template: str, record: RunRecord) -> str:
+    """Resolve the two supported placeholder shapes against the run record (§4).
+
+    Closed-form: regex-capture each ``{{...}}`` placeholder, match it against the
+    two allowed reference shapes, and look the value up in the record. An unknown
+    reference shape, an unknown input name, or a reference to a step that has not
+    produced a (validated) output yet is a hard ``WorkflowEngineError`` — never a
+    silent blank fill (honest-tiering). The spec text is NEVER evaluated.
+    """
+
+    def _resolve(match: "re.Match[str]") -> str:
+        ref = match.group(1).strip()
+
+        input_match = _INPUT_REF_RE.match(ref)
+        if input_match is not None:
+            name = input_match.group(1)
+            if name not in record.inputs:
+                raise WorkflowEngineError(
+                    f"template references unknown input '{name}' " f"(reference '{{{{{ref}}}}}')"
+                )
+            return str(record.inputs[name])
+
+        step_match = _STEP_REF_RE.match(ref)
+        if step_match is not None:
+            step_id, field_name = step_match.group(1), step_match.group(2)
+            st = record.step_states.get(step_id)
+            if st is None or st.output is None:
+                raise WorkflowEngineError(
+                    f"template references step '{step_id}' output, but that step "
+                    f"has produced no output (reference '{{{{{ref}}}}}')"
+                )
+            output_map = st.output.output
+            if field_name not in output_map:
+                raise WorkflowEngineError(
+                    f"template references field '{field_name}' not present in "
+                    f"step '{step_id}' output (reference '{{{{{ref}}}}}')"
+                )
+            return str(output_map[field_name])
+
+        raise WorkflowEngineError(
+            f"unsupported template reference '{{{{{ref}}}}}' "
+            f"(only {{{{workflow.inputs.<name>}}}} and "
+            f"{{{{steps.<id>.output.<field>}}}} are supported)"
+        )
+
+    return _PLACEHOLDER_RE.sub(_resolve, template)
+
+
+def _reprompt_prompt(step: WorkflowStep, prompt: str) -> str:
+    """A corrective prompt restating the schema and asking for a valid return (§3)."""
+    return (
+        f"{prompt}\n\n"
+        "Your previous turn did not produce a valid structured output for this "
+        "workflow step. Call the `workflow_return` tool with output that matches "
+        f"this JSON-Schema:\n{step.output_schema}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# §2/§3 — input validation, topo-sort, the two nested loops
+# ---------------------------------------------------------------------------
+class _HasInputs(Protocol):
+    """Structural type for anything carrying a typed ``inputs`` declaration map.
+
+    Both ``WorkflowSpec`` (YAML tier) and ``ScriptSpec`` (script tier, Unit A)
+    satisfy this — they expose ``inputs: Dict[str, InputDecl]``. Widening
+    ``_validate_inputs`` to this Protocol (ADR-1, FR-A2) lets ONE validator serve
+    both tiers with no ``isinstance`` branch and no behavior change to either.
+    """
+
+    inputs: Dict[str, "InputDecl"]
+
+
+def _validate_inputs(spec: _HasInputs, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate ``inputs`` against ``spec.inputs`` BEFORE any step runs (B3-BR-2).
+
+    Every required input must be present; each value must match its declared type;
+    ``path``-typed inputs are canonicalized through the SHARED path validator
+    (never reimplemented). A failure raises ``ValueError`` -> 400 and NO terminal
+    is ever created (fail fast). Returns the resolved input map (path values
+    replaced by their canonicalized form; declared defaults filled in).
+    """
+    resolved: Dict[str, Any] = {}
+    for name, decl in spec.inputs.items():
+        if name in inputs:
+            value = inputs[name]
+        elif decl.default is not None:
+            value = decl.default
+        elif decl.required:
+            raise ValueError(f"missing required input '{name}'")
+        else:
+            continue
+
+        if decl.type == "bool":
+            if not isinstance(value, bool):
+                raise ValueError(f"input '{name}' must be a bool")
+        elif decl.type == "int":
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"input '{name}' must be an int")
+        elif decl.type == "string":
+            if not isinstance(value, str):
+                raise ValueError(f"input '{name}' must be a string")
+        elif decl.type == "path":
+            if not isinstance(value, str):
+                raise ValueError(f"input '{name}' must be a path string")
+            # Reuse the shared path validator (project Mandated rule) — canonicalize
+            # via realpath + reject blocked system dirs. A bad path raises ValueError.
+            from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
+
+            value = resolve_and_validate_path(value, description="Working directory")
+        else:  # pragma: no cover — grammar restricts type to the four above
+            raise ValueError(f"input '{name}' has unknown declared type '{decl.type}'")
+
+        resolved[name] = value
+
+    # Reject unknown inputs the spec does not declare (fail fast on a typo).
+    for name in inputs:
+        if name not in spec.inputs:
+            raise ValueError(f"unknown input '{name}' (not declared by the workflow)")
+
+    return resolved
+
+
+def _topological_order(spec: WorkflowSpec) -> List[WorkflowStep]:
+    """Deterministic topological order of steps by ``needs:`` (B3-BR-6, RD-3.1).
+
+    Ties are broken by DECLARATION ORDER so the same spec always sequences
+    identically (byte-identical step order). The MVP grammar (``WorkflowStep``)
+    has no ``needs:`` field yet, so the order is simply declaration order today;
+    this helper is the single deterministic ordering seam that a future ``needs:``
+    field plugs into without changing the engine loop. A cycle (once ``needs:``
+    exists) raises ``ValueError`` -> 400.
+    """
+    # Declaration index for the stable tie-break.
+    decl_index = {step.id: i for i, step in enumerate(spec.steps)}
+    # ``needs:`` is reserved/not-yet-on-the-model; default to no edges so the
+    # order is declaration order. Read defensively via getattr for forward-compat.
+    edges: Dict[str, List[str]] = {}
+    for step in spec.steps:
+        needs = getattr(step, "needs", None) or []
+        edges[step.id] = list(needs)
+
+    visited: Dict[str, int] = {}  # 0 = visiting, 1 = done
+    order: List[str] = []
+
+    def _visit(step_id: str) -> None:
+        mark = visited.get(step_id)
+        if mark == 1:
+            return
+        if mark == 0:
+            raise ValueError(f"workflow has a dependency cycle at step '{step_id}'")
+        visited[step_id] = 0
+        # Deterministic: visit prerequisites in declaration order.
+        for dep in sorted(edges.get(step_id, []), key=lambda d: decl_index.get(d, 0)):
+            if dep not in decl_index:
+                raise ValueError(f"step '{step_id}' needs unknown step '{dep}'")
+            _visit(dep)
+        visited[step_id] = 1
+        order.append(step_id)
+
+    for step in spec.steps:  # declaration order roots -> stable tie-break
+        _visit(step.id)
+
+    by_id = {step.id: step for step in spec.steps}
+    return [by_id[sid] for sid in order]
+
+
+async def _collect_structured_output(
+    record: RunRecord, step: WorkflowStep, prompt: str
+) -> StepState:
+    """Collect the structured return for a COMPLETED step; reprompt once (§3).
+
+    - No ``output_schema`` -> free-form, trivially ``COMPLETED``.
+    - Validated record present -> ``COMPLETED`` (output copied onto the step state).
+    - Missing OR invalid record, not yet reprompted -> spend the ONE reprompt on a
+      fresh terminal, then re-collect. A crash DURING the reprompt re-raises the
+      ``StepExecutionError`` so the OUTER attempt loop (§2) consumes an attempt.
+    - Still missing/invalid after the reprompt -> ``COMPLETED_UNVALIDATED``
+      (missing == invalid, decision note D1).
+    """
+    st = record.step_states[step.id]
+
+    if step.output_schema is None:
+        return StepState.COMPLETED
+
+    rec = step_output_store.get(record.run_id, step.id)  # immediate read (Q2=A)
+    if rec is not None and rec.validated:
+        st.output = rec
+        return StepState.COMPLETED
+
+    if not st.reprompted:
+        st.reprompted = True
+        # U2 emission (BR-1, after the in-memory reprompted mutation): the one
+        # corrective reprompt is being spent for this step.
+        await _journal_event(
+            record,
+            "step.reprompted",
+            step_id=step.id,
+            terminal_id=st.terminal_id,
+            provider=step.provider,
+            agent_profile=step.agent,
+            reason="invalid_or_missing_output",
+        )
+        # Re-run on a FRESH terminal with a corrective prompt. A crash here is a
+        # run-failure: let the StepExecutionError propagate so the OUTER loop
+        # consumes an attempt (Q6=A / Trace C).
+        result = await run_agent_step(
+            provider=step.provider,
+            agent=step.agent,
+            prompt=_reprompt_prompt(step, prompt),
+            teardown=True,
+            timeout=WORKFLOW_STEP_TIMEOUT,
+            engine=step.engine,
+            env_vars={
+                "CAO_WORKFLOW_RUN_ID": record.run_id,
+                "CAO_WORKFLOW_STEP_ID": step.id,
+            },
+            cancel_event=record.cancel_event,
+            delegating_terminal_id=record.caller_id,
+        )
+        st.terminal_id = result.terminal_id
+        rec = step_output_store.get(record.run_id, step.id)
+        if rec is not None and rec.validated:
+            st.output = rec
+            return StepState.COMPLETED
+
+    # Missing/invalid after the reprompt: record what we have (may be None or an
+    # invalid record) and mark unvalidated (NOT a crash — decision note D1).
+    st.output = rec
+    return StepState.COMPLETED_UNVALIDATED
+
+
+async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
+    """Run one step through the two nested recovery loops (§2/§2a).
+
+    OUTER loop = bounded run-failure retry (B3-BR-4): a ``StepExecutionError``
+    (worker error / readiness or completion timeout) consumes an attempt and
+    retries the SAME prompt. INNER loop = the reprompt-once inside
+    ``_collect_structured_output`` (B3-BR-5), called INSIDE the outer ``try`` so a
+    reprompt crash is caught by the same ``except`` and consumes an attempt.
+
+    On attempt exhaustion the step is ``FAILED``; ``on_failure`` (default ``halt``)
+    decides whether the run halts (``record.state = FAILED``) or continues.
+    """
+    n_retries = step.retries if step.retries is not None else WORKFLOW_DEFAULT_STEP_RETRIES
+    record.current_step_id = step.id
+    st = record.step_states[step.id]
+    st.state = StepState.RUNNING
+    # Journal write-through (§1): record the step RUNNING + the live current step.
+    # Awaited sequentially off the loop (blocking sqlite must not stall the engine).
+    await _ajournal(_journal_step, record, step.id)
+    await _ajournal(_journal_current_step, record)
+    # U2 emission (BR-1, after the in-memory RUNNING mutation): the step went live.
+    await _journal_event(
+        record,
+        "step.started",
+        step_id=step.id,
+        state=st.state.value,
+        provider=step.provider,
+        agent_profile=step.agent,
+    )
+
+    # Track the last StepExecutionError.kind so the terminal step.failed event +
+    # the projection write carry the structured error kind (BR-6).
+    last_error_kind: Optional[str] = None
+
+    # OUTER: run-failure retry loop. attempts range 1..n_retries+1.
+    for attempt in range(1, n_retries + 2):
+        if record.cancelled:  # boundary check (B3-BR-7)
+            return
+        st.attempts = attempt
+        st.error = None
+        # U2 emission: this attempt is starting (attempt number in fields).
+        await _journal_event(
+            record,
+            "step.attempt.started",
+            step_id=step.id,
+            attempt=attempt,
+            provider=step.provider,
+            agent_profile=step.agent,
+        )
+        prompt = _substitute(step.prompt, record)  # §4 templating
+        try:
+            result = await run_agent_step(
+                provider=step.provider,
+                agent=step.agent,
+                prompt=prompt,
+                teardown=True,
+                timeout=WORKFLOW_STEP_TIMEOUT,
+                engine=step.engine,
+                env_vars={
+                    "CAO_WORKFLOW_RUN_ID": record.run_id,
+                    "CAO_WORKFLOW_STEP_ID": step.id,
+                },
+                cancel_event=record.cancel_event,
+                # The agent that started the run bounds every step it dispatches
+                # (utils/delegation.py); None for an operator-started run.
+                delegating_terminal_id=record.caller_id,
+            )
+            st.terminal_id = result.terminal_id
+            # U2 emission: a terminal exists for this step (after the id is bound).
+            await _journal_event(
+                record,
+                "terminal.created",
+                step_id=step.id,
+                attempt=attempt,
+                terminal_id=result.terminal_id,
+                provider=step.provider,
+                agent_profile=step.agent,
+            )
+            # Resolve the structured return INSIDE the try so a crash during the
+            # reprompt (§3 re-raises StepExecutionError) is caught below and
+            # consumes an attempt (Q6=A, Trace C).
+            outcome = await _collect_structured_output(record, step, prompt)
+        except StepCancelledError as exc:
+            # An in-flight cancel (#409b) is NOT a run-failure: do NOT consume the
+            # rest of the retry budget and do NOT mark the step FAILED. Settle the
+            # interrupted step SKIPPED (its work is abandoned; there is no
+            # CANCELLED step state, and leaving it RUNNING would reproduce exactly
+            # the stuck-`running` smell #409 targets). Then return so the drive
+            # loop converges the run to CANCELLED. The interrupted step already
+            # self-tore-down its own terminal inside run_agent_step.
+            if exc.terminal_id is not None:
+                st.terminal_id = exc.terminal_id
+            st.state = StepState.SKIPPED
+            # A cancelled step settled SKIPPED, not failed — never report a kind
+            # carried over from an earlier failed attempt of the same step.
+            st.error_kind = None
+            await _ajournal(_journal_step, record, step.id)
+            # U2 emission (BR-7): a cancellation settles the step SKIPPED — NEVER a
+            # failure event. The run converges CANCELLED at the drive-loop finalize.
+            await _journal_event(
+                record,
+                "step.skipped",
+                step_id=step.id,
+                attempt=attempt,
+                state=st.state.value,
+                terminal_id=st.terminal_id,
+                reason="cancelled",
+            )
+            logger.info(
+                "run '%s' step '%s' wait interrupted by cancel; converging CANCELLED",
+                record.run_id,
+                step.id,
+            )
+            return
+        except DelegationCeilingError as exc:
+            # The step's worker would hold tools the run's caller may not delegate
+            # (utils/delegation.py). Raised by create_terminal BEFORE any terminal
+            # exists, deterministic for the run, so it consumes the whole budget:
+            # retrying would refuse again. Settle the step FAILED with the refusal
+            # text (kind ``error``), journal it, and let the drive loop finish the
+            # run as any other step failure, rather than escaping the engine.
+            st.error = str(exc)
+            last_error_kind = "error"
+            await _ajournal(_journal_step, record, step.id, last_error_kind)
+            await _journal_event(
+                record,
+                "step.attempt.failed",
+                step_id=step.id,
+                attempt=attempt,
+                state=st.state.value,
+                error_kind=last_error_kind,
+                terminal_id=None,
+                provider=step.provider,
+                agent_profile=step.agent,
+            )
+            break  # no retry: the refusal does not change between attempts
+        except StepExecutionError as exc:
+            st.error = str(exc)
+            last_error_kind = exc.kind
+            st.error_kind = exc.kind
+            if exc.terminal_id is not None:
+                st.terminal_id = exc.terminal_id
+            # BR-6: persist the structured error kind onto the step projection now
+            # (still RUNNING between retries) so a cold read mid-retry surfaces it
+            # without event replay; cleared when the step later settles COMPLETED.
+            await _ajournal(_journal_step, record, step.id, exc.kind)
+            # U2 emission: this attempt failed (error_kind distinguishes a crash
+            # from a timeout, FR-1.2 / BR-6).
+            await _journal_event(
+                record,
+                "step.attempt.failed",
+                step_id=step.id,
+                attempt=attempt,
+                state=st.state.value,
+                error_kind=exc.kind,
+                terminal_id=exc.terminal_id,
+                provider=step.provider,
+                agent_profile=step.agent,
+            )
+            continue  # consume an attempt, retry the same prompt
+        # Settled (COMPLETED or COMPLETED_UNVALIDATED) — neither is a run-failure.
+        st.state = outcome
+        # A retried step that finally settled is not failed any more; clear the
+        # carried kind so the result envelope cannot report a stale failure.
+        st.error_kind = None
+        # §1: persist settled state + output + attempts (error_kind cleared to NULL).
+        await _ajournal(_journal_step, record, step.id)
+        # U2 emission: a validated/collected output was received (validation_result
+        # distinguishes valid from invalid); then the step settled.
+        if st.output is not None:
+            # ``output_ref`` carries a REFERENCE to the step's output, never the
+            # output itself: the compare diff (a_refs/b_refs) and the diagnostic
+            # bundle's references.artifacts are both documented as
+            # reference-level. output_reference() returns a content digest
+            # (``sha256:<16 hex>``) — stable, so compare still detects "this step
+            # produced something different", but revealing nothing and fixed-size
+            # regardless of output size.
+            #
+            # The output TEXT is NOT stored here. It reaches an operator only
+            # through the diagnostic bundle's capture-gated ``excerpts`` section,
+            # which re-reads the capture setting at export time — so turning
+            # capture off actually stops payloads from shipping, instead of
+            # leaving previously-written ones embedded in a "references" field.
+            # Imported lazily inside the function to match the module's other
+            # in-function imports and avoid an import cycle.
+            from cli_agent_orchestrator.services import workflow_retention
+
+            await _journal_event(
+                record,
+                "step.output.received",
+                step_id=step.id,
+                attempt=attempt,
+                validation_result="valid" if st.output.validated else "invalid",
+                terminal_id=st.terminal_id,
+                output_ref=workflow_retention.output_reference(_output_json(st.output)),
+            )
+        await _journal_event(
+            record,
+            "step.completed",
+            step_id=step.id,
+            attempt=attempt,
+            state=st.state.value,
+            terminal_id=st.terminal_id,
+            provider=step.provider,
+            agent_profile=step.agent,
+        )
+        return
+
+    # Attempts exhausted: every attempt raised StepExecutionError.
+    st.state = StepState.FAILED
+    # §1: persist FAILED state + last error + attempts + the structured error kind
+    # (BR-6, so a cold read surfaces the kind with no event replay).
+    await _ajournal(_journal_step, record, step.id, last_error_kind)
+    # U2 emission: the step is terminally FAILED (carries the last error kind).
+    await _journal_event(
+        record,
+        "step.failed",
+        step_id=step.id,
+        attempt=st.attempts,
+        state=st.state.value,
+        error_kind=last_error_kind,
+        terminal_id=st.terminal_id,
+        provider=step.provider,
+        agent_profile=step.agent,
+    )
+    if (step.on_failure or "halt") == "halt":
+        # Engine halts; start_run skips the remaining steps (§1). on_failure ==
+        # "continue" leaves the run RUNNING and sequencing continues.
+        record.state = RunState.FAILED
+
+
+async def _skip_remaining(record: RunRecord, order: List[WorkflowStep], from_index: int) -> None:
+    """Mark every still-PENDING step at/after ``from_index`` SKIPPED (§1).
+
+    The SINGLE producer of ``SKIPPED`` — reached on a halt (successors of the
+    failed step) and on a cancel (remaining PENDING steps). A halted step itself
+    is ``FAILED``, never ``SKIPPED`` (B3-BR-4 / B3-BR-7).
+    """
+    for step in order[from_index:]:
+        st = record.step_states[step.id]
+        if st.state == StepState.PENDING:
+            st.state = StepState.SKIPPED
+            await _ajournal(_journal_step, record, step.id)  # §1: persist the skip
+            # U2 emission (BR-1, after the in-memory skip): the halt/cancel reason
+            # distinguishes a halted-successor skip from a cancelled-remainder skip.
+            await _journal_event(
+                record,
+                "step.skipped",
+                step_id=step.id,
+                state=st.state.value,
+                reason=("cancelled" if record.cancelled else "upstream_halt"),
+            )
+
+
+def _build_result(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunResult:
+    """Aggregate a ``RunRecord`` into the run's ``WorkflowRunResult`` (§1 step 8)."""
+    steps: List[StepResult] = []
+    for step in order:
+        st = record.step_states[step.id]
+        steps.append(
+            StepResult(
+                id=step.id,
+                state=st.state,
+                attempts=st.attempts,
+                output=st.output.output if st.output is not None else None,
+                error=st.error,
+                error_kind=st.error_kind,
+            )
+        )
+    return WorkflowRunResult(
+        run_id=record.run_id,
+        workflow_name=record.workflow_name,
+        state=record.state,
+        steps=steps,
+        started_at=record.started_at,
+        finished_at=record.finished_at,
+    )
+
+
+async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunResult:
+    """Sequence ``record`` over ``order``, finalize, and aggregate (§1 steps 6-8).
+
+    THE single execution path (B4-RD-5): ``start_run`` and
+    ``resume_from_last_completed`` both drive through here, so resume cannot
+    diverge from the normal drive. A non-``PENDING`` (kept) step is skipped —
+    on a fresh run every step starts PENDING so the skip is a no-op; on a resume
+    it is exactly the B4-BR-9 keep boundary (done steps are never re-run, their
+    output stays available for templating).
+
+    An unexpected engine error mid-loop (e.g. ``_substitute`` raising
+    ``WorkflowEngineError`` on a bad template reference — raised OUTSIDE
+    ``_run_step``'s ``StepExecutionError`` guard) must NOT leave the registered
+    record stranded in RUNNING. Settle it to a terminal FAILED state (with
+    ``finished_at``) before re-raising so the boundary still maps it to 500 and
+    the registry is always left consistent (domain-entities lifecycle,
+    B3-RD-3/RD-5).
+    """
+    try:
+        for index, step in enumerate(order):
+            if record.cancelled:  # B3-BR-7 — cancel observed at a step boundary
+                await _skip_remaining(record, order, from_index=index)
+                record.state = RunState.CANCELLED
+                break
+            st = record.step_states[step.id]
+            if st.state in (StepState.COMPLETED, StepState.COMPLETED_UNVALIDATED):
+                continue  # kept on resume (B4-BR-9) — do not re-run a done step
+            await _run_step(record, step)
+            if record.state == RunState.FAILED:  # halt (B3-BR-4 on_failure=halt)
+                await _skip_remaining(record, order, from_index=index + 1)
+                break
+    except WorkflowEngineError:
+        # Settle the registered record into a terminal FAILED state before the
+        # error propagates to the boundary (-> 500). Mark the in-flight step FAILED
+        # too. The exception is NOT masked — it is re-raised unchanged.
+        if record.current_step_id is not None:
+            cur = record.step_states.get(record.current_step_id)
+            if cur is not None and cur.state not in (
+                StepState.COMPLETED,
+                StepState.COMPLETED_UNVALIDATED,
+            ):
+                cur.state = StepState.FAILED
+        record.state = RunState.FAILED
+        record.current_step_id = None
+        record.finished_at = _now()
+        # Persist the terminal FAILED state (best-effort) before re-raising (§1).
+        await _ajournal(_journal_current_step, record)
+        # U2 emission (BR-1, after the in-memory FAILED settle): an engine-internal
+        # invariant violation faulted the run (error_kind "error", not a step
+        # timeout). Emitted before the raise so the forensic timeline records it.
+        # Event BEFORE state, for the same trailing-gap reason as the finalize path
+        # below — see the ORDER IS LOAD-BEARING comment there.
+        await _journal_event(record, "run.failed", state=record.state.value, error_kind="error")
+        await _ajournal(_journal_run_state, record)
+        logger.error("drive: run '%s' failed with an engine error", record.run_id)
+        raise
+
+    # Finalize. A cancel that interrupted the FINAL (or only) step's in-flight
+    # wait (#409b) leaves the loop with no further boundary iteration to observe
+    # ``record.cancelled`` — converge to CANCELLED here so the run never settles
+    # COMPLETED after being cancelled. Any still-PENDING steps (none, for a
+    # last-step cancel) are marked SKIPPED for consistency with the boundary path.
+    if record.cancelled and record.state not in (RunState.FAILED, RunState.CANCELLED):
+        await _skip_remaining(record, order, from_index=0)
+        record.state = RunState.CANCELLED
+    if record.state not in (RunState.FAILED, RunState.CANCELLED):
+        record.state = RunState.COMPLETED
+    record.current_step_id = None
+    record.finished_at = _now()
+    await _ajournal(_journal_current_step, record)
+    # U2 emission (BR-1, after the in-memory terminal settle): the run reached its
+    # terminal state. Branch on the final state — run.completed for a clean finish,
+    # run.cancelled for a cooperative cancel, run.failed for a halted (on_failure=
+    # halt) run (its error_kind is already carried on the step.failed event).
+    #
+    # ORDER IS LOAD-BEARING: the terminal EVENT is appended BEFORE the terminal
+    # STATE is journaled (PR #526 review, BLOCKING). The reader's trailing-gap
+    # check declares a hole when a TERMINAL run's high-water exceeds its last
+    # stored seq, on the premise that a terminal run can have no append in flight
+    # (see workflow_journal.read_events_with_gaps). With the state written first
+    # that premise was false: every healthy completed run spent the duration of
+    # its final append looking exactly like a lost trailing write, so live
+    # followers were told "1 event(s) lost" on the common success path — and the
+    # web store latches that marker for the session. Appending the event first
+    # closes the window: by the time the run is observably terminal, its last
+    # event has already landed.
+    if record.state == RunState.CANCELLED:
+        await _journal_event(record, "run.cancelled", state=record.state.value)
+    elif record.state == RunState.FAILED:
+        await _journal_event(record, "run.failed", state=record.state.value, error_kind="error")
+    else:
+        await _journal_event(record, "run.completed", state=record.state.value)
+    # Journal the terminal run state last (§1, B4-BR-5). Still best-effort: a lost
+    # state write leaves the run non-terminal in the journal, which the F-1 guard
+    # in _follow_run_events handles — it re-reads state each poll and closes on the
+    # transition, so a follower is not pinned forever.
+    await _ajournal(_journal_run_state, record)
+
+    # Aggregate the result.
+    return _build_result(record, order)
+
+
+# ---------------------------------------------------------------------------
+# U5 addition (issue #312, RunSurface, C4/C1 boundary) — shared run-admission
+# pre-check (BR-9a), extracted from start_run's own inline checks so the YAML
+# arm (start_run, below) and the script arm (U5's run route,
+# ``run_script_workflow`` has no admission check of its own) share ONE
+# implementation, never two that could drift.
+# ---------------------------------------------------------------------------
+def _check_run_id_available(run_id: str) -> None:
+    """Raise ``KeyError`` if ``run_id`` is already claimed, by either tier.
+
+    Checks, in order: (1) a live in-process record (``run_registry``) or an
+    in-flight drive (``_active_drives``); (2) a best-effort durable journal
+    read — a restart-survived remnant's ``run_id`` must not be silently
+    reused to open a second drive under an old id. The journal read is
+    wrapped in a broad, best-effort catch (a broken journal must never block
+    a NEW run, B4-BR-5) — never a substitute for the engine's own admission,
+    just the sole gate ahead of it (BR-9a).
+    """
+    if run_id in run_registry or run_id in _active_drives:
+        raise KeyError(f"run_id '{run_id}' already exists")
+    try:
+        existing_row = workflow_journal.get_run(run_id)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal read is best-effort; a broken journal must not block new runs (B4-BR-5)
+        logger.debug("journal: _check_run_id_available('%s') failed; proceeding: %s", run_id, e)
+        existing_row = None
+    if existing_row is not None:
+        raise KeyError(f"run_id '{run_id}' already exists")
+
+
+# ---------------------------------------------------------------------------
+# §1 — start_run entry point
+# ---------------------------------------------------------------------------
+async def start_run(
+    spec: WorkflowSpec,
+    inputs: Dict[str, Any],
+    run_id: str,
+    caller_id: Optional[str] = None,
+) -> WorkflowRunResult:
+    """Run a validated workflow spec to completion, awaited inline (§1, Q1=A).
+
+    ``caller_id`` is the terminal starting the run, if an agent did; it is
+    recorded on the ``RunRecord`` so every step is bounded by that terminal's
+    delegation ceiling (see ``RunRecord.caller_id``).
+
+    Steps: validate the run_id key (B3-BR-1, shared validator) and the inputs
+    against ``spec.inputs`` (B3-BR-2) — failing BEFORE any terminal is created;
+    build + register the RunRecord; topo-sort the steps deterministically
+    (B3-BR-6); sequence them with a cancel-check + halt-handling loop; finalize.
+
+    Raises ``ValueError`` (-> 400) on a bad run_id / invalid inputs, ``KeyError``
+    (-> 409) if the run_id is already registered, actively driving, or journaled
+    (a durable row must never be clobbered by a reused id), ``NotBuiltYetError``
+    (-> reserved seam) for a non-sequential mode, ``WorkflowEngineError`` (-> 500)
+    on an engine-internal invariant violation (e.g. a bad template reference).
+    """
+    # 1. Validate run_id via the shared key validator (B3-BR-1), then the
+    # shared admission pre-check (U5, BR-9a) — extracted below so both the
+    # YAML arm (here) and the script arm (U5's run route) share ONE
+    # implementation, never two that can drift.
+    _validate_key_part(run_id, "run_id")
+    _check_run_id_available(run_id)
+
+    # 2. Validate inputs BEFORE any side effect (B3-BR-2 / FR-1.5, fail fast).
+    resolved_inputs = _validate_inputs(spec, inputs)
+
+    # Non-sequential mode dispatches to a reserved seam — NEVER silently run as
+    # sequential (B3-BR-6/B3-BR-10).
+    if spec.mode != "sequential":
+        _dispatch_reserved_mode(spec)
+
+    # 3. Build the RunRecord.
+    record = RunRecord(
+        run_id=run_id,
+        workflow_name=spec.name,
+        spec=spec,
+        inputs=resolved_inputs,
+        state=RunState.RUNNING,
+        current_step_id=None,
+        cancelled=False,
+        step_states={step.id: StepRunState(step_id=step.id) for step in spec.steps},
+        started_at=_now(),
+        caller_id=caller_id,
+    )
+    # 4. Register (in-memory floor) + mark the drive live + journal the run +
+    # seed every step (§1). The ``finally`` guarantees the liveness mark is
+    # cleared on EVERY exit path (complete, fail, engine error, cancel).
+    run_registry[run_id] = record
+    _active_drives.add(run_id)
+    try:
+        await _ajournal(_journal_insert_run, record)
+        # U2 emission (BR-1, after the run row + steps are seeded): the run
+        # started. Added ALONGSIDE the existing insert write-through — the engine
+        # register/insert/admission sequence above is unchanged (SEAM #1, BR-5).
+        await _journal_event(record, "run.started", state=record.state.value)
+
+        # 5. Deterministic sequencing order.
+        order = _topological_order(spec)
+
+        # 6-8. Sequence, finalize, aggregate — the single shared drive (B4-RD-5).
+        return await _drive(record, order)
+    finally:
+        _active_drives.discard(run_id)
+
+
+async def start_run_prepared(record: RunRecord) -> WorkflowRunResult:
+    """Drive an already-admitted, already-journaled, already-registered YAML run (U2, ADR-3).
+
+    The DEDICATED prepared entry the async submission path's background task
+    (``_run_in_background``) invokes. It is the EXACT tail of :func:`start_run`
+    (L822-832) with the pre-drive admission/insert/registration REMOVED: the async
+    handler (C1) has already run ``_check_run_id_available``, validated + capped the
+    inputs, run the reserved-mode guard, done the atomic durable insert, and
+    registered the ``record`` in ``run_registry`` BEFORE acking with 202. This
+    entry therefore re-runs NONE of that — it only marks the drive live and drives.
+
+    Re-entering the blocking :func:`start_run` here would be wrong on two counts
+    (ADR-3): it would call ``insert_run`` again (a plain INSERT -> ``IntegrityError``
+    on the already-journaled id) AND ``_check_run_id_available`` would see the id the
+    handler just registered as already-claimed and raise ``KeyError`` (-> 409) on
+    EVERY async YAML run — the double-admission hazard. A ``skip_insert`` flag
+    cannot fix the second problem; only a dedicated drive-only entry can.
+
+    ``_topological_order`` and ``_drive`` are reused UNCHANGED, so the async drive
+    settles the terminal state and per-step write-throughs identically to a blocking
+    run. The ``finally`` clears the ``_active_drives`` liveness mark on EVERY exit
+    path (complete, fail, engine error, cancel), so a settled run stays resumable.
+    """
+    _active_drives.add(record.run_id)
+    try:
+        order = _topological_order(record.spec)
+        return await _drive(record, order)
+    finally:
+        _active_drives.discard(record.run_id)
+
+
+# ---------------------------------------------------------------------------
+# §5 — cancel_run
+# ---------------------------------------------------------------------------
+def cancel_run(run_id: str) -> None:
+    """Cooperatively cancel a running workflow (§5, B3-BR-7).
+
+    Sets the ``cancelled`` flag AND fires ``cancel_event`` so the engine interrupts
+    the CURRENTLY in-flight step wait (issue #409b) rather than observing the cancel
+    only at the next step boundary — that boundary-only behavior meant a run hung
+    inside a long or never-settling step wait (the codex-IDLE case #409a addresses)
+    could never converge to CANCELLED. The interrupted step tears down its own
+    terminal; the drive loop then settles the run CANCELLED.
+
+    Idempotent (setting an already-set Event is a no-op), never raises into the
+    engine/worker path. Raises ``KeyError`` (-> 404) for an unknown run and
+    ``ValueError`` (-> 409) for a run already in a terminal state.
+    """
+    record = run_registry.get(run_id)
+    if record is None:
+        raise KeyError(f"unknown run_id '{run_id}'")
+    if record.state in (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED):
+        raise ValueError(f"run '{run_id}' is already {record.state.value}; cannot cancel")
+    record.cancelled = True
+    # Interrupt any in-flight step wait immediately (#409b). Guard the attribute
+    # for records rebuilt from an older journal shape that predates the field.
+    cancel_event = getattr(record, "cancel_event", None)
+    if cancel_event is not None:
+        cancel_event.set()
+    logger.info("cancel_run: run '%s' flagged for cooperative cancel", run_id)
+
+
+# ---------------------------------------------------------------------------
+# §6 — get_run_status
+# ---------------------------------------------------------------------------
+def get_run_status(run_id: str) -> RunStatus:
+    """Return a point-in-time SNAPSHOT copy of a run's state (§6, B3-BR-8).
+
+    No locks (Q3=A): the single asyncio loop mutates the record only between
+    awaits, so a reader at an await boundary never observes a half-written record.
+    The snapshot carries no per-step output or prompt (B3-SD-3). Raises
+    ``KeyError`` (-> 404) for an unknown run.
+    """
+    record = run_registry.get(run_id)
+    if record is None:
+        # Cache miss (cold read / after a restart). U5-Q1=A: a script-tier run's
+        # cold-miss fallback must NOT attempt ``_rebuild_record_from_journal``
+        # (YAML-only, ``WorkflowSpec.model_validate_json`` would corrupt-degrade
+        # a ScriptSpec snapshot) — short-circuit to the journal row's last-known
+        # state directly, without the fast path gaining any new dispatch branch.
+        row = None
+        try:
+            row = workflow_journal.get_run(run_id)
+        except (
+            Exception
+        ) as e:  # noqa: BLE001 — journal read is best-effort on a status read (B4-RD-4)
+            logger.debug("journal: get_run('%s') failed on cold status read: %s", run_id, e)
+        if row is not None and row.tier == "script":
+            return RunStatus(
+                run_id=row.run_id,
+                state=RunState(row.state),
+                current_step_id=row.current_step_id,
+                steps=[],
+            )
+        # Rebuild from the journal ONCE, then re-populate the cache (§2, B4-BR-4).
+        # A genuinely-absent run (absent from BOTH cache and journal) raises
+        # KeyError -> 404 (F1, contract unchanged). The rebuild returns None on
+        # absent and NEVER raises ValueError on this status read path.
+        record = _rebuild_record_from_journal(run_id)
+        if record is not None:
+            run_registry[run_id] = record
+    if record is None:
+        raise KeyError(f"unknown run_id '{run_id}'")
+    return RunStatus(
+        run_id=record.run_id,
+        state=record.state,
+        current_step_id=record.current_step_id,
+        steps=[
+            StepStatus(id=sid, state=st.state, attempts=st.attempts)
+            for sid, st in record.step_states.items()
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# §2 — registry-as-cache rebuild from the durable journal (Q1=B, B4-BR-3/4)
+# ---------------------------------------------------------------------------
+def _rebuild_record_from_journal(run_id: str) -> Optional[RunRecord]:
+    """Rebuild the in-memory ``RunRecord`` from the durable journal (§2, F2/F8).
+
+    Returns ``None`` when no ``workflow_run`` row exists for ``run_id`` (the caller
+    raises ``KeyError`` itself — this helper never raises on an absent run, F1).
+    The reconstructed dataclass uses the EXACT shipped ``RunRecord`` field binding
+    (``workflow_name`` is required; ``started_at``/``finished_at`` are restored from
+    the row — F2). ``step_states`` is seeded for EVERY step of the snapshotted spec
+    (PENDING) BEFORE overlaying persisted rows, so a partial ``insert_steps`` write
+    can never leave a step absent from the rebuilt record (F8 / B4-RD-3) — the
+    engine drive's ``record.step_states[step.id]`` stays total.
+
+    ``reprompted``/``terminal_id`` are NOT journaled (F3): on a kept step they are
+    irrelevant (it is skipped), on a reset step they are cleared anyway (B4-BR-9),
+    so they default here.
+    """
+    try:
+        row = workflow_journal.get_run(run_id)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal read is best-effort; a missing/failed table degrades to "absent" (B4-RD-4), the caller raises KeyError -> 404
+        logger.debug("journal: get_run('%s') failed; treating as absent: %s", run_id, e)
+        return None
+    if row is None:
+        return None
+
+    try:
+        spec = WorkflowSpec.model_validate_json(row.spec_snapshot)
+        inputs = json.loads(row.inputs_json)
+        if not isinstance(inputs, dict):
+            # "null" / arrays parse fine but leave record.inputs non-dict, which
+            # would later escape _drive as an unmapped TypeError. Corrupt -> absent.
+            raise ValueError(f"inputs_json is not a JSON object: {row.inputs_json!r}")
+        record = RunRecord(
+            run_id=row.run_id,
+            workflow_name=row.workflow_name,
+            spec=spec,
+            inputs=inputs,
+            state=RunState(row.state),
+            current_step_id=row.current_step_id,
+            started_at=row.started_at,
+            finished_at=row.finished_at,
+            caller_id=row.caller_id,
+        )
+    except (ValidationError, ValueError, TypeError) as e:
+        # ValidationError subclasses ValueError (pydantic v2) but is named for clarity;
+        # ValueError also covers json.JSONDecodeError and RunState coercion. Corrupt
+        # journal data degrades to "absent" (B4-RD-4) -> caller raises KeyError -> 404.
+        logger.debug("journal: run '%s' row is corrupt; treating as absent: %s", run_id, e)
+        return None
+    # F8: seed EVERY spec step PENDING first, then overlay durable rows.
+    for step in spec.steps:
+        record.step_states[step.id] = StepRunState(step_id=step.id, state=StepState.PENDING)
+    try:
+        step_rows = workflow_journal.get_steps(run_id)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal read is best-effort; on failure the seeded PENDING states stand (B4-RD-3)
+        logger.debug("journal: get_steps('%s') failed; using seeded PENDING: %s", run_id, e)
+        step_rows = []
+    for srow in step_rows:
+        if srow.step_id not in record.step_states:
+            # A persisted step no longer present in the snapshotted spec — skip it
+            # rather than resurrecting a ghost step into the rebuilt record.
+            logger.debug(
+                "journal: run '%s' step row '%s' not in spec snapshot; skipping",
+                run_id,
+                srow.step_id,
+            )
+            continue
+        try:
+            record.step_states[srow.step_id] = StepRunState(
+                step_id=srow.step_id,
+                state=StepState(srow.state),
+                attempts=srow.attempts,
+                output=_record_from_json(srow.output_json),
+                error=srow.error,
+            )
+        except ValueError as e:
+            # Unknown ``state`` value etc. — one bad row must never abort the
+            # rebuild; the seeded PENDING default stands for this step (B4-RD-3).
+            logger.debug(
+                "journal: run '%s' step row '%s' is corrupt; keeping seeded PENDING: %s",
+                run_id,
+                srow.step_id,
+                e,
+            )
+    # U2 re-seed (issue #504, crash-recovery closure): resume above
+    # max(persisted_high_water, max_event_seq) so a resumed run's emissions
+    # continue strictly above any allocated slot — no renumbering across the
+    # restart boundary. Two terms because either write of an emission may have
+    # been swallowed independently: the high-water can lag a durable append (if
+    # the high-water write was lost), and an append can lag the high-water (if the
+    # append was lost) — max() of both recovers the true floor. Both reads are
+    # best-effort and already degrade to 0 on failure (matching the seeded reads
+    # above), so this never raises into the rebuild path.
+    #
+    # THIRD TERM (PR #526 review): both durable reads degrade to 0 on failure, so
+    # a DOUBLE read fault re-seeded the counter to 0 and the next emission
+    # re-allocated seq 1 — colliding with an already-stored (run_id, seq) row on
+    # its PK and losing the event to an IntegrityError. That matters most on the
+    # resume path, which rebuilds over a record ALREADY LIVE in this process: the
+    # cached record's ``event_seq`` is a record of what this process has actually
+    # ALLOCATED, which is exactly the floor a resume must stay above (it is safer
+    # than any value that merely PERSISTED). Flooring against it makes the
+    # counter monotonic across a rebuild even when the journal is unreadable; on
+    # a genuine cold rebuild there is no cached record and the term is 0, so the
+    # normal two-term max is unchanged.
+    # ``run_registry`` is a UNION registry (U4 widened it to hold a script tier's
+    # ``ScriptRunRecord`` too), and a ScriptRunRecord has no ``event_seq`` — so
+    # the floor is read via getattr with a 0 default rather than attribute access
+    # that would AttributeError on a script row sharing this id.
+    live = run_registry.get(run_id)
+    live_floor = int(getattr(live, "event_seq", 0) or 0)
+    record.event_seq = max(
+        workflow_journal.persisted_high_water(run_id),
+        workflow_journal.max_event_seq(run_id),
+        live_floor,
+    )
+    return record
+
+
+# ---------------------------------------------------------------------------
+# U3 additions (issue #312, script-tier journal extension, C3) — additive only,
+# INV-1: no function above this block is modified by U3.
+# ---------------------------------------------------------------------------
+def check_generation(run_id: str, generation: str) -> None:
+    """Reject a stale-generation script call (A3, the ADR-9 anti-double-drive).
+
+    Every script ``run-step`` call carries ``CAO_WORKFLOW_GENERATION`` (forwarded
+    by U2); the run-step handler (U5, ``api/main.py::run_step``) calls this BEFORE
+    doing any work whenever the request's ``env_vars`` carries BOTH
+    ``CAO_WORKFLOW_RUN_ID`` and ``CAO_WORKFLOW_GENERATION`` (VR-3). Resume bumps
+    the run's generation BEFORE spawning (A4), so a reparented predecessor
+    subprocess that survived a crash still carries the OLD generation — its late
+    calls land here and are fenced out (DR-5 -> ``StaleGenerationError`` -> 409).
+
+    Raises ``KeyError`` (-> 404 at the boundary, same precedent as
+    ``get_run_status``) when ``run_id`` is unknown to the journal — that is a
+    different failure mode than a stale generation and must not be conflated
+    with it (DR-5 requires the *matching-run* generation to differ, not "no run
+    at all"). Raises ``StaleGenerationError`` on a generation mismatch (DR-5);
+    returns ``None`` on a match (DR-6, proceed).
+    """
+    row = workflow_journal.get_run(run_id)
+    if row is None:
+        raise KeyError(f"unknown run_id '{run_id}'")
+    if generation != row.generation:
+        raise StaleGenerationError(
+            f"run '{run_id}': call carried generation '{generation}' but the run's "
+            f"current generation is '{row.generation}'"
+        )
+
+
+def update_run_generation(run_id: str, generation: str) -> None:
+    """Persist a run's bumped generation (A4 write-side helper).
+
+    A thin additive write helper alongside the base's
+    ``update_run_current_step``/``update_run_state`` family. Per A4, the resume
+    (and DR-11 cancel) drive sequence is bump-then-persist-then-spawn: the
+    generation is bumped and persisted here BEFORE the resumed/cancelled run's
+    process (re)spawns, so any older-generation orphan is fenced by
+    ``check_generation`` from the moment it is stale, not from whenever it
+    happens to make its next call. Best-effort is deliberately NOT applied here
+    (unlike the ``_journal_*`` write-through helpers above): a failed generation
+    persist must be visible to the caller, since a silently-unpersisted bump
+    would let an orphan's old-generation calls through — this raises
+    ``sqlite3.Error`` on a DB failure, matching ``workflow_journal``'s documented
+    write-helper contract (module docstring), and the caller (U4/U5, out of
+    scope for U3) decides whether to retry or abort the resume/cancel.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        conn.execute(
+            "UPDATE workflow_run SET generation = ? WHERE run_id = ?",
+            (generation, run_id),
+        )
+
+
+def _is_resumable_for_tier(row: workflow_journal.RunRow) -> bool:
+    """Tier-aware resumability predicate (DR-7/DR-8, code-generation-plan precision fix).
+
+    **U3 supplies this journal primitive only — wiring it into the actual resume
+    ROUTE (replacing the inline check in ``resume_from_last_completed`` below) is
+    OUT OF SCOPE for U3; that is U4/U5's job.** ``resume_from_last_completed``'s
+    own inline check is untouched by this addition (INV-1): a YAML run's resume
+    behavior is byte-identical to before U3.
+
+    The pinned base tip's inline rule (verified at code-gen against
+    ``resume_from_last_completed``, not a function literally named
+    ``_is_resumable``) is: ``state in (COMPLETED, CANCELLED)`` -> not resumable;
+    everything else (``FAILED``, or a crash-remnant ``RUNNING`` row with no live
+    registry entry) -> resumable. Q3=A / DR-8 extends this for the SCRIPT tier
+    only: a ``CANCELLED`` script run IS resumable (a cancel-then-resume workflow,
+    US-C2) — but a ``CANCELLED`` YAML run stays non-resumable, matching the base
+    exactly. This function carves CANCELLED out of the shared "terminal, not
+    resumable" bucket per-tier; it does NOT relax ``COMPLETED`` for either tier
+    (DR-7 — a successfully finished run is never resumable), and it does NOT
+    perform the liveness-registry check (DR-9, layer 1) — that is the caller's
+    job, same as the base's own two-step check (registry, then journaled state).
+    """
+    state = RunState(row.state)
+    if state == RunState.COMPLETED:
+        return False
+    if state == RunState.CANCELLED:
+        return row.tier == "script"
+    return True
+
+
+# ---------------------------------------------------------------------------
+# §7 — reserved seams (raise NotBuiltYetError; never fake-run, B3-BR-10)
+# ---------------------------------------------------------------------------
+def _dispatch_reserved_mode(spec: WorkflowSpec) -> None:
+    """Route a non-sequential ``mode`` to its reserved seam (B3-BR-6/B3-BR-10).
+
+    Each branch hits the owning reserved seam (which raises ``NotBuiltYetError``)
+    so the failure names the implementing unit; a non-sequential mode is NEVER
+    silently downgraded to sequential.
+    """
+    if spec.mode in ("parallel", "pipeline"):
+        _run_parallel(None, None)
+    if spec.mode == "loop":
+        _run_loop(None, None)
+    # Defensive: grammar restricts ``mode`` to the four literals, so any other
+    # non-sequential value still fails loudly rather than running.
+    raise NotBuiltYetError(f"workflow mode '{spec.mode}' is reserved (not built yet)")
+
+
+async def resume_from_last_completed(
+    run_id: str, caller_id: Optional[str] = None
+) -> WorkflowRunResult:
+    """Resume a crashed/failed run from its durable journal (§3, FR-6.2, N6).
+
+    ``caller_id`` is the terminal resuming the run, if an agent is. The re-run
+    steps are bounded by the ORIGINAL starter's ceiling when the journal row
+    carries one (``workflow_run.caller_id``, see ``bound_caller``): an operator
+    or a wider agent resuming a reviewer's run cannot widen its steps. Only a
+    run that was started with no caller is bounded by the resumer.
+
+    Un-reserves the B3-BR-10 stub. The algorithm (business-logic-model §3):
+
+    1. Validate ``run_id`` via the shared key validator (B4-BR-2) -> ``ValueError``
+       (-> 400) on a malformed/traversal key.
+    2. **Liveness guard** (B4-BR-7a, F4): if the run is in ``_active_drives`` — a
+       drive loop is actually executing it IN THIS PROCESS -> a
+       ``ResumeNotAllowedError`` (-> 409). Never double-drive a live run. A cached
+       registry record with ``state == RUNNING`` is NOT enough: a status read may
+       rebuild a crash remnant into the cache as RUNNING with nothing executing,
+       and that remnant must stay resumable.
+    3. Load the ``workflow_run`` row; absent -> ``KeyError`` (-> 404, F1).
+    4. A ``COMPLETED``/``CANCELLED`` run is terminal and not resumable ->
+       ``ResumeNotAllowedError`` (-> 409, B4-BR-7). A ``FAILED`` run, or a
+       ``RUNNING`` row with NO live record (a crash remnant), IS resumable.
+    5. Deserialize ``spec_snapshot`` (Q2=B, B4-BR-8); a corrupt snapshot ->
+       ``ResumeCorruptError`` (-> 422).
+    6. Rebuild the ``RunRecord`` cache (§2, seeds all steps), then apply the Q3=A
+       skip/re-run boundary (B4-BR-9): keep ``COMPLETED``/``COMPLETED_UNVALIDATED``
+       (output reused for templating), UNCONDITIONALLY reset every other state to
+       ``PENDING`` (attempts=0, terminal_id=None, error=None, reprompted=False) so
+       the failed step + its halted successors re-run with a fresh terminal
+       (B4-BR-10).
+    7. Re-enter the SAME Bolt-3 drive over the snapshotted spec's topo order (a
+       single execution path, no resume/normal divergence — B4-RD-5). The drive
+       skips non-``PENDING`` steps, so the reset above is the only resume-specific
+       transformation; persisted inputs are the RESOLVED snapshot, not re-validated
+       (B4-BR-10a).
+    """
+    # 1. Validate the run_id key via the shared validator (B4-BR-2).
+    _validate_key_part(run_id, "run_id")
+
+    # 2. Liveness guard (B4-BR-7a / F4): never resume a run a drive loop is
+    # actively executing in THIS process. Do NOT trust a cached record's RUNNING
+    # state — a rebuilt crash remnant is RUNNING in the cache with no live drive.
+    if run_id in _active_drives:
+        raise ResumeNotAllowedError(
+            f"run '{run_id}' is currently executing; cannot resume a live run"
+        )
+
+    # 3. Load the durable row; absent (or an unreadable journal) -> KeyError -> 404 (F1).
+    # Read stays on-loop deliberately: a small point read via the sync helper
+    # shared with the sync status path.
+    try:
+        row = workflow_journal.get_run(run_id)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal read is best-effort; an unreadable journal means nothing to resume (B4-RD-4)
+        logger.debug("journal: resume get_run('%s') failed; treating as absent: %s", run_id, e)
+        row = None
+    if row is None:
+        raise KeyError(f"unknown run_id '{run_id}'")
+
+    # 4. Terminal runs are not resumable (B4-BR-7). A corrupt (non-enum) state
+    # string is corrupt journal data -> 422, consistent with a corrupt snapshot —
+    # never a bare ValueError that would mislead as a 400 "bad request".
+    try:
+        state = RunState(row.state)
+    except ValueError as e:
+        raise ResumeCorruptError(f"run '{run_id}' has corrupt state '{row.state}'") from e
+    if state in (RunState.COMPLETED, RunState.CANCELLED):
+        raise ResumeNotAllowedError(f"run '{run_id}' is {state.value}; not resumable")
+
+    # 5. Deserialize the snapshotted spec (Q2=B, B4-BR-8); corrupt -> 422.
+    try:
+        spec = WorkflowSpec.model_validate_json(row.spec_snapshot)
+    except ValidationError as e:
+        raise ResumeCorruptError(f"run '{run_id}' snapshot is corrupt: {e}") from e
+
+    # 6. Rebuild the cache (§2) and apply the Q3=A skip/re-run boundary (B4-BR-9).
+    # Rebuild reads stay on-loop deliberately: small point reads via the sync
+    # helpers shared with the sync status path.
+    record = _rebuild_record_from_journal(run_id)
+    if record is None:
+        # The row existed above but the rebuild degraded it to absent (e.g.
+        # corrupt inputs_json) — surface as unknown rather than resuming garbage.
+        raise KeyError(f"unknown run_id '{run_id}'")
+    for st in record.step_states.values():
+        if st.state in (StepState.COMPLETED, StepState.COMPLETED_UNVALIDATED):
+            continue  # keep done; output reused for {{steps.<id>.output.<field>}}
+        st.state = StepState.PENDING
+        st.attempts = 0
+        st.reprompted = False
+        st.terminal_id = None  # fresh terminal on re-run (B4-BR-10)
+        st.error = None
+        st.output = None
+
+    # Re-open the run and re-register the rebuilt record as the live cache.
+    record.state = RunState.RUNNING
+    record.cancelled = False
+    record.current_step_id = None
+    record.finished_at = None
+    # The ORIGINAL caller (journaled at start) keeps bounding the run; a resume by
+    # a different actor must not widen it. Only a run that was started with no
+    # caller (operator) takes the resumer's bound.
+    record.caller_id = bound_caller(row.caller_id, caller_id)
+    run_registry[run_id] = record
+    # Mark the drive live BEFORE the first await: the off-loop journal writes
+    # below yield, and a concurrent resume for the same run_id must hit the
+    # liveness guard during that window (B4-BR-7a — never double-drive). The
+    # ``finally`` clears the mark on EVERY exit path (complete, fail, engine
+    # error, cancel, journal-write error).
+    _active_drives.add(run_id)
+    try:
+        try:
+            await asyncio.to_thread(
+                workflow_journal.update_run_state, run_id, RunState.RUNNING.value, None
+            )
+        except (
+            Exception
+        ) as e:  # noqa: BLE001 — journal write is best-effort; in-memory floor still serves live reads
+            logger.warning("journal: resume reopen state write for '%s' failed: %s", run_id, e)
+        # Persist the cleared current_step_id too — otherwise the durable row stays
+        # stale until the first resumed step journals (best-effort, B4-BR-5).
+        await _ajournal(_journal_current_step, record)
+
+        # 7. Re-enter the SAME shared drive over the snapshotted spec's topo order
+        # (B4-RD-5).
+        return await _drive(record, _topological_order(spec))
+    finally:
+        _active_drives.discard(run_id)
+
+
+# ---------------------------------------------------------------------------
+# Single-step re-execution against a recorded run (issue #640)
+# ---------------------------------------------------------------------------
+async def replay_single_step(
+    run_id: str,
+    step_id: str,
+    prompt_override: Optional[str] = None,
+    caller_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Re-execute ONE recorded step live, leaving the source run untouched (#640).
+
+    ``caller_id``: the terminal replaying the step, if an agent is; the replayed
+    worker is bounded by its delegation ceiling like any workflow step.
+
+    The authoring loop this exists for: on a 57-step workflow, fixing two sentences
+    of step 55's prompt should not cost a full re-run to reach step 55 again. The
+    journal already holds everything one step needs — the spec snapshot, the
+    resolved run inputs, and every predecessor's output — so a step's prompt can be
+    resolved from the RECORDED run and executed on its own.
+
+    READ-ONLY with respect to ``run_id``: no ``_journal_*`` write-through runs, no
+    event is emitted, no ``run_registry`` entry is created or mutated, and the
+    replayed step emits its structured output under a per-call NONCED key so the
+    recorded step's own store entry survives. Replaying a step is therefore never
+    destructive to the run it was read from, and can be repeated freely — including
+    CONCURRENTLY, since no two calls share a store key.
+
+    ``prompt_override`` replaces the step's prompt TEMPLATE, not the resolved
+    prompt: ``{{workflow.inputs.<name>}}`` / ``{{steps.<id>.output.<field>}}``
+    references inside the override still resolve against the recorded run — which
+    is exactly what makes an edited prompt runnable in place. An override that is
+    empty or whitespace-only is REJECTED rather than run: ``None`` means "use the
+    recorded template", so a blank string can only be a mistake, and running a step
+    against a blank prompt burns a step budget to learn nothing.
+
+    Deliberately NOT restricted to a finished run. A step of a still-RUNNING run is
+    replayable, and safe for the same reason a repeat replay is: the source run's
+    journal, registry entry, and store slots are untouched, and the nonced key
+    cannot collide with the live drive's. Whether the step's predecessors have
+    actually produced output is answered by prompt resolution (-> 400 naming the
+    missing reference), which is a better answer than a blanket state guard —
+    iterating on step 12's prompt while the run is still grinding through step 30
+    is the authoring loop this exists for.
+
+    Also deliberately NOT cancellable: unlike the drive loop this passes no
+    ``cancel_event``, so a hung replay runs to the ``WORKFLOW_STEP_TIMEOUT``
+    ceiling. One watched step needs no cooperative-cancel machinery, and
+    ``cao workflow cancel`` targets a run this call never creates.
+
+    Raises ``KeyError`` (-> 404) for an unknown run or an unknown step,
+    :class:`ResumeCorruptError` (-> 422) when the run has no deserializable spec
+    snapshot, ``ValueError`` (-> 400) for a script-tier run, an empty override, or a
+    prompt that cannot be resolved from the recorded predecessors. A step that FAILS
+    is reported in the returned payload (``error`` / ``error_kind``), never raised —
+    the same posture as the drive loop, where a step failure is data rather than an
+    exception.
+
+    Every raise above is a PREFLIGHT one: each is decided before the step runs, and
+    each keeps its own status code. Once execution starts the posture inverts, and
+    three failures are normalised into the payload rather than raised —
+    ``StepExecutionError`` (readiness/completion timeout, or the terminal reaching
+    ERROR), a ``TimeoutError`` from provider initialisation, and an
+    :class:`~cli_agent_orchestrator.providers.base.OutputExtractionError` from
+    extracting the output of a step that already completed. The last two used to
+    escape as 500 and 400 respectively, which reported a step that had RUN as a
+    malformed request. The list is closed on purpose: a failure that is not one of
+    those three is not known to be a step failure, and is left to propagate rather
+    than be dressed up as one.
+
+    A ``StepExecutionError`` also leaves its worker ALIVE — ``run_agent_step``
+    hands that terminal to its caller instead of deleting it — so this function
+    tears the terminal down before releasing the replay's private output slot.
+    Otherwise the request ends while its producer keeps running, and a late
+    ``workflow_return`` from that worker re-creates the slot that was just freed.
+    """
+    _validate_key_part(run_id, "run_id")
+    _validate_key_part(step_id, "step_id")
+
+    # ``None`` is the "use the recorded template" signal, so an override that is
+    # present but blank is a caller mistake, not a request for a blank prompt.
+    if prompt_override is not None and not prompt_override.strip():
+        raise ValueError(
+            "prompt_override is empty; omit it to re-run the step's recorded prompt "
+            "(a blank prompt would run the step with no instructions)"
+        )
+
+    row = workflow_journal.get_run(run_id)
+    if row is None:
+        raise KeyError(f"unknown run '{run_id}'")
+    if row.tier == "script":
+        raise ValueError(
+            f"run '{run_id}' is a script-tier run; single-step replay covers YAML runs only "
+            f"(a script step's inputs come from the script, not from a spec snapshot)"
+        )
+
+    # The SAME reader resume uses (§2): it seeds every snapshotted step and overlays
+    # the journaled rows, so predecessor outputs arrive already shaped for
+    # ``_substitute``. It degrades a corrupt/absent snapshot to None — and the row
+    # existed above, so None here means the snapshot itself is unusable.
+    record = _rebuild_record_from_journal(run_id)
+    if record is None:
+        raise ResumeCorruptError(
+            f"run '{run_id}' has no usable spec snapshot; cannot replay one of its steps"
+        )
+
+    step = next((s for s in record.spec.steps if s.id == step_id), None)
+    if step is None:
+        raise KeyError(f"run '{run_id}' has no step '{step_id}'")
+
+    template = step.prompt if prompt_override is None else prompt_override
+    try:
+        prompt = _substitute(template, record)
+    except WorkflowEngineError as e:
+        # In a replay every unresolved reference is a PRECONDITION the caller can
+        # act on — a predecessor never produced output, or an override names a step
+        # that is not in the snapshot — not an engine invariant violation. So it
+        # maps to 400 with the reference named, never to a 500.
+        raise ValueError(f"cannot resolve the prompt for step '{step_id}' of run '{run_id}': {e}")
+
+    # A replayed step still needs ``CAO_WORKFLOW_RUN_ID`` so its ``workflow_return``
+    # has somewhere to land — but NOT the source run's key, which would overwrite
+    # the recorded step's entry in the in-memory ``step_output_store``. Derive a
+    # PER-CALL key: 40 chars of run_id + "-replay-" (8) + a 16-hex nonce is exactly
+    # WORKFLOW_NAME_RE's 64-char cap, which ``record_step_output`` re-validates when
+    # the worker emits. The nonce is what makes the key private to this call, and it
+    # closes three holes a fixed ``<prefix>-replay`` key left open (found in review):
+    #   - a REAL run named ``<prefix>-replay`` no longer shares the keyspace, so
+    #     replaying ``foo`` cannot wipe or clobber run ``foo-replay``'s store entry;
+    #   - two CONCURRENT replays of the same (run_id, step_id) no longer share a key,
+    #     so neither can read the other's output as its own;
+    #   - truncation aliasing between run_ids sharing a long prefix is likewise moot.
+    # The run_id prefix is kept only so the key is legible in a log line; the nonce
+    # is what carries the isolation. Nothing reads this key back except the block
+    # below, which deletes it when done.
+    replay_run_id = f"{run_id[:40]}-replay-{uuid.uuid4().hex[:16]}"
+
+    logger.info(
+        "replay_single_step: re-running step '%s' of run '%s' (override=%s)",
+        step_id,
+        run_id,
+        prompt_override is not None,
+    )
+    # ``replay_run_id`` is deliberately NOT in the payload: it is an internal store
+    # key, now per-call, so it names nothing a caller can look up or act on. It stays
+    # in the log line above, which is where a maintainer tracing an emit wants it.
+    payload: Dict[str, Any] = {
+        "run_id": run_id,
+        "step_id": step_id,
+        "provider": step.provider,
+        "agent": step.agent,
+        "prompt": prompt,
+        "terminal_id": None,
+        "last_message": None,
+        "output": None,
+        "validated": None,
+        "error": None,
+        "error_kind": None,
+    }
+    try:
+        try:
+            result = await run_agent_step(
+                provider=step.provider,
+                agent=step.agent,
+                prompt=prompt,
+                teardown=True,
+                timeout=WORKFLOW_STEP_TIMEOUT,
+                engine=step.engine,
+                env_vars={
+                    "CAO_WORKFLOW_RUN_ID": replay_run_id,
+                    "CAO_WORKFLOW_STEP_ID": step_id,
+                },
+                delegating_terminal_id=caller_id,
+            )
+        except StepExecutionError as e:
+            # Recorded, not raised (the drive loop's posture). Deliberately NO retry
+            # and NO reprompt: a replay is one attempt an author is watching, so a
+            # failure must surface now rather than spend another step budget in
+            # silence.
+            payload["error"] = str(e)
+            payload["error_kind"] = e.kind
+            payload["terminal_id"] = e.terminal_id
+            # THE WORKER IS STILL RUNNING AT THIS POINT. ``run_agent_step`` tears a
+            # terminal down on success, on cancellation and on extraction failure — but
+            # NOT here: at its readiness-timeout raise it says so outright ("We do NOT
+            # auto-delete here: leaving the terminal lets the caller decide"), and its
+            # completion wait re-raises ``StepExecutionError`` untorn while tearing down
+            # only ``StepCancelledError``. The DRIVE LOOP is the caller that wants that
+            # bargain: it pins ``exc.terminal_id`` onto the step state, and the run's
+            # registry entry, journal row and ``cao workflow cancel`` all still reach the
+            # worker afterwards. A replay has none of those — no run record, no cancel
+            # path, and a nonced store key private to this one call — so for a replay
+            # "left to the caller" means leaked. Observed: a completion timeout returned
+            # the failure payload while its worker kept running, and a later
+            # ``workflow_return`` from that worker was ACCEPTED and recreated the private
+            # store entry after the ``finally`` below had already released it.
+            #
+            # Tearing down inside this arm — rather than in the ``finally`` — is the
+            # ordering that closes it: the producer is dead before its slot is
+            # relinquished, so there is no window where a live worker can write to a
+            # released key. ``_best_effort_teardown`` never raises (it logs and swallows
+            # both halves of exit-then-delete), which is what keeps the ORIGINAL step
+            # failure the one the caller is told about even when cleanup itself fails.
+            #
+            # ``registry=None`` matches the ``run_agent_step`` call above, which passes no
+            # registry either: the in-process engine path dispatches no plugin hooks.
+            if e.terminal_id is not None:
+                await _best_effort_teardown(e.terminal_id, None)
+        except DelegationCeilingError as e:
+            # The replayed worker would hold tools the replaying terminal may not
+            # delegate. Nothing ran and no terminal exists, so there is nothing to
+            # tear down; report it in the payload like any other step failure.
+            payload["error"] = str(e)
+            payload["error_kind"] = "error"
+        except (TimeoutError, OutputExtractionError) as e:
+            # Two terminal-layer failures ``run_agent_step`` propagates verbatim instead
+            # of wrapping in ``StepExecutionError``, and both are the STEP failing rather
+            # than the REQUEST being bad. Provider initialization can raise
+            # ``TimeoutError`` (see that function's own ``Raises``: "ValueError /
+            # TimeoutError: propagated from terminal_service"), and completed-output
+            # extraction can raise ``OutputExtractionError``.
+            #
+            # Unnormalized, neither reached this payload: the timeout surfaced as an
+            # unhandled exception -> HTTP 500 "Internal Server Error", and
+            # ``OutputExtractionError`` — a ``ValueError`` subclass — fell into the
+            # route's ``except ValueError`` arm -> HTTP 400 "No message marker found",
+            # telling the caller its request was malformed about a step that had already
+            # RUN. It also broke the documented shape: ``cao workflow step ... --json``
+            # printed a plain error instead of the replay result carrying the resolved
+            # prompt and ``error``/``error_kind``. Catching the narrower type ahead of
+            # ``ValueError`` is the same move ``api/main.py`` already makes at its two
+            # ``get_output`` boundaries for issue #570.
+            #
+            # THE TUPLE IS DELIBERATELY NARROW. A bare ``except Exception`` here would
+            # report a programming error inside this function as a step failure, and the
+            # preflight raises live OUTSIDE this block on purpose so they keep their own
+            # codes: unknown run/step -> 404, corrupt snapshot -> 422, blank override or
+            # unresolvable template -> 400. Only failures of the EXECUTION are data.
+            #
+            # No teardown on this path, and that is not an omission. An
+            # ``OutputExtractionError`` can only arrive after ``run_agent_step``'s own
+            # extraction guard already tore the terminal down, and an initialization
+            # ``TimeoutError`` fails before there is a terminal id to tear down — neither
+            # leaves this call a handle, so there is nothing here to release.
+            payload["error"] = str(e)
+            payload["error_kind"] = "timeout" if isinstance(e, TimeoutError) else "error"
+        else:
+            payload["terminal_id"] = result.terminal_id
+            payload["last_message"] = result.last_message
+            emitted = step_output_store.get(replay_run_id, step_id)
+            if emitted is not None:
+                payload["output"] = emitted.output
+                payload["validated"] = emitted.validated
+    finally:
+        # Hand the slot back once its value is in the payload. The nonced key is
+        # private to this call, so nothing else can ever read it again — leaving it
+        # would pin one entry per replay for the process lifetime and bring the
+        # WORKFLOW_OUTPUT_STORE_MAX_ENTRIES eviction line that much closer for the
+        # live runs sharing this store. In the failure arm too: a step can emit and
+        # then fail, and that entry is just as unreachable.
+        step_output_store.delete(replay_run_id, step_id)
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# §7 (cont.) — the remaining reserved seams
+# ---------------------------------------------------------------------------
+def _run_parallel(record: Optional[RunRecord], steps: Any) -> None:
+    """RESERVED (N7) — parallel/pipeline execution. Raises ``NotBuiltYetError``."""
+    raise NotBuiltYetError("parallel/pipeline execution is reserved (not built yet; unit N7)")
+
+
+def _run_loop(record: Optional[RunRecord], step: Any) -> None:
+    """RESERVED (N8) — loop execution. Raises ``NotBuiltYetError``."""
+    raise NotBuiltYetError("loop execution is reserved (not built yet; unit N8)")
+
+
+def _eval_on_stall(paths: Any, n: Any) -> None:
+    """RESERVED (N8) — stall guard. Raises ``NotBuiltYetError``."""
+    raise NotBuiltYetError("on_stall guard is reserved (not built yet; unit N8)")
+
+
+def _eval_on_no_progress(values: Any, k: Any, eps: Any) -> None:
+    """RESERVED (N8) — no-progress guard. Raises ``NotBuiltYetError``."""
+    raise NotBuiltYetError("on_no_progress guard is reserved (not built yet; unit N8)")
