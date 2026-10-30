@@ -971,3 +971,72 @@ dialog#project-dialog::backdrop {
   background: #dbe7f9;
   color: #1a4294;
 }
+
+.update-panel {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid #dde5ef;
+}
+
+.update-panel-heading,
+.update-panel-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.update-panel-heading h3 {
+  margin: 0;
+  color: #24364e;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.update-badge {
+  color: #687a92;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.update-badge.available { color: #207456; }
+
+.update-versions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.update-versions > div {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  min-width: 0;
+}
+
+.update-versions span {
+  color: #72839a;
+  font-size: 11px;
+}
+
+.update-versions code {
+  color: #30425c;
+  font-size: 11px;
+}
+
+.update-state {
+  margin: 13px 0 16px;
+  color: #5e708a;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.update-panel-actions { justify-content: flex-start; }
+.update-panel-actions button { font-size: 11px; padding: 8px 12px; }
+.update-panel-actions button:disabled { cursor: not-allowed; opacity: .5; }
+
+@media (max-width: 480px) {
+  .update-versions { grid-template-columns: 1fr; gap: 6px; }
+  .update-panel-actions { flex-wrap: wrap; }
+}
