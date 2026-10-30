@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from manager.model_router import ModelRouter, NoEligibleModel, infer_role, parse_quota_wait_seconds
+from manager.app import ollama_model_profile
 from manager.outcomes import ensure_usable_result
 
 
@@ -47,11 +48,21 @@ async def test_role_backend_and_file_permissions_are_hard_filters(tmp_path):
     assert infer_role("planner", "Yeni iş adımları") == "architect"
     assert infer_role("writer", "Başlık yaz") == "general"
     assert infer_role("security_auditor", "Kod denetle") == "reviewer"
+    assert infer_role("feature_developer", "Şirket içi etkinlik planlama") == "development"
+    assert infer_role("frontend_architect", "Takvim bileşenini planla ve yaz") == "development"
     assert (await router.choose("architect", "cao", allow_writes=False)).model_id == "local_text"
-    assert (await router.choose("planning", "cao", allow_writes=True)).provider != "ollama"
+    assert (await router.choose("planning", "cao", allow_writes=True)).provider == "ollama"
     assert [choice.model_id for choice in await router.rank("reviewer", "ao", allow_writes=True)] == ["writer_b"]
     assert not await router.rank("development", "cao", allow_writes=True,
                                  availability={"codex": False, "antigravity": False})
+
+
+def test_vision_ollama_model_is_not_assigned_coding_or_architecture():
+    capabilities, _, modalities = ollama_model_profile(
+        'moondream:latest', {'details': {'family': 'moondream'}})
+    assert 'development' not in capabilities
+    assert 'architect' not in capabilities
+    assert modalities == ['text', 'image']
 
 
 @pytest.mark.asyncio
@@ -60,7 +71,7 @@ async def test_small_local_model_needs_explicit_priority_for_complex_planning(tm
     models[2] = {**models[2], "priority": {"general": 4}}
     router = ModelRouter(models, tmp_path / "unknown-quality.sqlite")
     choice = await router.choose("architect", "cao", allow_writes=False)
-    assert choice.model_id == "writer_a"  # master role has configured priority 8
+    assert choice.model_id == "writer_b"  # Codex priority is normalized to 7.
     assert choice.quota_confidence == "unknown"
     assert any("görev kalitesi ölçülmedi" in reason for reason in choice.reasons)
     # An operator can explicitly mark local planning as a better fit.
@@ -95,9 +106,9 @@ async def test_observed_token_load_is_only_a_routing_proxy(tmp_path):
         connection.execute("INSERT INTO token_ledger VALUES (1,'r','s','writer_a',5000,1000,6000,?)",
                            (datetime.now(timezone.utc).isoformat(),))
     ranked = await router.rank("general", "direct", allow_writes=True)
-    assert ranked[0].model_id == "writer_b"
-    assert ranked[0].quota_confidence == "unknown"
-    assert any("yaklaşık kullanım" in reason for reason in ranked[1].reasons)
+    assert ranked[0].model_id == "local_text"
+    assert ranked[0].quota_confidence == "local"
+    assert any("yaklaşık kullanım" in reason for choice in ranked for reason in choice.reasons)
 
 
 @pytest.mark.asyncio

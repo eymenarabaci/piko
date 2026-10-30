@@ -162,7 +162,8 @@ class _WindowsJob:
 
 
 async def run_command(command: list[str], *, root: Path, workspace: Path,
-                      timeout: float, on_event, stdin: str | None = None) -> dict:
+                      timeout: float, on_event, stdin: str | None = None,
+                      env: dict[str, str] | None = None) -> dict:
     """Return {returncode, stdout, stderr}; no shell, no automatic retry.
 
     Output has a shared 2 MiB cap. Heartbeats report activity, never infer a failure.
@@ -182,7 +183,7 @@ async def run_command(command: list[str], *, root: Path, workspace: Path,
         options = {'creationflags': subprocess.CREATE_NO_WINDOW | 0x4} if job else {'start_new_session': True}
         spawning = asyncio.create_task(asyncio.create_subprocess_exec(*command, cwd=str(workspace),
                     stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **options))
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env, **options))
         # Retain the returned process handle even when cancellation races OS spawn.
         proc, spawn_cancelled = await _join_owned(spawning)
         identity = psutil.Process(proc.pid)

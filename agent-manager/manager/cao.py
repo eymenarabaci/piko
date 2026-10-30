@@ -17,6 +17,7 @@ import psutil
 
 from .processes import _WindowsJob, _record
 from .local_media import create_media, media_scene_instructions
+from .local_edits import apply_local_edits, local_write_prompt
 from .worker_catalog import MAX_WORKER_DEPTH, WorkerRequestError, get_worker, worker_prompt
 
 
@@ -253,7 +254,7 @@ class CAOClient:
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode("utf-8")) > 200_000:
             raise CAOError("Görev metni boş veya çok büyük.")
         if provider == "ollama_local" and allow_writes:
-            raise CAOError("Ollama CAO işçisi metin üretir; dosya yazma adımı için Codex veya Antigravity seçin.")
+            prompt = local_write_prompt(workspace, prompt)
         await on_event("cao_starting", "CAO Windows işçisi hazırlanıyor.", {"provider": provider})
         job_id = uuid4().hex
         
@@ -336,11 +337,15 @@ class CAOClient:
         output_lower = output.lower()
         if any(term in output_lower for term in ("you’ve hit your usage limit", "you've hit your usage limit", "usage limit", "quota_exceeded", "insufficient_quota", "too many requests", "rate limit reached")):
             raise CAOError(f"Model ({model.get('id')}) kullanım kotasına ulaşıldı: {output[:300]}")
+        changed = []
+        if provider == "ollama_local" and allow_writes:
+            changed = apply_local_edits(workspace, output)
+            output += "\n\nUygulanan yerel dosya düzenlemeleri: " + ", ".join(changed)
         terminal_id = data.get("terminal_id")
         await on_event("cao_completed", "CAO işçisi tamamladı.", {"terminal_id": terminal_id, "warm_session": bool(reuse_id)})
         return {"output": output, "model_id": model["id"], "status": "completed",
                 "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
-                "cao_terminal_id": terminal_id}
+                "cao_terminal_id": terminal_id, "local_patch_applied": changed}
 
     async def run_worker(self, role: str, task: str, model: dict, *, workspace: str,
                          allow_writes: bool, timeout: float, on_event,
@@ -362,8 +367,6 @@ class CAOClient:
                       else worker_prompt(spec, task, allow_writes=worker_writes))
         except WorkerRequestError as exc:
             raise CAOError(str(exc)) from exc
-        if worker_writes and role not in {"image_generator", "video_generator"} and model.get("provider") == "ollama":
-            raise CAOError("Ollama kod işçisi dosya düzenleyemez; yazabilen model seçin.")
         bounded_timeout = float(timeout)
         if bounded_timeout <= 0:
             raise CAOError("İşçi süre sınırı pozitif olmalı.")

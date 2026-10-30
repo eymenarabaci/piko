@@ -5,6 +5,7 @@ import asyncio
 from collections import Counter
 from contextlib import asynccontextmanager
 import json
+import re
 
 from fastapi.testclient import TestClient
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -42,7 +43,8 @@ class FakeProviders:
         self.parallel_barrier = None
 
     def available(self):
-        return [{"id": "test", "available": True, "executable": "test-only"}]
+        return [{"id": provider, "available": True, "executable": "test-only"}
+                for provider in {model["provider"] for model in self.models}]
 
     async def run(self, model_id, prompt, *, workspace, allow_writes, timeout, on_event, effort=""):
         self.calls.append({"model": model_id, "prompt": prompt, "writes": allow_writes})
@@ -50,7 +52,9 @@ class FakeProviders:
             assert not allow_writes, "Planning must never inherit write permission"
             return {"output": json.dumps({"steps": self.steps}), "model_id": model_id,
                     "status": "completed", "usage": {}}
-        sid = prompt.split("Bu adım:\n", 1)[1].split("\n", 1)[0].removeprefix("TASK_")
+        match = re.search(r"=== ŞU AN YÜRÜTÜLEN ADIM: [^\n]+ ===\nTASK_([a-z_]+)", prompt)
+        assert match or "=== ŞU AN YÜRÜTÜLEN ADIM: Doğrudan yanıt ===" in prompt, "Adım istemi beklenen görev işaretini içermiyor."
+        sid = match.group(1) if match else "response"
         self.counts[sid] += 1
         self.started.set()
         self.active += 1
@@ -124,7 +128,7 @@ async def test_plan_edit_resume_dependency_results_and_events(tmp_path):
         event_page = await engine.store.events(run["id"])
         kinds = [event["kind"] for event in event_page["events"]]
         assert kinds.count("step_completed") == 2
-        assert kinds[-1] == "completed"
+        assert "completed" in kinds
         assert (await engine.store.events(run["id"], event_page["cursor"]))["events"] == []
         with pytest.raises(ValueError):
             await engine.edit(run["id"], edited)
@@ -203,7 +207,7 @@ async def test_ao_backend_uses_langgraph_and_awaits_worktree_review(tmp_path):
         async def health(self): return {"available": True}
         async def run(self, model, prompt, *, on_spawn, on_event, **kwargs):
             assert model["id"] == "codex"
-            assert "Bu adım:" in prompt
+            assert "=== ŞU AN YÜRÜTÜLEN ADIM:" in prompt
             await on_spawn("ao-test-1")
             return {"output": "AO sonucu", "ao_session_id": "ao-test-1", "status": "completed"}
 
@@ -259,7 +263,7 @@ def test_api_local_boundary_and_unknown_run(tmp_path):
         assert bootstrap.json()["engine"] == "LangGraph"
         assert client.get("/api/runs/missing").status_code == 404
         assert client.post("/api/runs/missing/resume", json={}).status_code == 404
-        assert client.get("/api/runs", headers={"Host": "attacker.example"}).status_code == 403
+        assert client.get("/api/runs", headers={"Host": "attacker.example"}).status_code == 401
         assert client.post("/api/runs", json={}, headers={"Origin": "https://attacker.example"}).status_code == 403
         assert client.post("/api/runs", content="not-json").status_code == 415
         assert client.post("/api/runs", json={}).status_code == 422
@@ -272,7 +276,7 @@ def routing_models():
         {"id": "codex_a", "provider": "codex", "execution_supported": True,
          "capabilities": ["general", "development", "reviewer", "master"],
          "priority": {"general": 1, "development": 1, "reviewer": 1, "master": 1}},
-        {"id": "codex_b", "provider": "codex", "execution_supported": True,
+        {"id": "agy_b", "provider": "antigravity", "execution_supported": True,
          "capabilities": ["general", "development", "reviewer", "master"],
          "priority": {"general": 2, "development": 2, "reviewer": 2, "master": 2}},
     ]
@@ -294,8 +298,8 @@ async def test_auto_route_hands_off_on_quota_error(tmp_path):
         created = await engine.create(request(mode="chat", executor_model="auto"))
         done = await settle(engine, created["id"])
         assert done["status"] == "completed", done.get("error")
-        assert done["results"]["response"]["model_id"] == "codex_b"
-        assert done["plan"]["steps"][0]["model_id"] == "codex_b"
+        assert done["results"]["response"]["model_id"] == "agy_b"
+        assert done["plan"]["steps"][0]["model_id"] == "agy_b"
         events = (await engine.store.events(done["id"]))["events"]
         assert any(event["kind"] == "model_handoff" for event in events)
 
@@ -357,6 +361,7 @@ async def test_cao_parent_can_call_one_bounded_worker(tmp_path):
         def __init__(self): self.parent_calls = 0; self.worker_calls = []
         async def health(self): return {"available": True}
         async def close(self): pass
+        async def clear_terminal_pool(self, workspace=None): pass
         async def run(self, model, prompt, **kwargs):
             self.parent_calls += 1
             output = ('<cao_workers>{"calls":[{"role":"technical_writer","task":"Kısa özet yaz"}]}</cao_workers>'

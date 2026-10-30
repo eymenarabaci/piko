@@ -28,6 +28,7 @@ from .outcomes import ensure_usable_result, is_infrastructure_error
 from .patcher import apply_patch_blocks, parse_search_replace_blocks
 from .personas import PersonaManager
 from .project_memory import ProjectMemory
+from .graphify_context import GraphifyContext
 from .planning_policy import planning_guidance
 from .schema import Plan, RunRequest, parse_plan, validate_models, workspace_path
 from .store import now
@@ -51,6 +52,7 @@ class Engine:
         self.router = ModelRouter(self.models, store.path.parent / "token_ledger.sqlite")
         self.persona_mgr = PersonaManager(Path(default_workspace).parent, store.path.parent / "cao")
         self.project_memory = ProjectMemory(store.path.parent)
+        self.graphify_context = GraphifyContext(store.path.parent)
         self.project_memory_locks = {}
         self.tasks = {}
         self.quota_waiters = {}
@@ -64,12 +66,19 @@ class Engine:
         return self.workspace_write_locks.setdefault(key, asyncio.Lock())
 
     async def project_memory_context(self, workspace, task, *, max_chars=6000):
-        """Read incremental, task-relevant structural context without an LLM call."""
+        """Combine local project memory and optional Graphify code relationships."""
         try:
+            max_chars = max(0, int(max_chars))
+            if max_chars == 0:
+                return ''
+            graph = await self.graphify_context.context(workspace, task,
+                                                        max_chars=min(1800, max_chars // 3))
+            graph_section = f'[Graphify kod ilişkileri — statik analiz]\n{graph}\n' if graph else ''
             key = str(Path(workspace).resolve())
             async with self.project_memory_locks.setdefault(key, asyncio.Lock()):
-                return await asyncio.to_thread(self.project_memory.context, workspace, task,
-                                               max_chars=max_chars)
+                memory = await asyncio.to_thread(self.project_memory.context, workspace, task,
+                                                 max_chars=max_chars - len(graph_section))
+            return (graph_section + memory)[:max_chars]
         except Exception:
             # Memory is an optimization; it must not prevent the requested work.
             return ""
@@ -82,6 +91,8 @@ class Engine:
             key = str(Path(run["workspace"]).resolve())
             async with self.project_memory_locks.setdefault(key, asyncio.Lock()):
                 stats = await asyncio.to_thread(self.project_memory.refresh, run["workspace"], run)
+            if stats.get('changed') or stats.get('removed'):
+                self.graphify_context.invalidate(run['workspace'])
             await self.store.event(run_id, "project_memory_updated",
                                    "Proje not defteri ve bağımlılık grafiği güncellendi.", stats)
         except Exception as exc:
@@ -167,8 +178,6 @@ class Engine:
         if request.execution_backend == "cao":
             if request.executor_model != "auto" and self.models[request.executor_model].get("provider") not in {"codex", "antigravity", "ollama"}:
                 raise ValueError("CAO yürütücüsü Codex, Antigravity veya Ollama modeli gerektirir.")
-            if request.executor_model != "auto" and request.allow_writes and self.models[request.executor_model].get("provider") == "ollama":
-                raise ValueError("Ollama CAO işçisi dosya düzenleyemez; yazma için Codex veya Antigravity seçin.")
             if not (await self.cao.health())["available"]:
                 raise ValueError("CAO Windows motoru hazır değil; yerel kurulumu kontrol edin.")
         run = {**request.model_dump(), "id": uuid.uuid4().hex, "execution_id": uuid.uuid4().hex, "status": "queued",
@@ -244,6 +253,18 @@ class Engine:
             await self.store.save(run)
         return run
 
+    async def add_instruction(self, run_id: str, message: str):
+        """Queue user guidance atomically for the next step or reflection."""
+        async with self.locks.setdefault(run_id, asyncio.Lock()):
+            run = await self.store.get(run_id)
+            if run is None or run.get("status") not in {"queued", "planning", "running", "waiting_quota"}:
+                raise ValueError("Yalnız etkin göreve ek talimat gönderilebilir.")
+            run["orchestrator_messages"] = [*run.get("orchestrator_messages", [])[-19:], message]
+            run["updated_at"] = now()
+            await self.store.save(run)
+        await self.store.event(run_id, "user_instruction", "Ek talimat sıradaki adıma iletilecek.")
+        return run
+
     async def set_step_model(self, run_id: str, step_id: str, model_id: str) -> None:
         """Persist a quota handoff without overwriting parallel step updates."""
         async with self.locks.setdefault(run_id, asyncio.Lock()):
@@ -293,8 +314,7 @@ class Engine:
                        for mid, m in self.models.items() if m.get("execution_supported", True)
                        and (run.get("execution_backend") != "ao" or m.get("provider") == "codex")
                        and (run.get("execution_backend") != "cao" or m.get("provider") in {"codex", "antigravity", "ollama"})
-                       and not (run.get("execution_backend") == "cao" and run.get("allow_writes")
-                                and m.get("provider") == "ollama")]
+                       ]
             personas = self.persona_mgr.list_personas()
             skills = self.persona_mgr.list_skills()
             available_mcps = []
@@ -336,10 +356,14 @@ class Engine:
             planner_id = run["planner_model"]
             if planner_id == "auto":
                 availability = await self.model_availability()
-                best = next((mid for mid, ok in availability.items() if ok and mid in self.models and self.models[mid].get("provider") != "ollama" and self.models[mid].get("execution_supported", True)), None)
-                if not best:
-                    best = next((mid for mid, ok in availability.items() if ok and mid in self.models and self.models[mid].get("execution_supported", True)), "gemini-3.8-flash-medium")
-                planner_id = best
+                ranked = await self.router.rank("architect", run["execution_backend"],
+                                                allow_writes=False, availability=availability,
+                                                estimated_tokens=self.optimizer.estimate_tokens(prompt))
+                planner_id = ranked[0].model_id if ranked else next(
+                    (mid for mid, ok in availability.items() if ok and mid in self.models
+                     and self.models[mid].get("execution_supported", True)), "gemini-3.8-flash-medium")
+            await self.store.event(run["id"], "planner_selected", f"Planlayıcı: {planner_id}",
+                                   {"model_id": planner_id, "provider": self.models.get(planner_id, {}).get("provider")})
             try:
                 result = await self.providers.run(planner_id, prompt,
                     workspace=run["workspace"], allow_writes=False, timeout=run["timeout_seconds"],
@@ -349,19 +373,19 @@ class Engine:
                 raise
             except Exception as first_error:
                 availability = await self.model_availability()
-                local = next((mid for mid, model in self.models.items()
-                              if model.get("provider") == "ollama" and model.get("execution_supported", True)
-                              and availability.get(mid) and mid != planner_id), None)
-                if local is None:
-                    raise ValueError(f"{first_error} Yerel Ollama hazır değil; planlayıcıyı elle değiştirin.") from first_error
-                await self.store.event(run["id"], "planner_local_fallback",
-                                       f"{planner_id} plan üretemedi; yerel {local} deneniyor.",
-                                       {"from": planner_id, "to": local})
-                result = await self.providers.run(local, prompt,
+                fallback = next((mid for mid, model in self.models.items()
+                                 if model.get("provider") != self.models.get(planner_id, {}).get("provider")
+                                 and model.get("execution_supported", True) and availability.get(mid)), None)
+                if fallback is None:
+                    raise ValueError(f"{first_error} Alternatif planlayıcı hazır değil.") from first_error
+                await self.store.event(run["id"], "planner_local_fallback" if self.models[fallback].get("provider") == "ollama" else "planner_fallback",
+                                       f"{planner_id} plan üretemedi; {fallback} deneniyor.",
+                                       {"from": planner_id, "to": fallback})
+                result = await self.providers.run(fallback, prompt,
                     workspace=run["workspace"], allow_writes=False, timeout=run["timeout_seconds"],
                     on_event=self.emitter(run["id"], "planner"))
                 plan = parse_plan(result["output"])
-                planner_id = local
+                planner_id = fallback
             await self.change(run["id"], planner_model_actual=planner_id)
             if run["executor_model"] == "auto":
                 reservations: dict[str, int] = {}
@@ -369,7 +393,8 @@ class Engine:
                     role = infer_role(step.persona, f"{step.title} {step.prompt}")
                     choices = await self.router.rank(
                         role=role, backend=run["execution_backend"],
-                        allow_writes=run["allow_writes"],
+                        allow_writes=bool(run["allow_writes"] and step.persona not in
+                                          {"reviewer", "qa_tester", "security_auditor", "architect", "researcher", "analyzer"}),
                         availability=await self.model_availability(),
                         estimated_tokens=self.optimizer.estimate_tokens(step.prompt),
                     )
@@ -435,9 +460,6 @@ class Engine:
         if run.get("execution_backend") == "cao" and any(
                 self.models[s.model_id].get("provider") not in {"codex", "antigravity", "ollama"} for s in plan.steps):
             raise ValueError("CAO planında Codex, Antigravity veya Ollama adımları kullanılabilir.")
-        if run.get("execution_backend") == "cao" and run.get("allow_writes") and any(
-                self.models[s.model_id].get("provider") == "ollama" for s in plan.steps):
-            raise ValueError("Yazma izinli CAO planında Ollama adımları kullanılamaz; model metin üretir.")
 
     async def run_executor(self, run, step, prompt, *, previous=None, allow_writes=None,
                            role=None, on_event=None):
@@ -770,7 +792,7 @@ class Engine:
                                 result["worker_results"] = worker_results
                         
                         # Apply surgical diff patches if any were emitted
-                        if is_step_writer and run.get("workspace"):
+                        if is_step_writer and run.get("workspace") and not result.get("local_patch_applied"):
                             patch_blocks = parse_search_replace_blocks(result.get("output", ""))
                             if patch_blocks:
                                 async with workspace_write_lock:
@@ -857,11 +879,11 @@ class Engine:
         if run.get("plan_revision", 0) >= MAX_ADAPTATIONS:
             prompt += "\nGenişletme hakkı doldu: action=complete seç ve nihai kısa değerlendirme ver."
         availability = await self.model_availability()
-        choices = [mid for mid, model in self.models.items()
-                   if model.get("provider") == "ollama" and model.get("execution_supported", True)
-                   and availability.get(mid, False)]
+        choices = [choice.model_id for choice in await self.router.rank(
+            "architect", run["execution_backend"], allow_writes=False,
+            availability=availability, estimated_tokens=self.optimizer.estimate_tokens(prompt))]
         if not choices:
-            raise NoEligibleModel("Yerel Ollama orkestratör modeli hazır değil.")
+            raise NoEligibleModel("Orkestratör modeli hazır değil.")
         for model_id in choices[:2]:
             try:
                 if run["execution_backend"] == "cao":
@@ -890,9 +912,9 @@ class Engine:
                 if kind is None:
                     raise
                 await self.store.event(run["id"], "orchestrator_handoff",
-                                       f"Yerel orkestratör {model_id} sınırına takıldı; başka yerel model deneniyor.",
+                                       f"Orkestratör {model_id} sınırına takıldı; başka model deneniyor.",
                                        {"model_id": model_id, "kind": kind})
-        raise NoEligibleModel("Yerel orkestratör modelleri kota sınırına takıldı.")
+        raise NoEligibleModel("Orkestratör modelleri kota sınırına takıldı.")
 
     async def synthesize_summary(self, run: dict, results: dict) -> str:
         """Synthesize a clean, professional executive conversational summary of the entire run."""
@@ -1011,10 +1033,17 @@ class Engine:
                         state = await self.invoke(graph, run_id, phase,
                                                   {"prompt": run["prompt"], "results": {}})
                         await self.change(run_id, results=state["results"], current_steps=[])
-                        if run["mode"] != "orchestrate" or run["executor_model"] != "auto" or run["execution_backend"] == "ao":
+                        if run["mode"] not in {"plan", "orchestrate"} or run["executor_model"] != "auto" or run["execution_backend"] == "ao":
                             break
                         run = await self.store.get(run_id)
-                        decision = await self.reflect(run)
+                        try:
+                            decision = await self.reflect(run)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            await self.store.event(run_id, "plan_reflection_skipped",
+                                                   f"Plan değerlendirmesi tamamlanamadı: {str(exc)[:200]}")
+                            break
                         if decision.action == "complete" or revision >= MAX_ADAPTATIONS:
                             await self.change(run_id, orchestrator_answer=decision.answer or decision.reason)
                             break
@@ -1238,6 +1267,7 @@ class Engine:
         return await self.store.get(run_id)
 
     async def close(self):
+        await self.graphify_context.close()
         for run_id in list(self.quota_waiters):
             self.cancel_quota_resume(run_id)
         tasks = list(self.tasks.values())

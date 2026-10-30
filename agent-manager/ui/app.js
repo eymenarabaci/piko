@@ -1014,6 +1014,10 @@ function renderRun() {
 
   const anyWaitingQuota = run?.status === 'waiting_quota' || Object.values(run?.results || {}).some(r => r.status === 'waiting_quota');
   $('#job-banner').hidden = !run || (!activeStatuses.has(run.status) && !anyWaitingQuota);
+  $('#cancel-job').textContent = 'Durdur';
+  $('#prompt').placeholder = run && activeStatuses.has(run.status)
+    ? 'Çalışan göreve ek talimat yazın (sıradaki adımda uygulanır)…'
+    : 'Mesajınızı yazın…';
   $('#job-banner').classList.toggle('banner-waiting-quota', anyWaitingQuota);
   if (anyWaitingQuota) {
     const timer = run.quota_timer || Object.values(run.results || {}).find(r => r.status === 'waiting_quota');
@@ -1067,7 +1071,7 @@ function renderRun() {
     return;
   }
 
-  const fingerprint = JSON.stringify([run.id, run.status, run.error, run.plan, run.results, run.current_steps, run.chat_history, run.orchestrator_answer, run.plan_history, state.conversationRuns, state.planViewId, state.events, state.runTokens]);
+  const fingerprint = JSON.stringify([run.id, run.status, run.error, run.plan, run.results, run.quota_timer, run.current_steps, run.chat_history, run.orchestrator_answer, run.plan_history, state.conversationRuns, state.planViewId, state.events, state.runTokens]);
   if (fingerprint === state.fingerprint) {
     renderInspector();
     return;
@@ -1489,19 +1493,32 @@ function renderInspector() {
     const chatLog = node('div', 'chat-log');
 
     // Show past messages if any
-    (run.orchestrator_messages || []).forEach((msg, idx) => {
-      chatLog.append(node('div', idx % 2 === 0 ? 'chat-msg-user' : 'chat-msg-ai', msg));
+    (run.orchestrator_messages || []).forEach(msg => {
+      chatLog.append(node('div', 'chat-msg-user', `Siz: ${msg}`));
     });
 
     const inputRow = node('form', 'chat-input-row');
     const chatInput = node('input', 'chat-input');
-    chatInput.placeholder = 'Orkestratöre talimat veya soru yazın...';
+    chatInput.placeholder = activeStatuses.has(run.status)
+      ? 'Sıradaki adım için ek talimat yazın...'
+      : 'Orkestratöre talimat veya soru yazın...';
     chatInput.required = true;
     inputRow.append(chatInput, button('Gönder', 'primary-button'));
     inputRow.addEventListener('submit', async e => {
       e.preventDefault();
       const msg = chatInput.value.trim();
       if (!msg) return;
+      if (activeStatuses.has(run.status)) {
+        try {
+          await api(`/api/runs/${encodeURIComponent(run.id)}/instructions`, {
+            method: 'POST', body: JSON.stringify({message: msg})
+          });
+          chatInput.value = '';
+          chatLog.append(node('div', 'chat-msg-user', `Siz: ${msg}`));
+          toast('Talimat sıradaki adıma iletildi.');
+        } catch (err) { toast(errorText(err)); }
+        return;
+      }
       chatInput.value = '';
       chatLog.append(node('div', 'chat-msg-user', `Siz: ${msg}`));
       const pending = node('div', 'chat-msg-ai', 'Ajan çalışıyor… 0 sn');
@@ -2657,6 +2674,22 @@ $('#composer').addEventListener('submit', async event => {
   const attachments = attachmentIds();
   const prompt = $('#prompt').value.trim() || (attachments.length ? 'Eklediğim dosyaları incele ve özetle.' : '');
   if (!prompt) return;
+  if (state.run && activeStatuses.has(state.run.status)) {
+    if (attachments.length) { toast('Çalışan göreve ek talimatta dosya eki desteklenmiyor.'); return; }
+    setBusy(true);
+    try {
+      const res = await api(`/api/runs/${encodeURIComponent(state.run.id)}/instructions`, {
+        method: 'POST', body: JSON.stringify({message: prompt})
+      });
+      $('#prompt').value = '';
+      state.run = res.run;
+      state.fingerprint = '';
+      renderRun();
+      toast('Talimat sıradaki adıma iletildi. Çalışan adımın istemi değişmez.');
+    } catch (error) { toast(errorText(error)); }
+    finally { setBusy(false); }
+    return;
+  }
   if (!state.bootstrap) {
     toast('Önce yerel sunucu bağlantısının kurulmasını bekleyin.');
     return;
@@ -2696,7 +2729,8 @@ $('#composer').addEventListener('submit', async event => {
     const res = await api('/api/assist', {
       method: 'POST',
       body: JSON.stringify({
-        message: prompt, model_id: requestedModel, planning_level: $('#planning-level').value,
+        message: prompt, model_id: requestedModel, planner_model: state.settings.planner_model || 'auto',
+        planning_level: $('#planning-level').value,
         conversation_run_id: previousId || '', client_run_id: clientRunId,
         workspace: state.activeProject?.path || state.settings.workspace || state.bootstrap.workspace_default,
         project_id: state.activeProject?.id || '', allow_writes: $('#allow-writes').checked,

@@ -1,9 +1,10 @@
-"""CAO execution contract at the Piko boundary; no model calls."""
+"""CAO execution contract at the Agent Manager boundary; no model calls."""
 
 import httpx
 import pytest
 
 from manager.cao import CAOClient, CAOError
+from manager.local_edits import LocalEditError
 
 
 @pytest.mark.asyncio
@@ -96,9 +97,20 @@ async def test_cao_ollama_uses_local_text_worker(tmp_path):
     assert body["prompt"] == "Görev"
     assert result["output"] == "TAMAM"
     assert result["usage"] == {"input_tokens": 4, "output_tokens": 2}
-    with pytest.raises(CAOError, match="dosya yazma"):
+    with pytest.raises(LocalEditError, match="dosya bloğu"):
         await client.run(model, "Görev", workspace=str(tmp_path),
                          allow_writes=True, timeout=30, on_event=event)
+    target = tmp_path / "note.txt"
+    target.write_text("before\n", encoding="utf-8")
+    async def patch_request(method, path, *, body, timeout):
+        assert "YEREL DOSYA DÜZENLEME PROTOKOLÜ" in body["prompt"]
+        return {"last_message": "File: note.txt\n<<<< SEARCH\nbefore\n====\nafter\n>>>>",
+                "terminal_id": None}
+    client.request = patch_request
+    edited = await client.run(model, "note.txt dosyasını düzenle", workspace=str(tmp_path),
+                              allow_writes=True, timeout=30, on_event=event)
+    assert edited["local_patch_applied"] == ["note.txt"]
+    assert target.read_text(encoding="utf-8") == "after\n"
 
 
 @pytest.mark.asyncio

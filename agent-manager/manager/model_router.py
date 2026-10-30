@@ -112,7 +112,18 @@ _ROLE_ALIASES = {
 
 def infer_role(persona: str, prompt: str = "") -> str:
     """Choose a broad catalog capability; never infer provider-specific skill."""
-    value = f"{persona} {prompt[:400]}".casefold()
+    persona_value = persona.casefold()
+    # The declared worker role takes precedence over incidental words in its
+    # task title (e.g. "event planning" is still implementation work).
+    for keywords, role in (
+        (("review", "audit", "security", "test", "qa"), "reviewer"),
+        (("develop", "frontend", "backend", "code", "implement"), "development"),
+        (("architect", "planner", "research", "analy"), "architect"),
+        (("orchestrat",), "master"),
+    ):
+        if any(word in persona_value for word in keywords):
+            return role
+    value = prompt[:400].casefold()
     for keywords, role in (
         (("review", "audit", "security", "test", "qa", "incele", "denet"), "reviewer"),
         (("plan", "architect", "mimar", "tasarım", "decompos"), "architect"),
@@ -343,7 +354,6 @@ class ModelRouter:
                     or provider not in {"codex", "antigravity", "ollama"}
                     or (backend == "ao" and provider != "codex")
                     or (backend == "cao" and provider not in {"codex", "antigravity", "ollama"})
-                    or (allow_writes and provider == "ollama")
                     or (availability is not None and
                         (availability.get(mid) is False or availability.get(provider) is False))):
                 continue
@@ -377,8 +387,6 @@ class ModelRouter:
             if backend == "cao" and provider not in {"codex", "antigravity", "ollama"}:
                 continue
             if provider not in {"codex", "antigravity", "ollama"}:
-                continue
-            if allow_writes and provider == "ollama":
                 continue
             if availability is not None and (availability.get(mid) is False or availability.get(provider) is False):
                 continue
@@ -434,7 +442,6 @@ class ModelRouter:
             elif provider == "ollama":
                 confidence = "local"
                 reasons.append("yerel Ollama; sağlayıcı API kotası yok")
-                score -= 2
             else:
                 confidence = "unknown"
                 reasons.append("sağlayıcı kalan kotası bilinmiyor")

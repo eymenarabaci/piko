@@ -12,6 +12,7 @@ import httpx
 
 from .processes import MAX_OUTPUT_BYTES, ProcessError, run_command
 from .outcomes import ensure_usable_result
+from .local_edits import apply_local_edits, local_write_prompt
 
 
 class ProviderError(RuntimeError):
@@ -116,7 +117,13 @@ class Providers:
         images = images or []
         try:
             if provider == 'ollama':
-                return await self._ollama(model_id, prompt, timeout, on_event, images=images)
+                local_prompt = local_write_prompt(directory, prompt) if allow_writes else prompt
+                result = await self._ollama(model_id, local_prompt, timeout, on_event, images=images)
+                if allow_writes:
+                    changed = apply_local_edits(directory, result['output'])
+                    result['local_patch_applied'] = changed
+                    result['output'] += '\n\nUygulanan yerel dosya düzenlemeleri: ' + ', '.join(changed)
+                return result
             if provider == 'codex':
                 command = resolve_codex() + ['--no-daemon', 'exec', '--ephemeral',
                          '--json', '--skip-git-repo-check', '--sandbox', 'workspace-write' if allow_writes else 'read-only',

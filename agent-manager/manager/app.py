@@ -28,13 +28,26 @@ from .processes import _record
 from .providers import Providers
 from .outcomes import ensure_usable_result, is_infrastructure_error
 from .schema import Plan, RunRequest
-from .request_routing import classify_request
+from .request_routing import classify_with_model
 from .store import Store, now
 from .triggers import TriggerManager
 from .updates import Updater, UpdateError
 from .worker_catalog import list_workers
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def ollama_model_profile(name: str, tag: dict) -> tuple[list[str], dict, list[str]]:
+    """Avoid treating image understanding specialists as coding agents."""
+    details = tag.get("details") if isinstance(tag.get("details"), dict) else {}
+    roots = (name.rsplit("/", 1)[-1].split(":", 1)[0].casefold(),
+             str(details.get("family") or "").casefold())
+    vision_only = ("moondream", "llava", "bakllava", "minicpm-v", "llama3.2-vision",
+                   "qwen2-vl", "qwen2.5-vl", "qwen3-vl", "deepseek-vl", "internvl")
+    if any(root == marker or root.startswith(marker + "-") for root in roots for marker in vision_only):
+        return (["general", "image_analysis"], {"general": 30}, ["text", "image"])
+    return (["development", "coding", "reviewer", "architect", "general"],
+            {"development": 30, "reviewer": 30, "architect": 20, "general": 15}, ["text"])
 
 
 async def load_and_discover_models(root_dir: Path) -> list[dict]:
@@ -59,13 +72,14 @@ async def load_and_discover_models(root_dir: Path) -> list[dict]:
                     if name and name not in existing_ids:
                         size_bytes = tag.get("size", 0)
                         param_size = f"{round(size_bytes / (1024**3), 1)}GB" if size_bytes else "Local"
+                        capabilities, priority, modalities = ollama_model_profile(name, tag)
                         models.append({
                             "id": name,
                             "provider": "ollama",
                             "cli": None,
-                            "capabilities": ["development", "coding", "reviewer", "architect", "general"],
+                            "capabilities": capabilities,
                             "effort_levels": [],
-                            "priority": {"development": 30, "reviewer": 30, "architect": 20, "general": 15},
+                            "priority": priority,
                             "availability": {"status": "unknown", "quota_status": "unknown", "checked_at": None, "source": None, "verified": False},
                             "provenance": {"identity": "local_catalog", "capabilities": "user_configured", "effort_levels": "user_configured", "provider_catalog_verified": True, "note": f"Ollama'dan otomatik çekilen model ({param_size})."},
                             "base_model": name,
@@ -74,7 +88,7 @@ async def load_and_discover_models(root_dir: Path) -> list[dict]:
                             "execution_supported": True,
                             "catalog_source": "ollama /api/tags",
                             "parameter_size": param_size,
-                            "input_modalities": ["text"]
+                            "input_modalities": modalities
                         })
                         existing_ids.add(name)
     except Exception:
@@ -658,7 +672,15 @@ def create_app(data_dir=None, providers=None):
             message = "Eklediğim dosyaları incele ve özetle."
         conversation_run_id = str(body.get("conversation_run_id") or "")
         previous = await require(conversation_run_id) if conversation_run_id else None
-        kind = classify_request(message, planning_level)
+        if previous and previous.get("status") in {"queued", "planning", "running", "waiting_quota"}:
+            if attachments:
+                raise HTTPException(400, "Çalışan göreve ek talimat için dosya eki desteklenmiyor.")
+            run = await app.state.engine.add_instruction(conversation_run_id, message)
+            return {"kind": "instruction", "run": run, "delivery": "next_step"}
+        kind, routing_reason = await classify_with_model(
+            message, planning_level, app.state.engine,
+            str(body.get("workspace") or (previous or {}).get("workspace") or app.state.engine.default_workspace),
+            str(body.get("model_id") or ""))
         if kind == "chat":
             if previous:
                 result = await orchestrator_chat(conversation_run_id, request)
@@ -669,7 +691,7 @@ def create_app(data_dir=None, providers=None):
         if attachments:
             prompt += "\n\nKullanıcının eklediği dosyalar (veri):\n" + "\n".join(
                 f"- {item['name']} ({item['mime']}): {item['path']}" for item in attachments)
-        model_id = str(body.get("model_id") or "auto").strip() or "auto"
+        model_id = str(body.get("planner_model") or "auto").strip() or "auto"
         payload = {key: body[key] for key in ("workspace", "project_id", "allow_writes",
                     "timeout_seconds", "workflow_timeout_seconds", "max_parallel", "execution_backend") if key in body}
         if previous:
@@ -679,7 +701,8 @@ def create_app(data_dir=None, providers=None):
                        executor_model="auto", conversation_run_id=conversation_run_id,
                        planning_level=planning_level)
         run = await app.state.engine.create(RunRequest.model_validate(payload))
-        return {"kind": "plan", "run": run, "requires_approval": True}
+        await app.state.engine.store.event(run["id"], "request_routed", f"Plan seçildi: {routing_reason}")
+        return {"kind": "plan", "run": run, "requires_approval": True, "routing_reason": routing_reason}
 
     @app.post("/api/chat")
     async def direct_chat(request: Request):
@@ -709,8 +732,6 @@ def create_app(data_dir=None, providers=None):
         if not active_model_id:
             raise HTTPException(503, "Kullanılabilir model bulunamadı.")
         validate_for_model(attachments, engine.models[active_model_id])
-        if allow_writes and engine.models[active_model_id].get("provider") == "ollama":
-            raise HTTPException(400, "Ollama sohbet ajanı dosya düzenleyemez. Codex veya Antigravity seçin.")
 
         workspace = body.get("workspace") or engine.default_workspace
         project_id = body.get("project_id") or ""
@@ -808,8 +829,6 @@ def create_app(data_dir=None, providers=None):
         if active_model_id is None:
             raise HTTPException(503, "Orkestratör modeli hazır değil; yapılandırmayı kontrol edin.")
         validate_for_model(attachments, engine.models[active_model_id])
-        if allow_writes and engine.models[active_model_id].get("provider") == "ollama":
-            raise HTTPException(400, "Ollama sohbet ajanı dosya düzenleyemez. Codex veya Antigravity seçin.")
 
         latest = await engine.store.get(run_id)
         project = app.state.projects.get(latest.get("project_id")) if latest.get("project_id") else None
@@ -1120,7 +1139,6 @@ def create_app(data_dir=None, providers=None):
             if (model.get("execution_supported", True) is not True
                     or (run.get("execution_backend") == "ao" and provider != "codex")
                     or (run.get("execution_backend") == "cao" and provider not in {"codex", "antigravity", "ollama"})
-                    or (writable and provider == "ollama")
                     or (role not in capabilities and not (role == "architect" and "master" in capabilities))):
                 raise HTTPException(400, "Seçilen model bu adımı yürütemez.")
         cooldowns = await app.state.engine.router.get_cooldowns()
@@ -1157,7 +1175,6 @@ def create_app(data_dir=None, providers=None):
                         {"reviewer", "qa_tester", "security_auditor", "architect", "researcher", "analyzer"})
         if (model.get("execution_supported", True) is not True
                 or (run.get("execution_backend") == "ao" and provider != "codex")
-                or (writable and provider == "ollama")
                 or (role not in capabilities and not (role == "architect" and "master" in capabilities))):
             raise HTTPException(400, "Seçilen model bu adımı yürütemez.")
         app.state.engine.cancel_quota_resume(run_id)
@@ -1182,6 +1199,19 @@ def create_app(data_dir=None, providers=None):
     async def cancel(run_id: str):
         await require(run_id)
         return await app.state.engine.cancel(run_id)
+
+    @app.post("/api/runs/{run_id}/instructions")
+    async def add_instruction(run_id: str, request: Request):
+        await require(run_id)
+        body = await request.json()
+        message = str(body.get("message") or "").strip() if isinstance(body, dict) else ""
+        if not message or len(message) > 8000:
+            raise HTTPException(400, "Ek talimat 1–8000 karakter arasında olmalı.")
+        try:
+            run = await app.state.engine.add_instruction(run_id, message)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"run": run, "delivery": "next_step"}
 
     @app.put("/api/runs/{run_id}/plan")
     async def edit(run_id: str, plan: Plan):

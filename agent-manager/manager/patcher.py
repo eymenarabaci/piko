@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .local_edits import LocalEditError, apply_local_edits
+
 
 @dataclass
 class PatchBlock:
@@ -121,39 +123,15 @@ def fuzzy_replace(original: str, search: str, replace: str) -> Optional[str]:
 
 
 def apply_patch_blocks(workspace_path: Path, blocks: list[PatchBlock]) -> tuple[int, list[str]]:
-    """Apply parsed search/replace patch blocks to files in workspace."""
-    success_count = 0
-    logs = []
-
-    for block in blocks:
-        # Resolve target file path securely within workspace
-        rel_path = block.filepath.lstrip("/\\")
-        file_path = workspace_path / rel_path
-        if not file_path.exists():
-            # Try finding filename recursively if partial path was provided
-            filename = Path(rel_path).name
-            candidates = list(workspace_path.rglob(filename))
-            if candidates:
-                file_path = candidates[0]
-            else:
-                logs.append(f"Hedef dosya bulunamadı: {block.filepath}")
-                continue
-
-        try:
-            content = file_path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            try:
-                content = file_path.read_text(encoding="latin-1")
-            except Exception as e:
-                logs.append(f"Dosya okunamadı ({file_path.name}): {e}")
-                continue
-
-        updated = fuzzy_replace(content, block.search, block.replace)
-        if updated is not None:
-            file_path.write_text(updated, encoding="utf-8")
-            success_count += 1
-            logs.append(f"✓ {file_path.name} yaması başarıyla uygulandı.")
-        else:
-            logs.append(f"Eşleşme bulunamadı: {file_path.name} (SEARCH bloğu dosya içeriğiyle eşleşmedi)")
-
-    return success_count, logs
+    """Apply only exact, unique, workspace-contained edits atomically per file."""
+    if not blocks:
+        return 0, []
+    proposal = "\n".join(
+        f"File: {block.filepath}\n<<<< SEARCH\n{block.search}\n====\n{block.replace}\n>>>>"
+        for block in blocks
+    )
+    try:
+        paths = apply_local_edits(workspace_path, proposal)
+    except LocalEditError as exc:
+        return 0, [str(exc)]
+    return len(blocks), [f"✓ {path} yaması uygulandı." for path in paths]

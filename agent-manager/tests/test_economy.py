@@ -46,7 +46,8 @@ def executor_state(error):
     state = SimpleNamespace(
         models={mid: {'provider': 'codex'} for mid in ('one', 'two', 'three', 'four')},
         providers=SimpleNamespace(run=AsyncMock(side_effect=error)),
-        router=SimpleNamespace(record_failure=AsyncMock(return_value=None), record_success=AsyncMock()),
+        router=SimpleNamespace(record_failure=AsyncMock(return_value=None), record_success=AsyncMock(),
+                               get_cooldowns=AsyncMock(return_value={})),
         store=SimpleNamespace(event=event), emitter=lambda *_: event,
         optimizer=SimpleNamespace(estimate_tokens=lambda value: len(value)),
         route=AsyncMock(side_effect=[SimpleNamespace(model_id='two', quota_confidence='unknown'),

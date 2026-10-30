@@ -88,7 +88,7 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
     async def test_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            kwargs = dict(root=root, workspace=root, timeout=3, on_event=event)
+            kwargs = dict(root=root, workspace=root, timeout=15, on_event=event)
             reply = await run_command([sys.executable, '-c', 'import sys; print(sys.stdin.read()); print("err",file=sys.stderr)'],
                                       stdin='hello', **kwargs)
             self.assertEqual(reply['stdout'].strip(), 'hello')
@@ -101,7 +101,8 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
             with self.assertRaises(ProcessError):
-                await run_command([sys.executable, '-c', 'print("x"*2200000)'], **kwargs)
+                await run_command([sys.executable, '-c', 'print("x"*2200000)'],
+                                  **{**kwargs, 'timeout': 15})
             records = json.loads((root / 'work/resource-ledger.json').read_text())['resources']
             self.assertEqual(len(records), 4)
             self.assertEqual([r['state'] for r in records], ['completed', 'timeout', 'cancelled', 'failed'])

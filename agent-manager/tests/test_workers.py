@@ -56,7 +56,7 @@ async def test_cao_worker_uses_existing_provider_and_cannot_escalate(tmp_path):
     result = await client.run_worker("code_reviewer", "Kodu incele", model,
                                      workspace=str(tmp_path), allow_writes=True,
                                      timeout=600, on_event=event)
-    assert calls[0][3:] == (False, 300, "reviewer")
+    assert calls[0][3:] == (False, 600.0, "reviewer")
     assert "Salt okunur" in calls[0][1]
     assert result["worker_role"] == "code_reviewer"
     assert [row[0] for row in events] == ["cao_worker_started", "cao_worker_completed"]
@@ -73,9 +73,16 @@ async def test_cao_worker_requires_capable_writer_and_rejects_nested_result(tmp_
     async def event(kind, message, data):
         events.append(kind)
 
-    with pytest.raises(CAOError, match="dosya düzenleyemez"):
-        await client.run_worker("code_writer", "Dosya değiştir", {"id": "qwen", "provider": "ollama"},
-                                workspace=str(tmp_path), allow_writes=True, timeout=30, on_event=event)
+    async def local_writer(model, prompt, **kwargs):
+        assert kwargs["allow_writes"] is True
+        return {"output": "Dosya yaması uygulandı", "model_id": model["id"], "status": "completed",
+                "local_patch_applied": ["app.py"]}
+
+    client.run = local_writer
+    result = await client.run_worker("code_writer", "Dosya değiştir", {"id": "qwen", "provider": "ollama"},
+                                     workspace=str(tmp_path), allow_writes=True, timeout=30, on_event=event)
+    assert result["local_patch_applied"] == ["app.py"]
+    events.clear()
 
     async def run(*_, **__):
         return {"output": '<cao_workers>{"calls":[]}</cao_workers>', "model_id": "codex"}
