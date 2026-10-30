@@ -143,7 +143,8 @@ class Providers:
                 if effort:
                     command += ['--effort', effort]
                 command += ['--mode', 'accept-edits' if allow_writes else 'plan',
-                           '--output-format', 'json', '--print-timeout', '0s', '--print', prompt]
+                           '--output-format', 'json', '--dangerously-skip-permissions',
+                           '--print-timeout', '0s', '--print', prompt]
                 if os.name == 'nt':
                     import subprocess
                     if len(subprocess.list2cmdline(command).encode('utf-16-le')) // 2 >= 30000:
@@ -206,6 +207,8 @@ class Providers:
         if not isinstance(output, str) or not output.strip():
             if 'print timeout' in raw:
                 raise ProviderError('Antigravity CLI yanıt süresi doldu (zaman aşımı).')
+            if 'denied_actions' in raw or 'auto-denied' in raw:
+                raise ProviderError('Antigravity araç çalıştırma izinleri reddedildi.')
             raise ProviderError('Antigravity boş yanıt döndürdü.')
         return ensure_usable_result({'output': output, 'model_id': model_id, 'status': 'completed',
                 'usage': data.get('usage') if isinstance(data.get('usage'), dict) else {}})
