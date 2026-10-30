@@ -2,8 +2,10 @@
 
 import httpx
 import pytest
+from types import SimpleNamespace
 
-from manager.cao import CAOClient, CAOError
+from manager.cao import CAOClient, CAOError, CAONoResponse
+from manager.engine import Engine
 from manager.local_edits import LocalEditError
 
 
@@ -127,6 +129,50 @@ async def test_cao_rejects_terminal_transcript_placeholder(tmp_path):
     with pytest.raises(CAOError, match="metin yanıtı üretmedi"):
         await client.run({"id": "codex", "provider": "codex"}, "Görev", workspace=str(tmp_path),
                          allow_writes=False, timeout=30, on_event=event)
+
+
+@pytest.mark.asyncio
+async def test_cao_no_response_uses_same_codex_via_direct_cli(tmp_path):
+    calls, events = [], []
+
+    async def no_response(*_args, **_kwargs):
+        raise CAONoResponse("CAO işçisi metin yanıtı üretmedi")
+
+    async def direct(model_id, prompt, **kwargs):
+        calls.append((model_id, prompt, kwargs))
+        return {"output": "İş tamamlandı.", "model_id": model_id, "status": "completed"}
+
+    async def record_event(*args):
+        events.append(args)
+
+    async def no_cooldowns():
+        return {}
+
+    async def success(*_args):
+        pass
+
+    engine = object.__new__(Engine)
+    engine.models = {"codex": {"id": "codex", "provider": "codex", "capabilities": ["development"]}}
+    engine.cao = SimpleNamespace(run=no_response)
+    engine.providers = SimpleNamespace(run=direct)
+    engine.store = SimpleNamespace(event=record_event)
+    engine.router = SimpleNamespace(get_cooldowns=no_cooldowns, record_success=success)
+    step = SimpleNamespace(id="step", title="Takvim bileşeni", prompt="Kod yaz", model_id="codex",
+                           persona="", skills=[], mcp_servers=[])
+
+    async def on_event(*_args):
+        pass
+
+    result = await engine.run_executor(
+        {"id": "run", "workspace": str(tmp_path), "allow_writes": True,
+         "execution_backend": "cao", "timeout_seconds": 60},
+        step, "Takvim bileşenini uygula", on_event=on_event,
+    )
+    assert result["output"] == "İş tamamlandı."
+    assert len(calls) == 1 and calls[0][0] == "codex"
+    assert calls[0][2]["allow_writes"] is True
+    assert "mevcut değişiklikleri incele" in calls[0][1]
+    assert any(row[1] == "cao_direct_fallback" for row in events)
 
 
 @pytest.mark.asyncio

@@ -20,7 +20,7 @@ from .adaptive import (MAX_ADAPTATIONS, build_adaptive_prompt, extend_plan,
                        parse_adaptive_decision, repair_explicit_validation_gap,
                        sanitize_adaptive_decision)
 from .ao import AOClient
-from .cao import CAOClient
+from .cao import CAOClient, CAONoResponse
 from .model_router import ModelRouter, NoEligibleModel, infer_role, parse_quota_wait_seconds
 from .mcp_catalog import PUBLIC_AUTO_SERVERS, get_server_config
 from .optimizer import TokenOptimizer
@@ -537,11 +537,27 @@ class Engine:
                             await self.store.event(run["id"], "mcp_attached",
                                                    f"{step.title}: MCP araçları bağlandı.",
                                                    {"step_id": step.id, "servers": requested_mcps})
-                        result = await self.cao.run(
-                            model, prompt, workspace=run["workspace"], allow_writes=writable,
-                            timeout=step_timeout, on_event=event,
-                            persona=persona_name,
-                        )
+                        try:
+                            result = await self.cao.run(
+                                model, prompt, workspace=run["workspace"], allow_writes=writable,
+                                timeout=step_timeout, on_event=event,
+                                persona=persona_name,
+                            )
+                        except CAONoResponse:
+                            if model.get("provider") != "codex" or requested_mcps:
+                                raise
+                            await self.store.event(run["id"], "cao_direct_fallback",
+                                                   f"{step.title}: CAO yanıt vermedi; aynı Codex modeli doğrudan CLI ile deneniyor.",
+                                                   {"step_id": step.id, "model_id": selected})
+                            recovery_prompt = (
+                                prompt + "\n\nÖnce çalışma alanındaki mevcut değişiklikleri incele. "
+                                "Önceki terminal denemesi yanıt vermeden bitmiş olabilir; "
+                                "tamamlanmış düzenlemeleri tekrarlama. Eksik işi bitir ve sonucu açıkça bildir."
+                            )
+                            result = await self.providers.run(
+                                selected, recovery_prompt, workspace=run["workspace"],
+                                allow_writes=writable, timeout=step_timeout, on_event=event,
+                            )
                     finally:
                         if mcp_profile is not None:
                             mcp_profile.unlink(missing_ok=True)

@@ -25,6 +25,12 @@ class CAOError(RuntimeError):
     pass
 
 
+class CAONoResponse(CAOError):
+    """The terminal settled without a publishable agent message."""
+
+    pass
+
+
 def _pre_trust_workspace(workspace: str | Path) -> None:
     """Auto-trust workspace in ~/.codex/config.toml to avoid interactive modal delays."""
     try:
@@ -329,11 +335,11 @@ class CAOClient:
                 await asyncio.gather(terminal_watch, return_exceptions=True)
         output = data.get("last_message")
         if not isinstance(output, str) or not output.strip():
-            raise CAOError("CAO işçisi kullanılabilir bir yanıt döndürmedi.")
+            raise CAONoResponse("CAO işçisi kullanılabilir bir yanıt döndürmedi.")
         if output.startswith("[NO RESPONSE - agent completed without producing a text response"):
-            raise CAOError("CAO işçisi metin yanıtı üretmedi; terminal çıktısı yanıt olarak kabul edilmedi.")
+            raise CAONoResponse("CAO işçisi metin yanıtı üretmedi; terminal çıktısı yanıt olarak kabul edilmedi.")
         if re.search(r"\[Pasted Content \d+ chars\]", output) or output.strip() == prompt.strip():
-            raise CAOError("CAO terminali ajan yanıtı yerine gönderilen promptun yankısını döndürdü; adım tamamlanmadı.")
+            raise CAONoResponse("CAO terminali ajan yanıtı yerine gönderilen promptun yankısını döndürdü; adım tamamlanmadı.")
         output_lower = output.lower()
         if any(term in output_lower for term in ("you’ve hit your usage limit", "you've hit your usage limit", "usage limit", "quota_exceeded", "insufficient_quota", "too many requests", "rate limit reached")):
             raise CAOError(f"Model ({model.get('id')}) kullanım kotasına ulaşıldı: {output[:300]}")
