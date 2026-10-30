@@ -1,4 +1,4 @@
-"""Conservative GitHub fast-forward updates for a local Agent Manager checkout."""
+"""Conservative GitHub fast-forward updates for a local Piko checkout."""
 from __future__ import annotations
 
 import asyncio

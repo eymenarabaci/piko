@@ -1520,7 +1520,7 @@ function renderInspector() {
           timeoutMs: 630000
         });
         if (requestedModel && res.model_id !== requestedModel) {
-          toast(`Seçilen ${requestedModel} yerine ${res.model_id || 'bilinmeyen model'} yanıtladı. Agent Manager sunucusunu yeniden başlatın.`);
+          toast(`Seçilen ${requestedModel} yerine ${res.model_id || 'bilinmeyen model'} yanıtladı. Piko sunucusunu yeniden başlatın.`);
         }
         pending.textContent = `Orkestratör: ${res.reply || 'Anlaşıldı.'}`;
         chatLog.scrollTop = chatLog.scrollHeight;
@@ -1755,7 +1755,7 @@ async function renderRemotePage() {
   const container = $('#data-page');
   container.replaceChildren(
     node('h2', '', 'Mobil ve Uzaktan Erişim (Tailscale & Android APK)'),
-    node('p', 'page-description', 'Agent Manager\'ı telefonunuzdan veya dış ağdan (4G/5G) kontrol edin. Tailscale ile güvenli WireGuard tüneli üzerinden çalışır.')
+    node('p', 'page-description', 'Piko’yu telefonunuzdan veya dış ağdan (4G/5G) kontrol edin. Tailscale ile güvenli WireGuard tüneli üzerinden çalışır.')
   );
 
   let remoteData = { token: 'Yükleniyor…', interfaces: [], tailscale_ips: [], port: 8765 };
@@ -1767,7 +1767,7 @@ async function renderRemotePage() {
 
   const apkCard = node('div', 'settings-group');
   apkCard.append(
-    node('h3', '', '📱 Android Uygulaması (Agent Remote APK)'),
+    node('h3', '', '📱 Piko Mobil (Android APK)'),
     node('p', 'setting-help', 'Codex Remote benzeri, telefonunuzdan canlı terminal takibi, plan onaylama ve yeni görev başlatma sağlayan özel mobil uygulama.')
   );
   const dlRow = node('div', 'button-row');
@@ -1820,7 +1820,7 @@ async function renderRemotePage() {
     <ol style="padding-left: 20px; line-height: 1.8; font-size: 13px;">
       <li><b>Bilgisayarda Uzaktan Modu Açın:</b> Proje klasöründeki <code>remote.cmd</code> dosyasını çalıştırın (sunucu 0.0.0.0 üzerinde dış ağa açılır).</li>
       <li><b>Tailscale ile Eşleyin:</b> Bilgisayarınızda ve telefonunuzda <b>Tailscale</b>'i açıp aynı hesapla giriş yapın. Her iki cihaz da güvenli bir VPN ağına dahil olur.</li>
-      <li><b>APK ile Bağlanın:</b> Yukarıdan indirdiğiniz <b>Agent Remote</b> uygulamasını telefonunuzda açın, bilgisayarınızın Tailscale IP'sini (100.x.y.z:8765) ve Mobil Token'ı girip <b>Bağlan</b>'a basın!</li>
+      <li><b>APK ile Bağlanın:</b> Yukarıdan indirdiğiniz <b>Piko Mobil</b> uygulamasını telefonunuzda açın, bilgisayarınızın Tailscale IP'sini (100.x.y.z:8765) ve Mobil Token'ı girip <b>Bağlan</b>'a basın!</li>
     </ol>
   `;
 
@@ -2972,7 +2972,7 @@ async function initialize() {
   try {
     state.bootstrap = await api('/api/bootstrap');
     connected(true);
-    $('#version-label').textContent = `Agent Manager ${state.bootstrap.version || ''}`;
+    $('#version-label').textContent = `Piko ${state.bootstrap.version || ''}`;
     applySettings();
     await fetchProjects();
     populateModels();

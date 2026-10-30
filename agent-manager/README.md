@@ -1,4 +1,4 @@
-# Agent Manager
+# Piko
 
 Hazır açık kaynak **[LangGraph](https://github.com/langchain-ai/langgraph)** çalışma zamanı üzerine kurulu yerel CLI ajan yöneticisi. Eski `orchestrator/` motorunu import etmez. Bağımlılık sırası, paralel düğümler, join ve checkpoint/replay işlemlerini gerçek LangGraph `StateGraph` ve `AsyncSqliteSaver` yürütür. API ve arayüz yerel uyarlamadır; tüm upstream uygulamanın fork'u değildir.
 
@@ -33,7 +33,7 @@ Windows'ta `run.py` kullanın: async subprocess için Proactor döngüsü gereki
 
 ### Gömülü CAO Windows motoru
 
-`setup.cmd`, bu projenin `vendor/cao-upstream/` klasöründeki CAO kaynağını kendi Windows `.venv` ortamına kurar. **Yapılandırma → Yürütme altyapısı → Gömülü CAO (Windows)** seçildiğinde Agent Manager motoru 127.0.0.1 üzerinde, rastgele yerel port ve oturuma özel bearer token ile açar. CAO verisi `data/cao/` altındadır; servis Agent Manager kapanırken onunla birlikte kapatılır. Harici AO masaüstü uygulaması bu modda kullanılmaz. Codex ve Antigravity CLI araçları Windows PATH içinde bulunmalıdır. Ollama için `127.0.0.1:11434` servisi ve seçilen model yüklü olmalıdır.
+`setup.cmd`, bu projenin `vendor/cao-upstream/` klasöründeki CAO kaynağını kendi Windows `.venv` ortamına kurar. **Yapılandırma → Yürütme altyapısı → Gömülü CAO (Windows)** seçildiğinde Piko motoru 127.0.0.1 üzerinde, rastgele yerel port ve oturuma özel bearer token ile açar. CAO verisi `data/cao/` altındadır; servis Piko kapanırken onunla birlikte kapatılır. Harici AO masaüstü uygulaması bu modda kullanılmaz. Codex ve Antigravity CLI araçları Windows PATH içinde bulunmalıdır. Ollama için `127.0.0.1:11434` servisi ve seçilen model yüklü olmalıdır.
 
 LangGraph planı ve adım durumlarını tutar; Codex ve Antigravity adımlarını CAO terminal işçilerine, Ollama adımlarını CAO'nun yerel metin işçisine gönderir. Ollama işçisi dosya araçları kullanmaz ve yazma izinli CAO görevlerinde seçilemez. Motor başlatılamazsa arayüzdeki **Modeller ve CLI** bölümü durumu gösterir; ayrıntı için `data/cao/server.log` dosyasına bakın. `data/cao` klasörünü başka bir CAO sunucusuyla aynı anda paylaşmayın.
 
@@ -47,7 +47,7 @@ CAO kipinde Codex `reviewer` görevleri `read-only`, `developer` görevleri `wor
 
 ### AO ile Codex işçileri
 
-AO v0.14.6 bu Windows makinesine kuruldu. Masaüstü AO uygulamasını açın; Agent Manager arayüzündeki **Yapılandırma → Yürütme altyapısı → Agent Orchestrator (AO)** seçeneğini kullanın. Yürütücü olarak Codex seçin, dosya yazma iznini açın ve çalışma klasörü olarak en az bir commit'i ve çözülebilen varsayılan dalı olan Git deposu seçin. Yerel ve remotesiz depoda `git config ao.defaultBranch main` kullanılabilir. AO daemon hazır değilse arayüz açıkça uyarır.
+AO v0.14.6 bu Windows makinesine kuruldu. Masaüstü AO uygulamasını açın; Piko arayüzündeki **Yapılandırma → Yürütme altyapısı → Agent Orchestrator (AO)** seçeneğini kullanın. Yürütücü olarak Codex seçin, dosya yazma iznini açın ve çalışma klasörü olarak en az bir commit'i ve çözülebilen varsayılan dalı olan Git deposu seçin. Yerel ve remotesiz depoda `git config ao.defaultBranch main` kullanılabilir. AO daemon hazır değilse arayüz açıkça uyarır.
 
 LangGraph planı ve checkpoint'i yürütür; AO her adım için Codex Chat oturumu ve ayrı worktree açar. AO oturum kimliği adımın ayrıntısında görünür. Biten AO görevi **İnceleme bekliyor** durumuna geçer: dosya değişiklikleri worktree'de kalır ve ana projeye otomatik aktarılmaz. AO masaüstünde diff'i inceleyip uygun değişiklikleri birleştirin. AGY ve Ollama için **Doğrudan CLI** altyapısı kullanılmaya devam eder; AGY'nin AO Chat kipi bu makinede ek ACP sunucusu olmadan açılmıyor.
 

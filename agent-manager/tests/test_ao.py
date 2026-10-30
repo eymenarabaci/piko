@@ -32,7 +32,7 @@ async def test_ao_codex_session_finishes_with_recorded_turn(client):
             polls += 1
             return httpx.Response(200, json={"session": {"id": "ao-1", "activity": {"state": "idle" if polls > 1 else "active"}}})
         if path == "/api/v1/sessions/ao-1/history":
-            return httpx.Response(200, json={"turns": [{"userRequest": "Agent Manager görev kimliği: am-1-task", "agentResponse": "İş tamamlandı."}], "total": 1})
+            return httpx.Response(200, json={"turns": [{"userRequest": "Piko görev kimliği: am-1-task", "agentResponse": "İş tamamlandı."}], "total": 1})
         raise AssertionError(path)
 
     ao = AOClient(client, httpx.MockTransport(handler))

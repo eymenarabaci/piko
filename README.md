@@ -1,4 +1,4 @@
-# ◈ AI-Orchestrator (Agent Manager)
+# Piko
 
 > **Gelişmiş Çoklu Ajan ve Görev Orkestrasyon Sistemi (LangGraph & ConPTY Destekli)**
 > Yerel modeller (Ollama), Antigravity (Gemini), Codex (OpenAI) ve özel CLI araçlarını tek bir çalışma alanında birleştiren, açık kaynaklı yeni nesil yapay zeka ajan orkestratörü.
@@ -22,8 +22,8 @@
 ### 1. Kurulum
 Depoyu klonlayın ve kök dizindeki kurulum dosyasını çalıştırın:
 ```cmd
-git clone https://github.com/eymenarabaci/AI-Orchestrator.git
-cd AI-Orchestrator
+git clone https://github.com/eymenarabaci/Piko.git
+cd Piko
 setup.cmd
 ```
 *Gerekli tüm Python kütüphaneleri otomatik olarak `.venv` sanal ortamına kurulacaktır.*
@@ -61,7 +61,7 @@ Sistem, ortamınızda çalışan CLI araçlarını ve Ollama modellerini otomati
 ## 📂 Proje Yapısı
 
 ```
-AI-Orchestrator/
+Piko/
 ├── agent-manager/            # FastAPI sunucusu, planlama motoru ve web arayüzü
 │   ├── manager/              # LangGraph, ConPTY, hafıza, tetikleyiciler
 │   ├── ui/                   # Modern Web UI (HTML/CSS/JS)

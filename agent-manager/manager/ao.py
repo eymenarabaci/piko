@@ -110,13 +110,13 @@ class AOClient:
             # AO model discovery can reject an explicit override even when the CLI accepts it.
             # The generic Codex catalog identity deliberately uses AO's signed-in default.
             override = model["id"] if model["id"] != "codex" else ""
-            task_prompt = f"Agent Manager görev kimliği: {request_id}\n\n{prompt}"
+            task_prompt = f"Piko görev kimliği: {request_id}\n\n{prompt}"
             if len(task_prompt.encode("utf-8")) > 16384:
                 raise AOError("AO görev metni 16 KiB sınırını aşıyor.")
             body = {"clientRequestId": request_id, "projectId": project_id, "kind": "worker",
                     "harness": harness, "mode": "chat",
                     "approvalMode": "accept-edits", "prompt": task_prompt,
-                    "displayName": f"Agent Manager {request_id[-12:]}"}
+                    "displayName": f"Piko {request_id[-12:]}"}
             if override:
                 body["model"] = override
             spawned = await self.request("POST", "/api/v1/sessions", body)

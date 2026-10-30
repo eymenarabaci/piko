@@ -28,7 +28,7 @@ def _new_server_ready(port: int, old_started_at: str) -> bool:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         with opener.open(f"http://127.0.0.1:{port}/openapi.json", timeout=2) as response:
-            if json.load(response).get("info", {}).get("title") != "Agent Manager":
+            if json.load(response).get("info", {}).get("title") != "Piko":
                 return False
         with opener.open(f"http://127.0.0.1:{port}/api/update/status", timeout=3) as response:
             return json.load(response).get("server_started_at") != old_started_at

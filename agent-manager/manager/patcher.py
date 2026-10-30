@@ -1,4 +1,4 @@
-"""Aider-style Search/Replace and Unified Diff patch applier for Agent Manager.
+"""Aider-style Search/Replace and Unified Diff patch applier for Piko.
 Enables agents to emit surgical 10-line changes instead of rewriting 500-line files,
 cutting output token generation latency by 70-85%.
 """

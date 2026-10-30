@@ -3,7 +3,7 @@ set -e
 cd "$(dirname "$0")/agent-manager"
 
 echo "============================================================"
-echo "  AI-Orchestrator: Linux / macOS Kurulumu"
+echo "  Piko: Linux / macOS Kurulumu"
 echo "============================================================"
 
 if ! command -v python3 &> /dev/null; then
@@ -26,5 +26,5 @@ fi
 
 echo "============================================================"
 echo "  Kurulum Tamamlandı!"
-echo "  Başlatmak için: python run.py --desktop"
+echo "  Başlatmak için: python run.py --open"
 echo "============================================================"

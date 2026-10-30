@@ -1,4 +1,4 @@
-"""CAO execution contract at the Agent Manager boundary; no model calls."""
+"""CAO execution contract at the Piko boundary; no model calls."""
 
 import httpx
 import pytest

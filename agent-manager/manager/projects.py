@@ -1,4 +1,4 @@
-"""Project management module for Agent Manager.
+"""Project management module for Piko.
 Organizes runs, workspaces, and chat sessions by project, similar to Codex/Claude Projects.
 """
 from __future__ import annotations

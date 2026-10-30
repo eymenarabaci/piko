@@ -18,7 +18,7 @@ from manager.processes import _record
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Agent Manager yerel sunucu")
+    parser = argparse.ArgumentParser(description="Piko yerel sunucu")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--open", action="store_true", help="Arayüzü varsayılan tarayıcıda aç")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Dinlenecek IP adresi")
@@ -47,12 +47,12 @@ def main():
         except Exception:
             same_checkout = False
         if same_checkout:
-            print(f"Agent Manager zaten acik: http://127.0.0.1:{candidate}")
+            print(f"Piko zaten acik: http://127.0.0.1:{candidate}")
             if args.open:
                 webbrowser.open(f"http://127.0.0.1:{candidate}")
             return
     else:
-        print(f"{requested_port}-{requested_port + 10} portlari dolu. Agent Manager baslatilmadi.")
+        print(f"{requested_port}-{requested_port + 10} portlari dolu. Piko baslatilmadi.")
         raise SystemExit(1)
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -85,7 +85,7 @@ def main():
             pass
 
         print("\n" + "=" * 64)
-        print(" [Agent Manager] Uzaktan ve Mobil Erisim Modu AKTIF")
+        print(" [Piko] Uzaktan ve Mobil Erisim Modu AKTIF")
         print(f" Telefondan Baglanti Adresi (Wi-Fi): http://{detected_ip}:{args.port}")
         print(f" Mobil Token: {token_str}")
         print(" Android APK'sinda bu adresi ve token'i girerek baglanabilirsiniz.")

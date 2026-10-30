@@ -135,7 +135,7 @@ def create_app(data_dir=None, providers=None):
         finally:
             await store.close()
 
-    app = FastAPI(title="Agent Manager", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="Piko", version="1.0.0", lifespan=lifespan)
 
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception):

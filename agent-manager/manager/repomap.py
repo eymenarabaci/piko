@@ -1,4 +1,4 @@
-"""Aider-style structural repository map for Agent Manager.
+"""Aider-style structural repository map for Piko.
 Extracts symbols, exports, and key architecture into a compact in-memory map.
 Eliminates 2-3 minutes of exploratory 'Get-ChildItem / find' command loops.
 """
