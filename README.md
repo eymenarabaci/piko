@@ -22,7 +22,7 @@
 ### 1. Kurulum
 Depoyu klonlayın ve kök dizindeki kurulum dosyasını çalıştırın:
 ```cmd
-git clone https://github.com/eymenarabaci/Piko.git
+git clone https://github.com/eymenarabaci/piko.git
 cd Piko
 setup.cmd
 ```
