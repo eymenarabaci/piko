@@ -5,6 +5,7 @@ _QUOTA = re.compile(
     r"(?:you[’']?ve|you have).{0,20}(?:hit|reached|exceeded).{0,30}(?:usage|rate|quota|limit)|"
     r"(?:usage|rate)[ _-]?limit.{0,30}(?:reached|exceeded|exhausted)|"
     r"quota[_ -]?exceeded|insufficient[_ -]?quota|resource[_ -]?exhausted|"
+    r"(?:individual\s+)?quota\s+(?:reached|exhausted)|resets?\s+in\s+\d|"
     r"too many requests|exceeded your current quota|kullanım kotası.{0,30}(?:dol|ulaş)", re.I)
 _ERROR = re.compile(r"^\s*(?:error|fatal|hata)\s*:\s*\S", re.I)
 

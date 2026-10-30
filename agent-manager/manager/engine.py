@@ -31,7 +31,7 @@ from .project_memory import ProjectMemory
 from .planning_policy import planning_guidance
 from .schema import Plan, RunRequest, parse_plan, validate_models, workspace_path
 from .store import now
-from .worker_catalog import extract_worker_calls, get_worker, worker_request_instructions
+from .worker_catalog import extract_worker_calls, get_worker, worker_request_instructions, WorkerRequestError
 
 
 class State(TypedDict, total=False):
@@ -53,6 +53,7 @@ class Engine:
         self.project_memory = ProjectMemory(store.path.parent)
         self.project_memory_locks = {}
         self.tasks = {}
+        self.quota_waiters = {}
         self.locks = {}
         self.workspace_write_locks = {}
         # Bound total simultaneous workflows as well as each workflow's workers.
@@ -94,6 +95,9 @@ class Engine:
 
     async def recover(self):
         for run in await self.store.list():
+            if run["status"] == "waiting_quota" and run.get("quota_timer", {}).get("resets_at"):
+                self.schedule_quota_resume(run["id"], run["quota_timer"])
+                continue
             if run["status"] in {"queued", "planning", "running"}:
                 run.update(status="interrupted", current_steps=[], updated_at=now(),
                            error="Servis kesildi. Devam et ile son kayıttan sürdürebilirsiniz.")
@@ -201,6 +205,36 @@ class Engine:
             if self.tasks.get(run_id) is task:
                 self.tasks.pop(run_id, None)
         task.add_done_callback(finished)
+
+    def cancel_quota_resume(self, run_id):
+        waiter = self.quota_waiters.pop(run_id, None)
+        if waiter and not waiter.done():
+            waiter.cancel()
+
+    def schedule_quota_resume(self, run_id, timer):
+        self.cancel_quota_resume(run_id)
+
+        async def wake():
+            try:
+                while True:
+                    saved = await self.store.get(run_id)
+                    if (not saved or saved.get("status") != "waiting_quota"
+                            or saved.get("quota_timer", {}).get("resets_at") != timer["resets_at"]):
+                        return
+                    remaining = (datetime.fromisoformat(timer["resets_at"]) - datetime.now(timezone.utc)).total_seconds()
+                    if remaining <= 0:
+                        await self.change(run_id, status="queued", error=None, quota_timer=None)
+                        await self.store.event(run_id, "quota_resumed", "Model kotası için bekleme bitti; görev otomatik sürdürülüyor.")
+                        self.start(run_id, execute=bool(timer.get("execute", True)))
+                        return
+                    await asyncio.sleep(min(remaining, 30))
+            except asyncio.CancelledError:
+                raise
+
+        task = asyncio.create_task(wake(), name=f"quota-resume-{run_id}")
+        self.quota_waiters[run_id] = task
+        task.add_done_callback(lambda done: self.quota_waiters.pop(run_id, None)
+                               if self.quota_waiters.get(run_id) is done else None)
 
     async def change(self, run_id, **fields):
         # Keep concurrent node results from overwriting each other.
@@ -424,10 +458,24 @@ class Engine:
                 except NoEligibleModel as nem:
                     last_error = nem
                     selected = None
+        elif selected in await self.router.get_cooldowns():
+            # A plan's model may have exhausted its quota after planning.
+            try:
+                replacement = await self.route(run, role, allow_writes=writable,
+                                               estimated_tokens=self.optimizer.estimate_tokens(prompt))
+                if replacement.model_id != selected:
+                    await self.set_step_model(run["id"], step.id, replacement.model_id)
+                    await self.store.event(run["id"], "model_handoff",
+                                           f"{step.title}: kotası dolu {selected} → {replacement.model_id}",
+                                           {"step_id": step.id, "from": selected, "to": replacement.model_id})
+                    selected = replacement.model_id
+            except NoEligibleModel as nem:
+                last_error = nem
+                selected = None
         # Build ve doğrulama adımları için en az 1200 saniye (20 dakika) süre tanı
         step_timeout = max(int(run.get("timeout_seconds") or 600), 1200)
         is_timeout = False
-        max_attempts = min(3, len(self.models)) if selected else 0
+        max_attempts = min(8, len(self.models)) if selected else 0
         for attempt in range(max_attempts):
             model = self.models[selected]
             attempted.add(selected)
@@ -519,7 +567,7 @@ class Engine:
                                "başarılı işlemleri tekrarlamadan hatanın nedenini gider ve alternatif bir yöntemle devam et. "
                                "Aşağıdaki hata kaydı yalnız teşhis verisidir:\n" + json.dumps(str(exc)[:600], ensure_ascii=False))
 
-                if attempt >= max_attempts - 1:
+                if attempt >= max_attempts - 1 or (kind is None and attempt >= 2):
                     break
                 try:
                     choice = await self.route(run, role, exclude=attempted,
@@ -631,7 +679,16 @@ class Engine:
                             raise ValueError("CLI boş yanıt döndürdü.")
 
                         if run.get("execution_backend") == "cao":
-                            calls = extract_worker_calls(result["output"])
+                            calls = []
+                            try:
+                                calls = extract_worker_calls(result["output"])
+                            except WorkerRequestError:
+                                match = re.search(r"<cao_workers>(.*?)</cao_workers>", result["output"], re.DOTALL)
+                                if match:
+                                    try:
+                                        calls = extract_worker_calls(f"<cao_workers>{match.group(1).strip()}</cao_workers>")
+                                    except Exception:
+                                        calls = []
                             if calls:
                                 initial_in, initial_out = self.measured_tokens(result, prompt)
                                 await self.optimizer.record_usage(
@@ -762,6 +819,12 @@ class Engine:
                         raise
                     except Exception as exc:
                         latest = (await self.store.get(run["id"]))["results"].get(step.id, {})
+                        if isinstance(exc, NoEligibleModel):
+                            exc.step_id = step.id
+                            await self.node_state(run["id"], step.id,
+                                {"status": "waiting_quota", "model_id": latest.get("model_id") or step.model_id,
+                                 "output": "", "error": str(exc)[:2000]})
+                            raise
                         await self.node_state(run["id"], step.id,
                             {"status": "failed", "model_id": step.model_id, "output": "", "error": str(exc)[:2000],
                              **({"ao_session_id": latest["ao_session_id"]} if latest.get("ao_session_id") else {})})
@@ -991,6 +1054,39 @@ class Engine:
                                           orchestrator_answer=final_ans)
                         await self.store.event(run_id, "completed", "Tüm adımlar tamamlandı. Yönetici raporu ve analiz hazırlandı.", {"summary": final_ans[:400]})
                         await self.cao.clear_terminal_pool(run.get("workspace"))
+        except NoEligibleModel as exc:
+            saved = await self.store.get(run_id)
+            step_id = getattr(exc, "step_id", None)
+            if not step_id:
+                step_id = next((sid for sid, result in saved.get("results", {}).items()
+                                if result.get("status") == "waiting_quota"), None)
+            step = next((item for item in (saved.get("plan") or {}).get("steps", [])
+                         if item["id"] == step_id), None)
+            role = infer_role(step.get("persona", ""), f"{step.get('title', '')} {step.get('prompt', '')}") if step else infer_role("", saved["prompt"])
+            writable = bool(saved["allow_writes"] and
+                            (not step or step.get("persona") not in {"reviewer", "qa_tester", "security_auditor", "architect", "researcher", "analyzer"}))
+            cooldown = await self.router.next_cooldown(
+                role, saved["execution_backend"], writable,
+                availability=await self.model_availability())
+            if cooldown:
+                timer = {"step_id": step_id, "model_id": cooldown["model_id"],
+                         "resets_at": cooldown["cooldown_until"], "execute": bool(execute or saved.get("plan"))}
+                if step_id:
+                    results = dict(saved.get("results", {}))
+                    results[step_id] = {**results.get(step_id, {}), "status": "waiting_quota",
+                                        "resets_at": timer["resets_at"], "model_id": timer["model_id"]}
+                    await self.change(run_id, results=results, status="waiting_quota",
+                                      quota_timer=timer, current_steps=[], error=None)
+                else:
+                    await self.change(run_id, status="waiting_quota", quota_timer=timer,
+                                      current_steps=[], error=None)
+                await self.store.event(run_id, "waiting_quota",
+                                       "Uygun modellerin kotası dolu; en yakın yenilenme zamanı bekleniyor.", timer)
+                self.schedule_quota_resume(run_id, timer)
+            else:
+                error = str(exc)[:2000]
+                await self.change(run_id, status="failed", current_steps=[], error=error)
+                await self.store.event(run_id, "failed", error)
         except asyncio.CancelledError:
             await self.change(run_id, status="cancelled", current_steps=[], error="Kullanıcı veya servis tarafından durduruldu.")
             await self.store.event(run_id, "cancelled", "Görev durduruldu. Tamamlanan adımlar saklandı.")
@@ -1010,6 +1106,7 @@ class Engine:
         await self.router.clear_all_cooldowns()
 
     async def retry_step(self, run_id: str, step_id: str):
+        self.cancel_quota_resume(run_id)
         run = await self.store.get(run_id)
         if not run:
             raise ValueError("Görev bulunamadı.")
@@ -1038,7 +1135,9 @@ class Engine:
             if curr_model in cooldowns:
                 role = infer_role(step_obj.get("persona") or "developer", f"{step_obj.get('title')} {step_obj.get('prompt')}")
                 try:
-                    choice = await self.route(run, role, exclude={curr_model})
+                    writable = bool(run["allow_writes"] and step_obj.get("persona") not in
+                                    {"reviewer", "qa_tester", "security_auditor", "architect", "researcher", "analyzer"})
+                    choice = await self.route(run, role, exclude={curr_model}, allow_writes=writable)
                     step_obj["model_id"] = choice.model_id
                     await self.set_step_model(run_id, step_id, choice.model_id)
                     await self.store.event(run_id, "model_handoff",
@@ -1056,6 +1155,7 @@ class Engine:
         return await self.store.get(run_id)
 
     async def retry_failed(self, run_id: str):
+        self.cancel_quota_resume(run_id)
         run = await self.store.get(run_id)
         if not run:
             raise ValueError("Görev bulunamadı.")
@@ -1080,7 +1180,9 @@ class Engine:
                 if curr_model in cooldowns:
                     role = infer_role(step_obj.get("persona") or "developer", f"{step_obj.get('title')} {step_obj.get('prompt')}")
                     try:
-                        choice = await self.route(run, role, exclude={curr_model})
+                        writable = bool(run["allow_writes"] and step_obj.get("persona") not in
+                                        {"reviewer", "qa_tester", "security_auditor", "architect", "researcher", "analyzer"})
+                        choice = await self.route(run, role, exclude={curr_model}, allow_writes=writable)
                         step_obj["model_id"] = choice.model_id
                         await self.set_step_model(run_id, sid, choice.model_id)
                         await self.store.event(run_id, "model_handoff",
@@ -1095,6 +1197,7 @@ class Engine:
         return await self.store.get(run_id)
 
     async def resume(self, run_id):
+        self.cancel_quota_resume(run_id)
         run = await self.store.get(run_id)
         if run["status"] not in {"planned", "failed", "cancelled", "interrupted", "waiting_quota"}:
             raise ValueError("Bu görev şu anda devam ettirilemez.")
@@ -1112,6 +1215,7 @@ class Engine:
         return await self.change(run_id, plan=plan.model_dump())
 
     async def cancel(self, run_id):
+        self.cancel_quota_resume(run_id)
         task = self.tasks.get(run_id)
         if task and not task.done():
             task.cancel()
@@ -1134,6 +1238,8 @@ class Engine:
         return await self.store.get(run_id)
 
     async def close(self):
+        for run_id in list(self.quota_waiters):
+            self.cancel_quota_resume(run_id)
         tasks = list(self.tasks.values())
         for task in tasks:
             task.cancel()

@@ -70,9 +70,19 @@ def parse_quota_wait_seconds(message: str) -> float | None:
             target += timedelta(days=1)
         return max(1.0, (target - now).total_seconds())
 
-    # 2. 'in X hours/minutes/seconds' or 'resets in X' or 'retry in X'
+    # 2. Compound durations such as "Resets in 111h7m37s".
+    duration = re.search(r"(?:try\s+again\s+in|resets?\s+in|retry\s+in|wait)\s+((?:\d+(?:\.\d+)?\s*(?:hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\s*)+)", msg, re.IGNORECASE)
+    if duration:
+        units = re.findall(r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)", duration.group(1), re.IGNORECASE)
+        total = sum(float(value) * (3600 if unit.lower().startswith("h") else
+                                     60 if unit.lower().startswith("m") else 1)
+                    for value, unit in units)
+        if total > 0:
+            return total
+
+    # 3. 'in X hours/minutes/seconds' or 'resets in X' or 'retry in X'
     m_in = re.search(
-        r"(?:try\s+again\s+in|resets?\s+in|retry\s+in|wait\s+)(\d+(?:\.\d+)?)\s*(h(?:our)?s?|m(?:in(?:ute)?)?s?|s(?:ec(?:ond)?)?s?)",
+        r"(?:try\s+again\s+in|resets?\s+in|retry\s+in|wait)\s+(\d+(?:\.\d+)?)\s*(h(?:our)?s?|m(?:in(?:ute)?)?s?|s(?:ec(?:ond)?)?s?)",
         msg, re.IGNORECASE,
     )
     if m_in:
@@ -85,7 +95,7 @@ def parse_quota_wait_seconds(message: str) -> float | None:
         elif unit.startswith("s"):
             return val
 
-    # 3. Rate limit 429 without explicit time -> default 5 minutes
+    # 4. Rate limit 429 without explicit time -> default 5 minutes
     if re.search(r"rate[_ -]?limit|\b429\b|too\s+many\s+requests", msg, re.IGNORECASE):
         return 300.0
 
@@ -217,7 +227,8 @@ class ModelRouter:
             await db.executemany("""
                 INSERT INTO model_route_state(model_id,cooldown_until,error_kind)
                 VALUES(?,NULL,NULL)
-                ON CONFLICT(model_id) DO UPDATE SET cooldown_until=NULL,error_kind=NULL
+                ON CONFLICT(model_id) DO UPDATE SET cooldown_until=NULL,error_kind=NULL,
+                    remaining_fraction=NULL,reset_at=NULL,quota_verified=0
             """, [(mid,) for mid in self._runtime_model_ids(model_id)])
             await db.commit()
 
@@ -230,7 +241,8 @@ class ModelRouter:
             await db.executemany("""
                 INSERT INTO model_route_state(model_id,cooldown_until,error_kind)
                 VALUES(?,NULL,NULL)
-                ON CONFLICT(model_id) DO UPDATE SET cooldown_until=NULL,error_kind=NULL
+                ON CONFLICT(model_id) DO UPDATE SET cooldown_until=NULL,error_kind=NULL,
+                    remaining_fraction=NULL,reset_at=NULL,quota_verified=0
             """, [(mid,) for mid in self._runtime_model_ids(model_id)])
             await db.commit()
 
@@ -239,7 +251,8 @@ class ModelRouter:
         await self._init_db()
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
-                UPDATE model_route_state SET cooldown_until=NULL, error_kind=NULL
+                UPDATE model_route_state SET cooldown_until=NULL, error_kind=NULL,
+                    remaining_fraction=NULL, reset_at=NULL, quota_verified=0
             """)
             await db.commit()
 
@@ -295,6 +308,12 @@ class ModelRouter:
         active = {}
         for mid, status in statuses.items():
             cooldown = status.get("cooldown_until")
+            kind = status.get("error_kind", "quota")
+            if (not cooldown and status.get("quota_verified") and
+                    status.get("remaining_fraction") is not None and
+                    float(status["remaining_fraction"]) <= 0 and status.get("reset_at")):
+                cooldown = status["reset_at"]
+                kind = "verified_quota"
             if cooldown:
                 try:
                     dt = datetime.fromisoformat(cooldown)
@@ -304,12 +323,36 @@ class ModelRouter:
                             "model_id": mid,
                             "cooldown_until": cooldown,
                             "remaining_seconds": round(remaining_secs, 1),
-                            "error_kind": status.get("error_kind", "quota"),
+                            "error_kind": kind,
                             "observed_at": status.get("observed_at"),
                         }
                 except ValueError:
                     pass
         return active
+
+    async def next_cooldown(self, role: str = "general", backend: str = "direct",
+                            allow_writes: bool = False,
+                            availability: Mapping[str, bool | None] | None = None) -> dict | None:
+        """Earliest retry for a compatible model; never relax capability or backend rules."""
+        role = _ROLE_ALIASES.get(role.casefold(), role.casefold())
+        cooldowns = await self.get_cooldowns()
+        choices = []
+        for mid, model in self.models.items():
+            provider = model.get("provider")
+            if (mid == "codex-auto-review" or model.get("execution_supported", True) is not True
+                    or provider not in {"codex", "antigravity", "ollama"}
+                    or (backend == "ao" and provider != "codex")
+                    or (backend == "cao" and provider not in {"codex", "antigravity", "ollama"})
+                    or (allow_writes and provider == "ollama")
+                    or (availability is not None and
+                        (availability.get(mid) is False or availability.get(provider) is False))):
+                continue
+            capabilities = {str(value).casefold() for value in model.get("capabilities", [])}
+            if role not in capabilities and not (role == "architect" and "master" in capabilities):
+                continue
+            if mid in cooldowns:
+                choices.append(cooldowns[mid])
+        return min(choices, key=lambda row: row["cooldown_until"]) if choices else None
 
     async def rank(self, role: str = "general", backend: str = "direct",
                    allow_writes: bool = False, availability: Mapping[str, bool | None] | None = None,
@@ -321,10 +364,10 @@ class ModelRouter:
             raise ValueError("estimated_tokens negatif olamaz")
         role = _ROLE_ALIASES.get(role.casefold(), role.casefold())
         statuses, usage = await self._signals()
+        cooldowns = await self.get_cooldowns()
         now = datetime.now(timezone.utc)
         excluded = set(exclude)
         candidates = []
-        cooldown_candidates = []
         for mid, model in self.models.items():
             provider = model.get("provider")
             if mid in excluded or model.get("execution_supported", True) is not True or mid == "codex-auto-review":
@@ -344,59 +387,15 @@ class ModelRouter:
             if not suitable:
                 continue
             status = statuses.get(mid, {})
+            if mid in cooldowns:
+                continue
             cooldown = status.get("cooldown_until")
             if cooldown:
                 try:
-                    dt = datetime.fromisoformat(cooldown)
-                    if dt > now:
-                        cooldown_candidates.append((mid, model, status, (dt - now).total_seconds()))
-                        continue
+                    datetime.fromisoformat(cooldown)
                 except ValueError:
                     continue  # Corrupt status fails closed for this candidate.
             candidates.append((mid, model, status))
-
-        if not candidates and cooldown_candidates:
-            # 3 saat (10800 saniye) ve altındaki en erken modeli öncelikle değerlendir
-            short_cds = [c for c in cooldown_candidates if c[3] <= 3 * 3600]
-            if short_cds:
-                short_cds.sort(key=lambda item: item[3])
-                best_mid, best_model, best_status, shortest_secs = short_cds[0]
-                candidates.append((best_mid, best_model, best_status))
-            else:
-                # 3 saatten uzunsa: Role kısıtlamasını esnet ve tüm sağlayıcılardaki (Codex, Antigravity, Ollama)
-                # kotası müsait veya 3 saatin altındaki diğer modelleri otomatik devreye sok
-                for mid, model in self.models.items():
-                    if mid in excluded or model.get("execution_supported", True) is not True or mid == "codex-auto-review":
-                        continue
-                    if backend == "ao" and model.get("provider") != "codex":
-                        continue
-                    if backend == "cao" and model.get("provider") not in {"codex", "antigravity", "ollama"}:
-                        continue
-                    if model.get("provider") not in {"codex", "antigravity", "ollama"}:
-                        continue
-                    if allow_writes and model.get("provider") == "ollama":
-                        continue
-                    if availability is not None and (availability.get(mid) is False or availability.get(model.get("provider")) is False):
-                        continue
-                    status = statuses.get(mid, {})
-                    cooldown = status.get("cooldown_until")
-                    rem = 0
-                    if cooldown:
-                        try:
-                            dt = datetime.fromisoformat(cooldown)
-                            if dt > now:
-                                rem = (dt - now).total_seconds()
-                        except ValueError:
-                            rem = 0
-                    if rem <= 3 * 3600:
-                        candidates.append((mid, model, status))
-                        
-                # Hala aday bulunamadıysa en azından alternatif sağlayıcıdan bir model seç
-                if not candidates:
-                    for mid, model in self.models.items():
-                        if model.get("execution_supported", True) and mid != "codex-auto-review":
-                            candidates.append((mid, model, statuses.get(mid, {})))
-                            break
 
         if not candidates:
             return []

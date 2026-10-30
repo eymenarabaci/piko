@@ -6,7 +6,8 @@ import sqlite3
 
 import pytest
 
-from manager.model_router import ModelRouter, NoEligibleModel, infer_role
+from manager.model_router import ModelRouter, NoEligibleModel, infer_role, parse_quota_wait_seconds
+from manager.outcomes import ensure_usable_result
 
 
 MODELS = [
@@ -126,3 +127,32 @@ async def test_quota_cools_only_the_runtime_model_not_all_antigravity(tmp_path):
     assert [choice.model_id for choice in ranked] == ["flash", "codex"]
     await router.record_success("opus-low")
     assert (await router.choose("development", "cao", allow_writes=True)).model_id == "opus-high"
+
+
+@pytest.mark.asyncio
+async def test_all_compatible_models_cooling_wait_instead_of_running_early(tmp_path):
+    router = ModelRouter(MODELS, tmp_path / "ledger.sqlite")
+    await router.record_failure("writer_a", "Individual quota reached. Resets in 4h7m37s.")
+    await router.record_failure("writer_b", "Individual quota reached. Resets in 2h5m.")
+    assert await router.rank("development", "cao", allow_writes=True) == []
+    with pytest.raises(NoEligibleModel):
+        await router.choose("development", "cao", allow_writes=True)
+    nearest = await router.next_cooldown("development", "cao", allow_writes=True)
+    assert nearest["model_id"] == "writer_b"
+    assert nearest["remaining_seconds"] > 2 * 3600
+    assert await router.next_cooldown("reviewer", "cao", allow_writes=False)
+    assert parse_quota_wait_seconds("Resets in 111h7m37s") == 400057
+    with pytest.raises(RuntimeError, match="kota"):
+        ensure_usable_result({"status": "completed", "output": "Individual quota reached. Resets in 2h."})
+
+
+@pytest.mark.asyncio
+async def test_verified_zero_quota_waits_until_reset_or_manual_clear(tmp_path):
+    router = ModelRouter(MODELS, tmp_path / "ledger.sqlite")
+    reset = datetime.now(timezone.utc) + timedelta(hours=2)
+    await router.record_quota_snapshot("writer_a", 0, reset, "provider-adapter", True)
+    cooldown = await router.get_cooldowns()
+    assert cooldown["writer_a"]["error_kind"] == "verified_quota"
+    assert (await router.choose("development", "cao", allow_writes=True)).model_id == "writer_b"
+    await router.clear_cooldown("writer_a")
+    assert "writer_a" not in await router.get_cooldowns()

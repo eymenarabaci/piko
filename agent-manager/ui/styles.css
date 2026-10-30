@@ -75,6 +75,12 @@
 .job-banner.banner-waiting-quota{background:#fef3c7;border-color:#f59e0b;color:#92400e}
 .banner-auto-switch-btn{background:#d97706;color:#fff;border:none;border-radius:4px;padding:3px 10px;font-size:11px;font-weight:700;margin-left:12px;cursor:pointer;transition:all .15s}
 .banner-auto-switch-btn:hover{background:#b45309;transform:translateY(-1px);box-shadow:0 1px 3px rgba(0,0,0,0.15)}
+.quota-banner-summary,.quota-banner-actions{display:inline-flex;align-items:center;gap:7px;flex-wrap:wrap}
+.quota-banner-actions{margin-left:12px}
+.banner-retry-btn{border:1px solid #d39a47;border-radius:5px;padding:4px 9px;color:#78350f;font-size:11px;font-weight:600;background:#fffaf0}
+.banner-retry-btn:hover{background:#ffedd0}
+.worker-card>.step-quota-countdown{margin:3px 0 10px}
+.quota-timer-chip{gap:5px}
 
 /* Codex Style Project Selector */
 .project-selector-card{display:flex;align-items:center;gap:10px;padding:9px 12px;background:#f3f6fc;border:1px solid #dbe4f2;border-radius:8px;margin:8px 0 12px;cursor:pointer;transition:all .15s ease}

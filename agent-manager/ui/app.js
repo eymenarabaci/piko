@@ -1018,10 +1018,24 @@ function renderRun() {
   if (anyWaitingQuota) {
     const timer = run.quota_timer || Object.values(run.results || {}).find(r => r.status === 'waiting_quota');
     const waitingStepId = timer?.step_id || Object.keys(run.results || {}).find(k => run.results[k]?.status === 'waiting_quota');
-    $('#job-label').innerHTML = `⏳ <strong>Kota Bekleniyor (Zamanlayıcı Aktif)</strong> · Kalan: <span class="countdown-badge" id="banner-countdown">...</span> · Model: <code>${timer?.model_id || ''}</code> <button type="button" class="banner-auto-switch-btn" id="banner-quick-switch">⚡ Otomatik Modeli Değiştir</button>`;
-    const quickBtn = $('#banner-quick-switch');
-    if (quickBtn && waitingStepId) {
-      quickBtn.onclick = () => autoSwitchStepModel(run.id, waitingStepId);
+    const label = $('#job-label');
+    label.replaceChildren();
+    const summary = node('span', 'quota-banner-summary');
+    summary.append(node('strong', '', 'Kota bekleniyor'), node('span', '', ' · Otomatik devam edecek · '));
+    const clock = node('span', 'countdown-badge quota-countdown', 'Hesaplanıyor…');
+    if (timer?.resets_at) clock.dataset.resetAt = timer.resets_at;
+    summary.append(clock, node('span', '', ` · ${timer?.model_id || 'model seçimi bekleniyor'}`));
+    label.append(summary);
+    if (waitingStepId && !archivedPlanSelected()) {
+      const actions = node('span', 'quota-banner-actions');
+      actions.append(
+        button('Model seç', 'banner-auto-switch-btn', () => {
+          const step = run.plan?.steps?.find(item => item.id === waitingStepId);
+          if (step) openModelSwitchModal(run.id, step);
+        }),
+        button('Kotayı yeniledim', 'banner-retry-btn', () => retryQuotaStep(run.id, waitingStepId))
+      );
+      label.append(actions);
     }
   } else {
     $('#job-label').textContent = run ? `${statusLabels[run.status] || run.status}${run.current_steps?.length ? ' · Aktif Adım: ' + run.current_steps.join(', ') : ''}` : '';
@@ -1288,9 +1302,12 @@ function renderInspector() {
         actions.append(live);
       }
       if (result?.status === 'waiting_quota') {
-        actions.append(button('⚡ Otomatik Modeli Değiştir', 'primary-button', () => {
-          autoSwitchStepModel(run.id, step.id);
-        }));
+        const resetAt = result.resets_at || (run.quota_timer?.step_id === step.id ? run.quota_timer.resets_at : '');
+        const clock = node('span', 'step-quota-countdown quota-countdown', 'Hesaplanıyor…');
+        if (resetAt) clock.dataset.resetAt = resetAt;
+        card.append(clock);
+        actions.append(button('Model seç', 'outline-button', () => openModelSwitchModal(run.id, step)));
+        actions.append(button('Kotayı yeniledim', 'outline-button', () => retryQuotaStep(run.id, step.id)));
       }
       if (isRunning && result?.status !== 'waiting_quota') {
         actions.append(button('🔄 Yeniden Başlat', 'outline-button danger-text', () => {
@@ -1378,7 +1395,9 @@ function renderInspector() {
     // Active Sub-agents / Quota Timer
     if (run.status === 'waiting_quota') {
       const timerChip = node('div', 'stat-chip quota-timer-chip');
-      timerChip.innerHTML = `<span>⏳</span> <strong>Kota Zamanlayıcısı:</strong> <span class="countdown-display">Hesaplanıyor...</span> (Çalışma duraklatıldı)`;
+      timerChip.append(node('span', '', '⏳'), node('strong', '', 'Kota yenilenince devam:'), node('span', 'countdown-display quota-countdown', 'Hesaplanıyor…'));
+      const timer = run.quota_timer;
+      if (timer?.resets_at) timerChip.querySelector('.quota-countdown').dataset.resetAt = timer.resets_at;
       statsRow.append(timerChip);
     } else if (activeWorkers.length) {
       const activeChip = node('div', 'stat-chip');
@@ -2282,6 +2301,28 @@ async function autoSwitchStepModel(runId, stepId) {
   }
 }
 
+async function retryQuotaStep(runId, stepId) {
+  if (state.busy) return;
+  setBusy(true);
+  try {
+    const run = await api(`/api/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(stepId)}/retry-quota`, {
+      method: 'POST',
+      body: JSON.stringify({})
+    });
+    state.run = run;
+    storeRun(run);
+    state.fingerprint = '';
+    renderRun();
+    toast('Kota kaydı temizlendi; adım yeniden deneniyor.');
+    await pollEvents(state.generation);
+    schedulePoll();
+  } catch (error) {
+    toast(errorText(error));
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function openModelSwitchModal(runId, step) {
   currentSwitchTarget = { runId, stepId: step.id };
   const modal = $('#model-switch-dialog');
@@ -2301,7 +2342,23 @@ async function openModelSwitchModal(runId, step) {
 
   const currentModel = state.run?.results?.[step.id]?.model_id || step.model_id;
   const models = state.bootstrap?.models || [];
-  const eligible = models.filter(m => m.execution_supported !== false && m.provider !== 'opencode' && !m.hidden);
+  const run = state.run || {};
+  const readOnly = new Set(['reviewer', 'qa_tester', 'security_auditor', 'architect', 'researcher', 'analyzer']);
+  const writing = Boolean(run.allow_writes && !readOnly.has(step.persona));
+  const roleText = `${step.persona || ''} ${(step.title || '')} ${(step.prompt || '').slice(0, 400)}`.toLocaleLowerCase();
+  const role = ['review', 'audit', 'security', 'test', 'qa', 'incele', 'denet'].some(s => roleText.includes(s)) ? 'reviewer'
+    : ['plan', 'architect', 'mimar', 'tasarım', 'decompos'].some(s => roleText.includes(s)) ? 'architect'
+    : ['orchestrat', 'koordina', 'yönetic'].some(s => roleText.includes(s)) ? 'master'
+    : ['develop', 'frontend', 'backend', 'code', 'implement', 'kod', 'geliştir'].some(s => roleText.includes(s)) ? 'development'
+    : 'general';
+  const eligible = models.filter(m => {
+    const caps = new Set((m.capabilities || []).map(x => String(x).toLowerCase()));
+    return m.execution_supported !== false && !m.hidden && m.provider !== 'opencode'
+      && (!writing || m.provider !== 'ollama')
+      && (run.execution_backend !== 'ao' || m.provider === 'codex')
+      && (run.execution_backend !== 'cao' || ['codex', 'antigravity', 'ollama'].includes(m.provider))
+      && (caps.has(role) || (role === 'architect' && caps.has('master')));
+  });
 
   let firstAvailableId = null;
 
@@ -2319,12 +2376,12 @@ async function openModelSwitchModal(runId, step) {
       const hours = Math.floor(rem / 3600);
       const mins = Math.floor((rem % 3600) / 60);
       const timeStr = hours > 0 ? `${hours} sa ${mins} dk` : `${mins} dk`;
-      label += ` ⚠️ (Kotası Dolmuş Olabilir - ${timeStr} kaldı)`;
+      label += ` · Kota bekliyor (${timeStr})`;
     }
 
     const opt = node('option', '', label);
     opt.value = m.id;
-    if (isCurrent) {
+    if (isCurrent || isCooldown) {
       opt.disabled = true;
     } else if (!firstAvailableId) {
       firstAvailableId = m.id;
@@ -2339,7 +2396,14 @@ async function openModelSwitchModal(runId, step) {
     select.value = preferred.id;
   } else if (firstAvailableId) {
     select.value = firstAvailableId;
+  } else {
+    const opt = node('option', '', 'Şu anda uygun model yok; sayaç dolunca otomatik denenecek');
+    opt.value = '';
+    opt.disabled = true;
+    opt.selected = true;
+    select.prepend(opt);
   }
+  $('#confirm-model-switch-btn').disabled = !firstAvailableId;
 
   modal.showModal();
 }
@@ -2792,41 +2856,21 @@ $('#chat-model').addEventListener('change', () => {
 });
 
 function updateQuotaCountdowns() {
-  const run = state.run;
-  if (!run) return;
-  const timer = run.quota_timer || Object.values(run.results || {}).find(r => r.status === 'waiting_quota');
-  let resetsAtStr = timer?.resets_at;
-
-  // Geçmiş veya aktif kayıtlarda resets_at yoksa output metninden ("2 saat 53 dakika") dinamik hesapla
-  if (!resetsAtStr && timer?.output) {
-    const m = timer.output.match(/(?:Yenilenmeye|kaldı|var)\s*(\d+)?\s*(?:saat)?\s*(\d+)\s*dakika/i);
-    if (m) {
-      const h = parseInt(m[1] || '0', 10);
-      const min = parseInt(m[2] || '0', 10);
-      const target = new Date(Date.now() + (h * 3600 + min * 60) * 1000);
-      timer.resets_at = target.toISOString();
-      resetsAtStr = timer.resets_at;
+  document.querySelectorAll('.quota-countdown').forEach(el => {
+    const resetsAt = Date.parse(el.dataset.resetAt || '');
+    if (!Number.isFinite(resetsAt)) {
+      el.textContent = 'Yenilenme saati bekleniyor';
+      return;
     }
-  }
-  if (!resetsAtStr) return;
-
-  const resetsAt = new Date(resetsAtStr).getTime();
-  const now = Date.now();
-  const diffSec = Math.max(0, Math.floor((resetsAt - now) / 1000));
-
-  const h = Math.floor(diffSec / 3600);
-  const m = Math.floor((diffSec % 3600) / 60);
-  const s = diffSec % 60;
-  const formatted = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-
-  const bannerCd = $('#banner-countdown');
-  if (bannerCd) {
-    bannerCd.textContent = diffSec > 0 ? formatted : '00:00:00';
-  }
-
-  const countdownEls = document.querySelectorAll('.countdown-display');
-  countdownEls.forEach(el => {
-    el.textContent = diffSec > 0 ? `⏳ ${formatted}` : '⏳ Yenileniyor...';
+    const remaining = Math.max(0, Math.ceil((resetsAt - Date.now()) / 1000));
+    if (!remaining) {
+      el.textContent = 'Yeniden deneniyor…';
+      return;
+    }
+    const hours = Math.floor(remaining / 3600);
+    const mins = Math.floor((remaining % 3600) / 60);
+    const secs = remaining % 60;
+    el.textContent = `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
   });
 }
 

@@ -1095,58 +1095,77 @@ def create_app(data_dir=None, providers=None):
 
         # Otomatik Model Seçimi: model_id gönderilmemişse veya 'auto' ise router en uygun modeli seçer
         role = infer_role(step_obj.get("persona") or "developer", f"{step_obj.get('title')} {step_obj.get('prompt')}") if step_obj else "general"
-        writable = run.get("allow_writes", False)
-        cooldowns = await app.state.engine.router.get_cooldowns()
+        writable = bool(run.get("allow_writes") and
+                        (not step_obj or step_obj.get("persona") not in
+                         {"reviewer", "qa_tester", "security_auditor", "architect", "researcher", "analyzer"}))
 
         if not new_model_id or new_model_id == "auto":
             exclude_ids = {current_model} if current_model else set()
-            active_cooldown_ids = set(cooldowns.keys())
             try:
                 choice = await app.state.engine.route(
                     run, role, allow_writes=writable,
-                    exclude=exclude_ids | active_cooldown_ids
+                    exclude=exclude_ids
                 )
                 new_model_id = choice.model_id
-            except NoEligibleModel:
-                try:
-                    choice = await app.state.engine.route(
-                        run, role, allow_writes=writable,
-                        exclude=exclude_ids
-                    )
-                    new_model_id = choice.model_id
-                    await app.state.engine.clear_cooldown(new_model_id)
-                except Exception as e:
-                    raise HTTPException(status_code=400, detail=f"Hiçbir uygun model bulunamadı: {str(e)}")
+            except NoEligibleModel as exc:
+                raise HTTPException(status_code=409, detail=f"Şu anda uygun ve kotası açık alternatif yok: {exc}") from exc
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Otomatik model seçilemedi: {str(e)}")
         else:
             if new_model_id not in app.state.engine.models:
                 raise HTTPException(status_code=400, detail=f"Bilinmeyen model: {new_model_id}")
-            if new_model_id in cooldowns:
-                await app.state.engine.clear_cooldown(new_model_id)
-        if False:
-            role = infer_role(step_obj.get("persona") or "developer", f"{step_obj.get('title')} {step_obj.get('prompt')}") if step_obj else "general"
-            try:
-                pass
-                new_model_id = choice.model_id
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Otomatik model seçilemedi: {str(e)}")
-        
+            model = app.state.engine.models[new_model_id]
+            provider = model.get("provider")
+            capabilities = {str(item).casefold() for item in model.get("capabilities", [])}
+            if (model.get("execution_supported", True) is not True
+                    or (run.get("execution_backend") == "ao" and provider != "codex")
+                    or (run.get("execution_backend") == "cao" and provider not in {"codex", "antigravity", "ollama"})
+                    or (writable and provider == "ollama")
+                    or (role not in capabilities and not (role == "architect" and "master" in capabilities))):
+                raise HTTPException(400, "Seçilen model bu adımı yürütemez.")
         cooldowns = await app.state.engine.router.get_cooldowns()
-        if False and new_model_id in cooldowns:
-            rem = int(cooldowns[new_model_id]["remaining_seconds"])
-            hours = rem // 3600
-            mins = (rem % 3600) // 60
-            time_str = f"{hours} saat {mins} dakika" if hours > 0 else f"{mins} dakika"
-            raise HTTPException(
-                status_code=400,
-                detail=f"'{new_model_id}' modelinin kotası doludur ({time_str} kaldı). Lütfen kotası müsait başka bir model seçin."
-            )
+        if new_model_id in cooldowns:
+            raise HTTPException(409, f"{new_model_id} için kota beklemesi sürüyor; yenilendiyse 'Kotayı yeniledim' düğmesini kullanın.")
 
         await app.state.engine.set_step_model(run_id, step_id, new_model_id)
         await app.state.engine.store.event(run_id, "model_handoff",
                                            f"Otomatik model seçildi ve adım başlatıldı: {current_model} → {new_model_id}",
                                            {"step_id": step_id, "from": current_model, "to": new_model_id})
+        return await app.state.engine.retry_step(run_id, step_id)
+
+    @app.post("/api/runs/{run_id}/steps/{step_id}/retry-quota")
+    async def retry_quota_step(run_id: str, step_id: str, request: Request):
+        run = await require(run_id)
+        if run.get("status") != "waiting_quota":
+            raise HTTPException(409, "Görev kota bekleme durumunda değil.")
+        step = next((item for item in (run.get("plan") or {}).get("steps", [])
+                     if item.get("id") == step_id), None)
+        if not step or run.get("quota_timer", {}).get("step_id") != step_id:
+            raise HTTPException(400, "Bekleyen adım bulunamadı.")
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        model_id = body.get("model_id") or run["quota_timer"]["model_id"]
+        if model_id not in app.state.engine.models:
+            raise HTTPException(400, "Bilinmeyen model.")
+        role = infer_role(step.get("persona") or "developer", f"{step.get('title')} {step.get('prompt')}")
+        model = app.state.engine.models[model_id]
+        provider = model.get("provider")
+        capabilities = {str(item).casefold() for item in model.get("capabilities", [])}
+        writable = bool(run.get("allow_writes") and step.get("persona") not in
+                        {"reviewer", "qa_tester", "security_auditor", "architect", "researcher", "analyzer"})
+        if (model.get("execution_supported", True) is not True
+                or (run.get("execution_backend") == "ao" and provider != "codex")
+                or (writable and provider == "ollama")
+                or (role not in capabilities and not (role == "architect" and "master" in capabilities))):
+            raise HTTPException(400, "Seçilen model bu adımı yürütemez.")
+        app.state.engine.cancel_quota_resume(run_id)
+        await app.state.engine.clear_cooldown(model_id)
+        await app.state.engine.set_step_model(run_id, step_id, model_id)
+        await app.state.engine.store.event(run_id, "quota_manual_retry",
+                                           f"{model_id} kotası kullanıcı isteğiyle yeniden kontrol ediliyor.",
+                                           {"step_id": step_id, "model_id": model_id})
         return await app.state.engine.retry_step(run_id, step_id)
 
     @app.post("/api/models/clear-cooldowns")
