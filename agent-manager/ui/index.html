@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="tr">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light"><link rel="icon" href="data:,"><title>Piko · Çalışma alanı</title><link rel="stylesheet" href="/ui/styles.css?v=compact-clean-20261029"><script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light"><link rel="icon" href="data:,"><title>Piko · Çalışma alanı</title><link rel="stylesheet" href="/ui/styles.css?v=compact-clean-20261029"></head>
 <body>
 <div class="app-shell inspector-collapsed">
  <aside class="sidebar">
@@ -113,6 +113,14 @@
      <form id="composer" class="composer">
       <div class="composer-top"><span class="composer-flow-label">Birlikte ilerleyelim</span><button type="button" class="settings-open settings-pill">⚙ <span>Ayarlar</span></button></div>
       <label class="sr-only" for="prompt">Mesajınız veya göreviniz</label><textarea id="prompt" maxlength="32000" rows="2" placeholder="Hangi hedef üzerinde çalışalım? (Enter ile gönderin, Shift+Enter ile yeni satır)"></textarea>
+      <label id="instruction-delivery-control" class="instruction-delivery-control" for="instruction-delivery" hidden>Çalışan işe gönderim
+       <select id="instruction-delivery" aria-label="Ek talimatın iletilme zamanı">
+        <option value="now">Şimdiki ajana hemen ilet</option>
+        <option value="next_step">Sıradaki adımda uygula</option>
+        <option value="next_plan">Sonraki plana ekle</option>
+       </select>
+       <small id="instruction-delivery-hint">Seçilen zaman ile teslim durumu sohbet içinde gösterilir.</small>
+      </label>
       <div id="attachment-list" class="attachment-list" aria-live="polite" hidden></div>
       <div class="composer-bottom"><div class="model-controls"><label id="planner-model-control" hidden>Planlayıcı<select id="planner-model" aria-label="Planlayıcı model"><option value="">Yükleniyor…</option></select></label><label id="chat-model-control">Ajan<select id="chat-model" aria-label="Ajan"><option value="">Yükleniyor…</option></select></label><label class="planning-level-control" title="Planın kapsam ve ayrıntısını belirler; otomatik olarak daha fazla ajan çağırmaz.">Planlama<select id="planning-level" aria-label="Planlama düzeyi"><option value="fast">Hızlı</option><option value="balanced">Dengeli</option><option value="detailed">Ayrıntılı</option></select></label></div><div class="composer-submit-actions"><input id="attachment-input" type="file" multiple hidden><button type="button" id="attach-button" class="attach-button" title="Resim veya dosya ekle" aria-label="Resim veya dosya ekle">📎</button><button id="send-button" class="send-button" title="Görevi gönder" aria-label="Görevi gönder">↑</button></div></div>
       <div class="composer-permission">

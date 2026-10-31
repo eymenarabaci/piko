@@ -4,11 +4,57 @@ const activeStatuses = new Set(['queued', 'planning', 'running', 'waiting_quota'
 const statusLabels = {
   queued: 'Sırada', planning: 'Planlanıyor', planned: 'Plan hazır',
   running: 'Çalışıyor', awaiting_review: 'İnceleme bekliyor',
+  awaiting_user_test: 'Kullanıcı testi bekleniyor', scheduled: 'Zamanlandı',
   completed: 'Tamamlandı', failed: 'Başarısız', cancelled: 'İptal edildi',
   interrupted: 'Kesildi', pending: 'Bekliyor', blocked: 'Bağımlılık bekliyor',
   success: 'Tamamlandı', skipped: 'Atlandı', waiting_quota: '⏳ Kota Bekleniyor'
 };
 const unifiedHint = 'Sorunuzu veya yapmak istediğiniz işi yazın. Gerektiğinde planı inceleyip onaylayabilirsiniz.';
+const instructionDeliveryLabels = {
+  now: 'Şimdiki ajana', next_step: 'Sıradaki adımda', next_plan: 'Sonraki planda'
+};
+const instructionStatusLabels = {
+  queued: 'Sırada', sending: 'İletiliyor', delivered: 'İletildi', applied: 'Uygulandı',
+  delivery_unknown: 'Teslim doğrulanamadı', failed: 'İletilemedi',
+  deferred: 'Sonraki plana ayrıldı'
+};
+const phaseStatusLabels = {
+  planning: 'Planlanıyor', planned: 'Plan hazır', executing: 'Uygulanıyor',
+  auditing: 'Önceki iş denetleniyor', awaiting_review: 'İnceleme bekleniyor',
+  awaiting_user_test: 'Kullanıcı testi bekleniyor', completed: 'Tamamlandı'
+};
+
+function instructionRecords(run) {
+  const records = [...(run.instruction_history || []), ...(run.instruction_queue || [])];
+  const latest = new Map();
+  for (const item of records) if (item && typeof item === 'object' && item.id) latest.set(item.id, item);
+  return [...latest.values()].sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
+}
+
+function programProgress(run) {
+  const items = Array.isArray(run.program_items) ? run.program_items : [];
+  if (!items.length) return null;
+  const index = Math.min(Math.max(Number(run.program_index) || 0, 0), items.length - 1);
+  return {index, total: items.length, item: items[index] || {}};
+}
+
+async function submitActiveInstruction(run, message, delivery) {
+  const res = await api(`/api/runs/${encodeURIComponent(run.id)}/instructions`, {
+    method: 'POST',
+    body: JSON.stringify({message, delivery, client_message_id: crypto.randomUUID().replaceAll('-', '')})
+  });
+  if (res.run) {
+    storeRun(res.run);
+    if (state.run?.id === run.id) state.run = res.run;
+  }
+  state.fingerprint = '';
+  renderRun();
+  const actual = res.actual_delivery || res.delivery || res.instruction?.delivery || delivery;
+  toast(actual !== delivery
+    ? `Şimdiki ajana canlı iletim desteklenmedi; talimat ${instructionDeliveryLabels[actual] || actual} için sıraya alındı.`
+    : `Talimat kaydedildi: ${instructionDeliveryLabels[actual] || actual}.`);
+  return res;
+}
 
 const state = {
   bootstrap: null, runs: [], run: null, selectedId: null,
@@ -760,15 +806,72 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
     container.append(userBubble);
   }
 
+  const instructions = instructionRecords(run);
+  if (instructions.length) {
+    const queue = node('section', 'instruction-queue');
+    queue.setAttribute('aria-label', 'Çalışan işe verilen talimatlar');
+    for (const item of instructions) {
+      const card = node('article', 'instruction-card');
+      const head = node('div', 'instruction-card-head');
+      const requested = item.requested_delivery || item.delivery;
+      const deliveryLabel = requested !== item.delivery
+        ? `${instructionDeliveryLabels[requested] || requested} → ${instructionDeliveryLabels[item.delivery] || item.delivery}`
+        : instructionDeliveryLabels[item.delivery] || 'Ek talimat';
+      head.append(node('strong', '', deliveryLabel));
+      const status = node('span', `instruction-card-state status-${item.status || 'queued'}`,
+        instructionStatusLabels[item.status] || item.status || 'Sırada');
+      if (item.target_step_id) status.title = `Hedef adım: ${item.target_step_id}`;
+      head.append(status);
+      card.append(head, node('div', 'instruction-card-body', item.message || ''));
+      queue.append(card);
+    }
+    container.append(queue);
+  }
+  if (!archived && run.id === state.run?.id && run.status === 'awaiting_user_test' && run.audit_user_question) {
+    const request = node('form', 'user-test-request');
+    request.append(node('strong', '', 'Piko sizden test sonucu bekliyor'),
+      node('p', '', String(run.audit_user_question)));
+    const answer = node('textarea', 'user-test-answer');
+    answer.rows = 3;
+    answer.required = true;
+    answer.placeholder = 'Denediğiniz adımları ve gözlediğiniz sonucu yazın…';
+    const submitTest = button('Test sonucunu gönder', 'primary-button');
+    submitTest.type = 'submit';
+    request.append(answer, submitTest);
+    request.addEventListener('submit', async event => {
+      event.preventDefault();
+      const value = answer.value.trim();
+      if (!value || state.busy) return;
+      setBusy(true);
+      try {
+        const res = await api(`/api/runs/${encodeURIComponent(run.id)}/test-response`, {
+          method: 'POST', body: JSON.stringify({answer: value})
+        });
+        const updated = res.run || res;
+        if (updated?.id) {
+          storeRun(updated);
+          state.fingerprint = '';
+          renderRun();
+          schedulePoll();
+        }
+        toast('Test sonucu kaydedildi. Piko sonraki planı buna göre değerlendirecek.');
+      } catch (error) { toast(errorText(error)); }
+      finally { setBusy(false); }
+    });
+    container.append(request);
+  }
+
   // 2. ORKESTRATÖR PLAN & MINI-DAG BALONU (Yalnızca gerçekten çok adımlı plan gerekiyorsa gösterilir)
   const steps = run.plan?.steps || [];
   const isMultiStep = steps.length > 1;
 
-  if (isMultiStep || run.status === 'planned') {
+  if (isMultiStep || run.status === 'planned' || programProgress(run)) {
     const planBubble = node('article', 'message-bubble plan-overview-bubble');
     const planHead = node('div', 'plan-overview-head');
     const planIdentity = node('div', 'plan-identity');
-    planIdentity.append(node('span', 'plan-emblem', '◈'), node('b', '', 'Çalışma planı'));
+    const program = programProgress(run);
+    planIdentity.append(node('span', 'plan-emblem', '◈'),
+      node('b', '', program ? `İş ${program.index + 1}/${program.total} · ${program.item.title || 'Çalışma planı'}` : 'Çalışma planı'));
     const planMeta = node('div', 'plan-meta');
     if (run.planner_model_actual || run.planner_model) {
       planMeta.append(node('span', 'worker-id-pill', `🤖 ${run.planner_model_actual || run.planner_model}`));
@@ -786,6 +889,13 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
         ? `${doneCount}/${steps.length} adım tamamlandı.`
         : `${doneCount}/${steps.length} adım tamamlandı · ${statusLabels[run.status] || run.status}`;
     planBubble.append(node('p', 'conversation-status', statusText));
+    if (program) {
+      const phaseInfo = node('p', 'program-phase-note',
+        `${program.item.goal || program.item.title || ''}${run.phase_status ? ` · ${phaseStatusLabels[run.phase_status] || run.phase_status}` : ''}`);
+      planBubble.append(phaseInfo);
+      if (program.item.demo_requested) planBubble.append(node('span', 'program-demo-chip', 'Demo çıktısı istendi'));
+      if (program.item.schedule_hint) planBubble.append(node('span', 'program-schedule-chip', `Zamanlama: ${program.item.schedule_hint}`));
+    }
     planBubble.append(button('Plan ayrıntılarını aç ↗', 'output-open-button', () => {
       state.tab = 'flow';
       renderInspector();
@@ -1015,8 +1125,17 @@ function renderRun() {
   const anyWaitingQuota = run?.status === 'waiting_quota' || Object.values(run?.results || {}).some(r => r.status === 'waiting_quota');
   $('#job-banner').hidden = !run || (!activeStatuses.has(run.status) && !anyWaitingQuota);
   $('#cancel-job').textContent = 'Durdur';
+  const activeRun = !!run && activeStatuses.has(run.status);
+  $('#instruction-delivery-control').hidden = !activeRun;
+  $('#instruction-delivery-hint').textContent = activeRun
+    ? ($('#instruction-delivery').value === 'now'
+        ? 'Canlı terminal destekliyorsa ajana hemen iletilir; teslim durumu aşağıda görünür.'
+        : $('#instruction-delivery').value === 'next_plan'
+          ? 'Bu iş bittiğinde hazırlanacak yeni planın girdisi olur.'
+          : 'Çalışan adımın istemi değişmez; sıradaki adıma iletilir.')
+    : '';
   $('#prompt').placeholder = run && activeStatuses.has(run.status)
-    ? 'Çalışan göreve ek talimat yazın (sıradaki adımda uygulanır)…'
+    ? 'Çalışan göreve ek talimat yazın…'
     : 'Mesajınızı yazın…';
   $('#job-banner').classList.toggle('banner-waiting-quota', anyWaitingQuota);
   if (anyWaitingQuota) {
@@ -1055,6 +1174,8 @@ function renderRun() {
     progress.replaceChildren();
     const stats = node('div', 'overview-stats-row');
     stats.append(node('span', 'stat-chip', `${statusLabels[viewRun.status] || viewRun.status}`));
+    const program = programProgress(viewRun);
+    if (program) stats.append(node('span', 'stat-chip', `İş ${program.index + 1}/${program.total}`));
     stats.append(node('span', 'stat-chip', `Adımlar ${done}/${total || '—'} · %${percent}`));
     stats.append(node('span', 'stat-chip', `⚡ ${(state.runTokenTotals[viewRun.id] || Object.values(viewRun.results || {}).reduce((sum, item) => sum + Number(item.token_usage?.step_tokens || item.tokens || 0), 0)).toLocaleString('tr-TR')} token`));
     if (viewRun.current_steps?.length) stats.append(node('span', 'stat-chip', `${viewRun.current_steps.length} ajan çalışıyor`));
@@ -1071,7 +1192,7 @@ function renderRun() {
     return;
   }
 
-  const fingerprint = JSON.stringify([run.id, run.status, run.error, run.plan, run.results, run.quota_timer, run.current_steps, run.chat_history, run.orchestrator_answer, run.plan_history, state.conversationRuns, state.planViewId, state.events, state.runTokens]);
+  const fingerprint = JSON.stringify([run.id, run.status, run.error, run.plan, run.results, run.quota_timer, run.current_steps, run.chat_history, run.orchestrator_answer, run.plan_history, run.program_items, run.program_index, run.phase_status, run.audit_user_question, run.instruction_queue, run.instruction_history, state.conversationRuns, state.planViewId, state.events, state.runTokens]);
   if (fingerprint === state.fingerprint) {
     renderInspector();
     return;
@@ -1093,7 +1214,7 @@ function renderRun() {
       section.append(button(`Plan ${planNumber} · ${statusLabels[planRun.status] || planRun.status} · Ayrıntıları göster ↗`, 'conversation-plan-select', () => choosePlan(planRun.id)));
     }
     section.addEventListener('click', event => {
-      if (event.target.closest('.archived-plan')) return;
+      if (event.target.closest('.archived-plan, .user-test-request, button, input, textarea, select')) return;
       state.planViewId = planRun.id; state.fingerprint = ''; renderRun();
     });
     renderRunMessages(planRun, section, questionDrafts);
@@ -1500,9 +1621,19 @@ function renderInspector() {
     const inputRow = node('form', 'chat-input-row');
     const chatInput = node('input', 'chat-input');
     chatInput.placeholder = activeStatuses.has(run.status)
-      ? 'Sıradaki adım için ek talimat yazın...'
+      ? 'Çalışan işe ek talimat yazın...'
       : 'Orkestratöre talimat veya soru yazın...';
     chatInput.required = true;
+    const inspectorDelivery = node('select', 'chat-delivery-select');
+    if (activeStatuses.has(run.status)) {
+      for (const [value, label] of Object.entries(instructionDeliveryLabels)) {
+        const option = node('option', '', label); option.value = value;
+        inspectorDelivery.append(option);
+      }
+      inspectorDelivery.value = $('#instruction-delivery').value;
+      inspectorDelivery.setAttribute('aria-label', 'Ek talimatın iletilme zamanı');
+      inputRow.append(inspectorDelivery);
+    }
     inputRow.append(chatInput, button('Gönder', 'primary-button'));
     inputRow.addEventListener('submit', async e => {
       e.preventDefault();
@@ -1510,12 +1641,8 @@ function renderInspector() {
       if (!msg) return;
       if (activeStatuses.has(run.status)) {
         try {
-          await api(`/api/runs/${encodeURIComponent(run.id)}/instructions`, {
-            method: 'POST', body: JSON.stringify({message: msg})
-          });
+          await submitActiveInstruction(run, msg, inspectorDelivery.value);
           chatInput.value = '';
-          chatLog.append(node('div', 'chat-msg-user', `Siz: ${msg}`));
-          toast('Talimat sıradaki adıma iletildi.');
         } catch (err) { toast(errorText(err)); }
         return;
       }
@@ -2071,9 +2198,11 @@ async function renderTriggersPage() {
       const top = node('div', 'trigger-card-top');
       top.append(node('h4', 'trigger-title', t.name));
 
-      const intervalText = t.type === 'file_watch'
-        ? `Watcher (${t.interval_seconds}s sessizlik)`
-        : `Her ${Math.round(t.interval_seconds / 3600) || Math.round(t.interval_seconds / 60) + ' dk'} saat`;
+      const intervalText = t.type === 'once'
+        ? `Bir kez · ${date(t.run_at || t.next_run_at) || 'zaman bekleniyor'}`
+        : t.type === 'file_watch'
+          ? `Watcher (${t.interval_seconds}s sessizlik)`
+          : `Her ${Math.round(t.interval_seconds / 3600) || Math.round(t.interval_seconds / 60) + ' dk'} saat`;
       top.append(node('span', 'trigger-interval-pill', intervalText));
       card.append(top);
 
@@ -2150,36 +2279,48 @@ async function renderTriggersPage() {
   }
   container.append(trgGrid);
 
-  container.append(node('h3', 'triggers-section-title', '＋ Yeni Özel Otonom Tetikleyici Oluştur'));
+  container.append(node('h3', 'triggers-section-title', '＋ Yeni zamanlanmış görev veya tetikleyici oluştur'));
   const customBox = node('div', 'settings-group');
   customBox.innerHTML = `
     <div style="display:flex;gap:12px;margin:10px 0;flex-wrap:wrap">
       <input id="custom-trg-name" type="text" placeholder="Tetikleyici Adı (Örn: Gece Testi)" style="flex:2;min-width:200px;padding:8px 12px;border:1px solid #dce4f1;border-radius:6px;font-size:12px">
       <select id="custom-trg-type" style="padding:8px;border-radius:6px;border:1px solid #dce4f1;background:#fff;font-size:12px">
+        <option value="once">Belirli zamanda bir kez</option>
         <option value="interval">Zaman Aralığı (Interval)</option>
         <option value="file_watch">Dosya Değişikliği (File Watcher)</option>
       </select>
-      <input id="custom-trg-interval" type="number" value="3600" min="10" placeholder="Aralık (saniye)" style="width:120px;padding:8px;border:1px solid #dce4f1;border-radius:6px;font-size:12px">
+      <input id="custom-trg-run-at" type="datetime-local" aria-label="Görevin yerel başlangıç zamanı" style="padding:8px;border:1px solid #dce4f1;border-radius:6px;font-size:12px">
+      <input id="custom-trg-interval" type="number" value="3600" min="10" placeholder="Aralık (saniye)" style="width:120px;padding:8px;border:1px solid #dce4f1;border-radius:6px;font-size:12px" hidden>
     </div>
     <textarea id="custom-trg-prompt" placeholder="Ajanın otonom uyanınca yürüteceği talimat/görev metni..." rows="3" style="width:100%;border:1px solid #dce4f1;border-radius:6px;padding:10px;font-size:12px;line-height:1.6;font-family:inherit;margin-bottom:10px"></textarea>
     <button id="create-custom-trg-btn" class="primary-button">Tetikleyiciyi Oluştur ve Başlat</button>
   `;
+  const typeInput = customBox.querySelector('#custom-trg-type');
+  const intervalInput = customBox.querySelector('#custom-trg-interval');
+  const runAtInput = customBox.querySelector('#custom-trg-run-at');
+  typeInput.onchange = () => {
+    intervalInput.hidden = typeInput.value === 'once';
+    runAtInput.hidden = typeInput.value !== 'once';
+  };
   customBox.querySelector('#create-custom-trg-btn').onclick = async () => {
     const name = customBox.querySelector('#custom-trg-name').value.trim();
-    const type = customBox.querySelector('#custom-trg-type').value;
-    const interval_seconds = parseInt(customBox.querySelector('#custom-trg-interval').value) || 3600;
+    const type = typeInput.value;
+    const interval_seconds = parseInt(intervalInput.value) || 3600;
     const prompt = customBox.querySelector('#custom-trg-prompt').value.trim();
-    if (!name || !prompt) {
-      toast('Lütfen tetikleyici adı ve görev talimatını girin.');
+    const runAt = type === 'once' && runAtInput.value ? new Date(runAtInput.value) : null;
+    if (!prompt || (type !== 'once' && !name) || (type === 'once' && (!runAt || Number.isNaN(runAt.valueOf()) || runAt <= new Date()))) {
+      toast(type === 'once' ? 'Görev metni ve gelecekte bir yerel saat seçin.' : 'Tetikleyici adı ve görev metnini girin.');
       return;
     }
     try {
       await api('/api/triggers', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, type, interval_seconds, prompt, enabled: true })
+        body: JSON.stringify(type === 'once'
+          ? {name, type, run_at: runAt.toISOString(), prompt, enabled: true}
+          : {name, type, interval_seconds, prompt, enabled: true})
       });
-      toast(`'${name}' tetikleyicisi oluşturuldu!`);
+      toast(type === 'once' ? 'Görev seçilen zamana kaydedildi.' : `'${name}' tetikleyicisi oluşturuldu!`);
       renderTriggersPage();
     } catch (e) {
       toast(errorText(e));
@@ -2664,6 +2805,7 @@ $('#composer').addEventListener('drop', event => {
     queueAttachments(files);
   }
 });
+$('#instruction-delivery').addEventListener('change', () => renderRun());
 $('#composer').addEventListener('submit', async event => {
   event.preventDefault();
   if (state.busy) return;
@@ -2678,14 +2820,8 @@ $('#composer').addEventListener('submit', async event => {
     if (attachments.length) { toast('Çalışan göreve ek talimatta dosya eki desteklenmiyor.'); return; }
     setBusy(true);
     try {
-      const res = await api(`/api/runs/${encodeURIComponent(state.run.id)}/instructions`, {
-        method: 'POST', body: JSON.stringify({message: prompt})
-      });
+      await submitActiveInstruction(state.run, prompt, $('#instruction-delivery').value);
       $('#prompt').value = '';
-      state.run = res.run;
-      state.fingerprint = '';
-      renderRun();
-      toast('Talimat sıradaki adıma iletildi. Çalışan adımın istemi değişmez.');
     } catch (error) { toast(errorText(error)); }
     finally { setBusy(false); }
     return;

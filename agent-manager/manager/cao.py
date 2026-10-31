@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
+from urllib.parse import quote
 import secrets
 import socket
 import subprocess
@@ -225,6 +226,18 @@ class CAOClient:
             raise CAOError("CAO yanıtı beklenen biçimde değil.")
         return data
 
+    async def send_live_instruction(self, terminal_id: str, message: str) -> dict:
+        """Deliver explicit user guidance to the active CAO terminal."""
+        if not re.fullmatch(r"[0-9a-f]{8,32}", terminal_id):
+            raise CAOError("Geçerli çalışan terminal bulunamadı.")
+        if not message.strip() or len(message) > 8000:
+            raise CAOError("Canlı yönlendirme uzunluğu geçersiz.")
+        result = await self.request("POST", f"/terminals/{terminal_id}/input?message={quote(message, safe='')}",
+                                    timeout=15)
+        if result.get("success") is not True:
+            raise CAOError("CAO terminali canlı yönlendirmeyi kabul etmedi.")
+        return result
+
     async def _ensure_opencode_profile(self, profile: str) -> None:
         """Install the bundled CAO profile into this app's private OpenCode home."""
         if profile not in {"developer", "reviewer"}:
@@ -303,6 +316,21 @@ class CAOClient:
                     if isinstance(terminal_id, str) and re.fullmatch(r"[0-9a-f]{8,32}", terminal_id):
                         await on_event("cao_terminal_ready", "Çalışan terminal bağlantısı hazır.",
                                        {"terminal_id": terminal_id})
+                        last_status = None
+                        while True:
+                            terminal = await self.request("GET", f"/terminals/{terminal_id}", timeout=3)
+                            status = terminal.get("status")
+                            if status != last_status:
+                                await on_event("terminal_supervision", f"Terminal durumu: {status}",
+                                               {"terminal_id": terminal_id, "status": status})
+                                last_status = status
+                            if status == "error":
+                                await on_event("terminal_intervention", "Terminal hatası saptandı; yürütücü hata kurtarma ve model devrini uygulayacak.",
+                                               {"terminal_id": terminal_id})
+                                return
+                            if status == "completed":
+                                return
+                            await asyncio.sleep(5)
                         return
                 except CAOError:
                     pass

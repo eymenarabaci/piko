@@ -15,6 +15,7 @@ import pytest
 from manager.app import create_app
 from manager.engine import Engine
 from manager.adaptive import AdaptiveDecision
+from manager.program import PhaseAudit
 from manager.schema import Plan, RunRequest, parse_plan, validate_models, workspace_path
 from manager.store import Store
 
@@ -48,6 +49,12 @@ class FakeProviders:
 
     async def run(self, model_id, prompt, *, workspace, allow_writes, timeout, on_event, effort=""):
         self.calls.append({"model": model_id, "prompt": prompt, "writes": allow_writes})
+        if "Sen iş ayrıştırıcısısın" in prompt:
+            return {"output": json.dumps({"items": [{"title": "Görev", "goal": "Bir görev"}]}),
+                    "model_id": model_id, "status": "completed", "usage": {}}
+        if "Sen bağımsız ve salt okunur iş denetçisisin" in prompt:
+            return {"output": json.dumps({"action": "accept", "reason": "Hedef karşılandı."}),
+                    "model_id": model_id, "status": "completed", "usage": {}}
         if model_id == "planner":
             assert not allow_writes, "Planning must never inherit write permission"
             return {"output": json.dumps({"steps": self.steps}), "model_id": model_id,
@@ -114,7 +121,7 @@ async def test_plan_edit_resume_dependency_results_and_events(tmp_path):
         created = await engine.create(request(mode="plan", allow_writes=True))
         run = await settle(engine, created["id"])
         assert run["status"] == "planned"
-        assert [c["model"] for c in provider.calls] == ["planner"]
+        assert [c["model"] for c in provider.calls] == ["planner", "planner"]
         edited = Plan(steps=[step("prepare"), step("review", ["prepare"])])
         await engine.edit(run["id"], edited)
         await engine.resume(run["id"])
@@ -157,7 +164,7 @@ async def test_resume_after_reopen_preserves_successful_sibling(tmp_path):
         assert provider.counts == {"good": 1, "flaky": 2, "joined": 1}
         joined = next(c for c in provider.calls if "TASK_joined" in c["prompt"])
         assert "RESULT_good" in joined["prompt"] and "RESULT_flaky" in joined["prompt"]
-        assert len([c for c in provider.calls if c["model"] == "planner"]) == 1
+        assert len([c for c in provider.calls if c["model"] == "planner" and "Sen görev planlayıcısısın" in c["prompt"]]) == 1
 
 
 @pytest.mark.asyncio
@@ -331,25 +338,110 @@ async def test_empty_planner_response_uses_only_ready_local_fallback(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_auto_orchestrator_extends_plan_without_replaying_old_step(tmp_path):
+async def test_auto_orchestrator_repairs_in_new_plan_without_replaying_old_step(tmp_path):
     class RoutedProviders(FakeProviders):
         models = routing_models()
 
     provider = RoutedProviders([step("first", model="auto")])
     async with engine_at(tmp_path, provider) as engine:
-        async def reflect(run):
-            if run["plan_revision"] == 0:
-                return AdaptiveDecision(action="extend", reason="Doğrulama eksik.",
-                                        steps=[step("verify", ["first"], model="auto")])
-            return AdaptiveDecision(action="complete", reason="İş bitti.", answer="Doğrulandı.")
-        engine.reflect = reflect
+        async def audit(run):
+            if run["program_attempt"] == 0:
+                provider.steps = [step("verify", model="auto")]
+                return PhaseAudit(action="repair", reason="Doğrulama eksik.", repair_goal="Doğrula")
+            return PhaseAudit(action="accept", reason="Doğrulandı.")
+        engine.audit_phase = audit
         created = await engine.create(request(mode="orchestrate", executor_model="auto"))
         done = await settle(engine, created["id"])
         assert done["status"] == "completed", done.get("error")
-        assert done["plan_revision"] == 1
-        assert done["orchestrator_answer"] == "Doğrulandı."
+        assert done["program_attempt"] == 1
+        assert len(done["plan_history"]) == 2
         assert provider.counts == {"first": 1, "verify": 1}
-        assert set(done["results"]) == {"first", "verify"}
+        assert set(done["results"]) == {"verify"}
+
+
+@pytest.mark.asyncio
+async def test_writer_waits_for_independent_review_then_repairs_once(tmp_path):
+    class ReviewProviders(FakeProviders):
+        models = [*FakeProviders.models,
+                  {"id": "checker", "provider": "codex", "execution_supported": True,
+                   "capabilities": ["reviewer"], "priority": {"reviewer": 1}}]
+
+        def __init__(self):
+            super().__init__([step("first")])
+            self.reviews = 0
+            self.repairs = 0
+
+        async def run(self, model_id, prompt, **kwargs):
+            if "Sen bağımsız, salt okunur QA denetçisisin" in prompt:
+                assert kwargs["allow_writes"] is False
+                self.reviews += 1
+                status = "fail" if self.reviews == 1 else "pass"
+                findings = ([{"path": "module.py", "line": 3,
+                              "issue": "Hedef yanlış", "evidence": "İlgili satır hatalı"}]
+                            if status == "fail" else [])
+                return {"output": json.dumps({"status": status, "findings": findings}),
+                        "model_id": model_id, "status": "completed"}
+            if "Sen aynı adımın hedefli düzeltme uygulayıcısısın" in prompt:
+                self.repairs += 1
+                assert kwargs["allow_writes"] is True
+                return {"output": "DÜZELTİLDİ", "model_id": model_id, "status": "completed"}
+            return await super().run(model_id, prompt, **kwargs)
+
+    provider = ReviewProviders()
+    async with engine_at(tmp_path, provider) as engine:
+        created = await engine.create(request(mode="orchestrate", allow_writes=True))
+        done = await settle(engine, created["id"])
+        assert done["status"] == "completed", done.get("error")
+        assert provider.reviews == 2 and provider.repairs == 1
+        assert done["results"]["first"]["output"] == "DÜZELTİLDİ"
+        assert done["results"]["first"]["independent_review"]["status"] == "pass"
+
+
+@pytest.mark.asyncio
+async def test_next_work_plan_is_created_only_after_previous_audit(tmp_path):
+    class ProgramProviders(FakeProviders):
+        async def run(self, model_id, prompt, **kwargs):
+            if "Sen iş ayrıştırıcısısın" in prompt:
+                return {"output": json.dumps({"items": [{"title": "Bir", "goal": "İlk iş"},
+                                                          {"title": "İki", "goal": "İkinci iş"}]}),
+                        "model_id": model_id, "status": "completed"}
+            return await super().run(model_id, prompt, **kwargs)
+
+    provider = ProgramProviders()
+    async with engine_at(tmp_path, provider) as engine:
+        audits = []
+        async def audit(run):
+            audits.append(run["program_index"])
+            if run["program_index"] == 0:
+                assert provider.counts == {"first": 1}
+                provider.steps = [step("second")]
+            return PhaseAudit(action="accept", reason="Dosya ve sonuç denetlendi.")
+        engine.audit_phase = audit
+        created = await engine.create(request(mode="orchestrate"))
+        done = await settle(engine, created["id"])
+        assert done["status"] == "completed", done.get("error")
+        assert audits == [0, 1]
+        assert provider.counts == {"first": 1, "second": 1}
+        assert len(done["completed_items"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_user_test_pauses_then_audits_without_replaying_implementation(tmp_path):
+    provider = FakeProviders()
+    async with engine_at(tmp_path, provider) as engine:
+        async def audit(run):
+            if not run.get("user_test_answer"):
+                return PhaseAudit(action="await_user_test", reason="Fiziksel kontrol gerekli.",
+                                  question="Cihazda düğme çalışıyor mu?")
+            return PhaseAudit(action="accept", reason="Kullanıcı cihazda doğruladı.")
+        engine.audit_phase = audit
+        created = await engine.create(request(mode="orchestrate"))
+        waiting = await settle(engine, created["id"])
+        assert waiting["status"] == "awaiting_user_test"
+        await engine.submit_user_test(created["id"], "Evet, cihazda çalıştı.")
+        done = await settle(engine, created["id"])
+        assert done["status"] == "completed", done.get("error")
+        assert provider.counts == {"first": 1}
 
 
 @pytest.mark.asyncio

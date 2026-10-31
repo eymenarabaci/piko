@@ -600,11 +600,18 @@ def create_app(data_dir=None, providers=None):
     @app.post("/api/triggers")
     async def create_trigger(request: Request):
         body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Zamanlama isteği geçersiz.")
+        if body.get("type") == "once" and not body.get("name"):
+            body["name"] = str(body.get("prompt") or "Zamanlanmış görev")[:80]
         if not body.get("name"):
             raise HTTPException(400, "Tetikleyici adı gereklidir.")
         body["workspace"] = _resolve_workspace(body.get("workspace"))
         tm: TriggerManager = app.state.triggers
-        return tm.create_trigger(body)
+        try:
+            return tm.create_trigger(body)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.post("/api/triggers/from-template")
     async def create_trigger_from_template(request: Request):
@@ -622,8 +629,13 @@ def create_app(data_dir=None, providers=None):
     @app.put("/api/triggers/{trigger_id}")
     async def update_trigger(trigger_id: str, request: Request):
         body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Zamanlama isteği geçersiz.")
         tm: TriggerManager = app.state.triggers
-        updated = tm.update_trigger(trigger_id, body)
+        try:
+            updated = tm.update_trigger(trigger_id, body)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
         if not updated:
             raise HTTPException(404, "Tetikleyici bulunamadı.")
         return updated
@@ -675,8 +687,19 @@ def create_app(data_dir=None, providers=None):
         if previous and previous.get("status") in {"queued", "planning", "running", "waiting_quota"}:
             if attachments:
                 raise HTTPException(400, "Çalışan göreve ek talimat için dosya eki desteklenmiyor.")
-            run = await app.state.engine.add_instruction(conversation_run_id, message)
-            return {"kind": "instruction", "run": run, "delivery": "next_step"}
+            delivery = str(body.get("delivery") or "next_step")
+            client_message_id = str(body.get("client_message_id") or uuid.uuid4().hex)
+            try:
+                run = await app.state.engine.add_instruction(
+                    conversation_run_id, message, delivery=delivery,
+                    client_message_id=client_message_id)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            records = await app.state.engine.store.list_messages(conversation_run_id)
+            instruction = next((item for item in records
+                                if item["client_message_id"] == client_message_id), None)
+            return {"kind": "instruction", "run": run, "instruction": instruction,
+                    "actual_delivery": instruction["delivery"] if instruction else "unknown"}
         kind, routing_reason = await classify_with_model(
             message, planning_level, app.state.engine,
             str(body.get("workspace") or (previous or {}).get("workspace") or app.state.engine.default_workspace),
@@ -1048,6 +1071,19 @@ def create_app(data_dir=None, providers=None):
                 await app.state.engine.resume(run_id)
         return {"status": "ok"}
 
+    @app.post("/api/runs/{run_id}/test-response")
+    async def submit_user_test(run_id: str, request: Request):
+        await require(run_id)
+        body = await request.json()
+        answer = str(body.get("answer") or "").strip() if isinstance(body, dict) else ""
+        if not answer or len(answer) > 4000:
+            raise HTTPException(400, "Test yanıtı 1–4000 karakter arasında olmalı.")
+        try:
+            run = await app.state.engine.submit_user_test(run_id, answer)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"run": run}
+
     @app.get("/api/runs")
     async def runs():
         return await app.state.engine.store.list()
@@ -1207,11 +1243,23 @@ def create_app(data_dir=None, providers=None):
         message = str(body.get("message") or "").strip() if isinstance(body, dict) else ""
         if not message or len(message) > 8000:
             raise HTTPException(400, "Ek talimat 1–8000 karakter arasında olmalı.")
+        delivery = str(body.get("delivery") or "next_step")
+        client_message_id = str(body.get("client_message_id") or uuid.uuid4().hex)
         try:
-            run = await app.state.engine.add_instruction(run_id, message)
+            run = await app.state.engine.add_instruction(
+                run_id, message, delivery=delivery, client_message_id=client_message_id)
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
-        return {"run": run, "delivery": "next_step"}
+        records = await app.state.engine.store.list_messages(run_id)
+        instruction = next((item for item in records
+                            if item["client_message_id"] == client_message_id), None)
+        return {"run": run, "instruction": instruction,
+                "actual_delivery": instruction["delivery"] if instruction else "unknown"}
+
+    @app.get("/api/runs/{run_id}/instructions")
+    async def get_instructions(run_id: str):
+        await require(run_id)
+        return {"instructions": await app.state.engine.store.list_messages(run_id)}
 
     @app.put("/api/runs/{run_id}/plan")
     async def edit(run_id: str, plan: Plan):

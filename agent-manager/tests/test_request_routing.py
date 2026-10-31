@@ -123,10 +123,17 @@ def test_active_instruction_is_saved_for_next_step():
         async def get(self, run_id): return dict(record)
         async def save(self, run): record.update(run)
         async def event(self, *args): events.append(args)
+        async def enqueue_message(self, run_id, message, delivery, client_message_id=""):
+            item = {"id": "instruction-1", "message": message,
+                    "requested_delivery": delivery, "delivery": delivery,
+                    "status": "queued", "client_message_id": client_message_id}
+            record.setdefault("messages", []).append(item)
+            return item
+        async def list_messages(self, run_id): return record.get("messages", [])
 
     engine = Engine.__new__(Engine)
     engine.store = MemoryStore()
     engine.locks = {}
     updated = _run_immediate(engine.add_instruction('run-1', 'Önce güvenlik kontrolünü yap'))
-    assert updated['orchestrator_messages'] == ['Önce güvenlik kontrolünü yap']
+    assert updated['instruction_queue'][0]['message'] == 'Önce güvenlik kontrolünü yap'
     assert events[0][1] == 'user_instruction'

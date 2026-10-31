@@ -18,6 +18,7 @@ class Step(BaseModel):
     persona: str = Field(default="", max_length=50)
     skills: list[str] = Field(default_factory=list, max_length=10)
     mcp_servers: list[str] = Field(default_factory=list, max_length=10)
+    required_modalities: list[Literal["text", "image", "audio", "video"]] = Field(default_factory=list, max_length=4)
     awaiting_input: bool = False
     user_response: str = Field(default="", max_length=2000)
 
@@ -144,6 +145,8 @@ def validate_models(plan: Plan, models: dict):
             continue
         if step.model_id not in models or not models[step.model_id].get("execution_supported", True):
             raise ValueError(f"Çalıştırılamayan model: {step.model_id}")
+        if not set(step.required_modalities) <= set(models[step.model_id].get("input_modalities", [])):
+            raise ValueError(f"Model gereken girdi türlerini desteklemiyor: {step.model_id}")
 
 
 def workspace_path(value: str, default: Path) -> str:

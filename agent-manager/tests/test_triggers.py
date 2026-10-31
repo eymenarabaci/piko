@@ -1,5 +1,6 @@
 """Unit tests for TriggerManager and autonomous trigger logic."""
 import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import pytest
 
@@ -94,3 +95,43 @@ def test_trigger_execution_with_mock_engine(tmp_path):
     assert updated_t["last_run_id"] == "mock_run_123"
     assert updated_t["run_count"] == 1
 
+
+def test_once_trigger_normalizes_future_time_and_disables_after_run(tmp_path):
+    tm = TriggerManager(tmp_path)
+    future = datetime.now(timezone.utc) + timedelta(hours=2)
+    local_offset = timezone(timedelta(hours=3))
+    created = tm.create_trigger({
+        "type": "once", "run_at": future.astimezone(local_offset).isoformat(),
+        "prompt": "Demoyu göster",
+    })
+    assert created["run_at"] == created["next_run_at"]
+    assert datetime.fromisoformat(created["run_at"]).utcoffset() == timedelta(0)
+    tm.record_run_start(created["id"], "scheduled-run")
+    consumed = tm.get_trigger(created["id"])
+    assert consumed["run_count"] == 1
+    assert consumed["enabled"] is False
+    assert consumed["next_run_at"] is None
+
+
+@pytest.mark.parametrize("run_at", [
+    None, "yarın", "2027-01-01T12:00:00", "2000-01-01T12:00:00+00:00",
+])
+def test_once_rejects_missing_naive_or_past_run_at(tmp_path, run_at):
+    tm = TriggerManager(tmp_path)
+    with pytest.raises(ValueError, match="run_at"):
+        tm.create_trigger({"type": "once", "run_at": run_at})
+    assert tm.list_triggers() == []
+
+
+def test_once_rearm_requires_new_future_instant(tmp_path):
+    tm = TriggerManager(tmp_path)
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    created = tm.create_trigger({"type": "once", "run_at": future.isoformat()})
+    tm.record_run_start(created["id"], "first")
+    with pytest.raises(ValueError, match="yeni run_at"):
+        tm.update_trigger(created["id"], {"enabled": True})
+    rearmed = tm.update_trigger(created["id"], {
+        "enabled": True, "run_at": (future + timedelta(hours=1)).isoformat(),
+    })
+    assert rearmed["enabled"] is True
+    assert rearmed["next_run_at"] == rearmed["run_at"]

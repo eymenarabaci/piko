@@ -167,3 +167,63 @@ async def test_verified_zero_quota_waits_until_reset_or_manual_clear(tmp_path):
     assert (await router.choose("development", "cao", allow_writes=True)).model_id == "writer_b"
     await router.clear_cooldown("writer_a")
     assert "writer_a" not in await router.get_cooldowns()
+
+
+@pytest.mark.asyncio
+async def test_concrete_task_requirements_exclude_incompatible_models(tmp_path):
+    models = [
+        {"id": "text_only", "provider": "codex", "capabilities": ["development"],
+         "input_modalities": ["text"], "context_window_tokens": 8192,
+         "priority": {"development": 1}},
+        {"id": "vision", "provider": "codex", "capabilities": ["development"],
+         "input_modalities": ["text", "image"], "context_window_tokens": 32768,
+         "priority": {"development": 2}},
+        {"id": "read_only", "provider": "ollama", "capabilities": ["development"],
+         "input_modalities": ["text", "image"], "context_window_tokens": 32768,
+         "supports_writes": False, "mcp_supported": False,
+         "priority": {"development": 0}},
+    ]
+    router = ModelRouter(models, tmp_path / "requirements.sqlite")
+    ranked = await router.rank("development", "cao", allow_writes=True,
+                               required_modalities=("IMAGE",), required_tools=True,
+                               min_context_tokens=16000)
+    assert [choice.model_id for choice in ranked] == ["vision"]
+    assert await router.rank("development", "direct", required_tools=True) == []
+    assert await router.rank("development", "cao", min_context_tokens=50000) == []
+
+
+@pytest.mark.asyncio
+async def test_only_verified_task_outcomes_affect_ranking_after_enough_samples(tmp_path):
+    models = [
+        {"id": "a", "provider": "antigravity", "capabilities": ["development"],
+         "priority": {"development": 5}},
+        {"id": "b", "provider": "antigravity", "capabilities": ["development"],
+         "priority": {"development": 6}},
+    ]
+    router = ModelRouter(models, tmp_path / "outcomes.sqlite")
+    assert (await router.choose("development", task_kind="coding")).model_id == "a"
+    with pytest.raises(ValueError, match="doğrulanmış"):
+        await router.record_outcome("b", "coding", True, 12, 300, verified=False)
+    for _ in range(4):
+        await router.record_outcome("b", "coding", True, 12, 300, verified=True)
+    assert (await router.choose("development", task_kind="coding")).model_id == "a"
+    await router.record_outcome("b", "coding", True, 12, 300, verified=True)
+    choice = await router.choose("development", task_kind="coding")
+    assert choice.model_id == "b"
+    assert any("5/5" in reason for reason in choice.reasons)
+    assert (await router.choose("development", task_kind="review")).model_id == "a"
+
+
+@pytest.mark.asyncio
+async def test_latency_only_compares_models_with_measured_outcomes(tmp_path):
+    models = [
+        {"id": "slow", "provider": "antigravity", "capabilities": ["reviewer"],
+         "priority": {"reviewer": 5}},
+        {"id": "fast", "provider": "antigravity", "capabilities": ["reviewer"],
+         "priority": {"reviewer": 6}},
+    ]
+    router = ModelRouter(models, tmp_path / "latency.sqlite")
+    for _ in range(5):
+        await router.record_outcome("slow", "review", True, 120, 100, verified=True)
+        await router.record_outcome("fast", "review", True, 10, 100, verified=True)
+    assert (await router.choose("reviewer", task_kind="review")).model_id == "fast"

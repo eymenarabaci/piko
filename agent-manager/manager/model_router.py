@@ -30,6 +30,26 @@ class NoEligibleModel(RuntimeError):
     """No compatible, available model can execute this step."""
 
 
+def _meets_requirements(model: dict, *, allow_writes: bool,
+                        required_modalities: tuple[str, ...], required_tools: bool,
+                        min_context_tokens: int) -> bool:
+    """Reject only concrete task requirements; unknown required facts fail closed."""
+    if allow_writes and model.get("supports_writes") is False:
+        return False
+    modalities = {str(value).casefold() for value in model.get("input_modalities", [])}
+    if not set(required_modalities) <= modalities:
+        return False
+    if required_tools and not model.get(
+        "mcp_supported", model.get("provider") in {"codex", "antigravity"}
+    ):
+        return False
+    if min_context_tokens:
+        capacity = model.get("context_window_tokens")
+        if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < min_context_tokens:
+            return False
+    return True
+
+
 _QUOTA_ERROR = re.compile(
     r"quota[_ -]?exceeded|insufficient[_ -]?quota|usage limit|kullanım kotası|"
     r"quota exhausted|quota.{0,30}(?:exceed|reach|limit)|"
@@ -196,8 +216,54 @@ class ModelRouter:
                         observed_at TEXT
                     )
                 """)
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS model_task_outcomes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        model_id TEXT NOT NULL,
+                        task_kind TEXT NOT NULL,
+                        passed INTEGER NOT NULL,
+                        duration_seconds REAL NOT NULL,
+                        total_tokens INTEGER NOT NULL,
+                        recorded_at TEXT NOT NULL
+                    )
+                """)
+                await db.execute("""CREATE INDEX IF NOT EXISTS idx_model_task_outcomes
+                                  ON model_task_outcomes(task_kind, model_id, recorded_at)""")
                 await db.commit()
             self._initialized = True
+
+    async def record_outcome(self, model_id: str, task_kind: str, passed: bool,
+                             duration_seconds: float, total_tokens: int,
+                             *, verified: bool) -> None:
+        """Record an externally checked result, never an agent's self-assessment."""
+        if model_id not in self.models:
+            raise ValueError("Bilinmeyen model")
+        if not verified or not task_kind.strip() or len(task_kind) > 80:
+            raise ValueError("Yalnız doğrulanmış ve türü belirtilmiş sonuç kaydedilir")
+        if not isinstance(passed, bool) or not isinstance(total_tokens, int) or total_tokens < 0:
+            raise ValueError("Geçersiz görev sonucu")
+        if not isinstance(duration_seconds, (int, float)) or isinstance(duration_seconds, bool) \
+                or not math.isfinite(duration_seconds) or duration_seconds < 0:
+            raise ValueError("Geçersiz süre")
+        await self._init_db()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""INSERT INTO model_task_outcomes
+                (model_id,task_kind,passed,duration_seconds,total_tokens,recorded_at)
+                VALUES(?,?,?,?,?,?)""",
+                (model_id, task_kind.casefold().strip(), int(passed), float(duration_seconds),
+                 total_tokens, datetime.now(timezone.utc).isoformat()))
+            await db.commit()
+
+    async def _task_outcomes(self, task_kind: str) -> dict[str, tuple[int, int, float]]:
+        if not task_kind:
+            return {}
+        since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            rows = await (await db.execute("""SELECT model_id,COUNT(*),SUM(passed),AVG(duration_seconds)
+                FROM model_task_outcomes WHERE task_kind=? AND recorded_at>=?
+                GROUP BY model_id""", (task_kind.casefold().strip(), since))).fetchall()
+        return {str(mid): (int(count), int(passed), float(duration))
+                for mid, count, passed, duration in rows}
 
     async def record_failure(self, model_id: str, error: BaseException | str,
                              retry_after_seconds: float | None = None) -> str | None:
@@ -343,9 +409,15 @@ class ModelRouter:
 
     async def next_cooldown(self, role: str = "general", backend: str = "direct",
                             allow_writes: bool = False,
-                            availability: Mapping[str, bool | None] | None = None) -> dict | None:
+                            availability: Mapping[str, bool | None] | None = None,
+                            required_modalities: tuple[str, ...] = (),
+                            required_tools: bool = False,
+                            min_context_tokens: int = 0) -> dict | None:
         """Earliest retry for a compatible model; never relax capability or backend rules."""
+        if required_tools and backend != "cao":
+            return None
         role = _ROLE_ALIASES.get(role.casefold(), role.casefold())
+        required_modalities = tuple(str(value).casefold() for value in required_modalities)
         cooldowns = await self.get_cooldowns()
         choices = []
         for mid, model in self.models.items():
@@ -360,6 +432,11 @@ class ModelRouter:
             capabilities = {str(value).casefold() for value in model.get("capabilities", [])}
             if role not in capabilities and not (role == "architect" and "master" in capabilities):
                 continue
+            if not _meets_requirements(model, allow_writes=allow_writes,
+                                       required_modalities=required_modalities,
+                                       required_tools=required_tools,
+                                       min_context_tokens=min_context_tokens):
+                continue
             if mid in cooldowns:
                 choices.append(cooldowns[mid])
         return min(choices, key=lambda row: row["cooldown_until"]) if choices else None
@@ -367,13 +444,21 @@ class ModelRouter:
     async def rank(self, role: str = "general", backend: str = "direct",
                    allow_writes: bool = False, availability: Mapping[str, bool | None] | None = None,
                    exclude: tuple[str, ...] | list[str] | set[str] = (),
-                   estimated_tokens: int = 0) -> list[RouteChoice]:
+                   estimated_tokens: int = 0, required_modalities: tuple[str, ...] = (),
+                   required_tools: bool = False, min_context_tokens: int = 0,
+                   task_kind: str = "") -> list[RouteChoice]:
         if backend not in {"direct", "ao", "cao"}:
             raise ValueError("Bilinmeyen yürütme altyapısı")
         if estimated_tokens < 0:
             raise ValueError("estimated_tokens negatif olamaz")
+        if min_context_tokens < 0:
+            raise ValueError("min_context_tokens negatif olamaz")
+        if required_tools and backend != "cao":
+            return []
+        required_modalities = tuple(str(value).casefold() for value in required_modalities)
         role = _ROLE_ALIASES.get(role.casefold(), role.casefold())
         statuses, usage = await self._signals()
+        outcomes = await self._task_outcomes(task_kind)
         cooldowns = await self.get_cooldowns()
         now = datetime.now(timezone.utc)
         excluded = set(exclude)
@@ -394,6 +479,11 @@ class ModelRouter:
             suitable = role in capabilities or (role == "architect" and "master" in capabilities)
             if not suitable:
                 continue
+            if not _meets_requirements(model, allow_writes=allow_writes,
+                                       required_modalities=required_modalities,
+                                       required_tools=required_tools,
+                                       min_context_tokens=min_context_tokens):
+                continue
             status = statuses.get(mid, {})
             if mid in cooldowns:
                 continue
@@ -408,6 +498,9 @@ class ModelRouter:
         if not candidates:
             return []
         max_usage = max((usage.get(mid, 0) for mid, _, _ in candidates), default=0)
+        measured_durations = [outcomes[mid][2] for mid, _, _ in candidates
+                              if mid in outcomes and outcomes[mid][0] >= 5 and outcomes[mid][2] > 0]
+        fastest_measured = min(measured_durations) if len(measured_durations) >= 2 else None
         ranked = []
         for mid, model, status in candidates:
             provider = model["provider"]
@@ -419,9 +512,18 @@ class ModelRouter:
             if provider == "codex":
                 priority = min(float(priority), 7.0)
             reasons = [f"{role} uyumu; katalog önceliği {priority:g}"]
-            if not model.get("quality_verified", False):
+            if not model.get("quality_verified", False) and not (outcomes.get(mid) and outcomes[mid][0] >= 5):
                 reasons.append("görev kalitesi ölçülmedi; uygunluk operatör yapılandırması")
             score = float(priority)
+            sample = outcomes.get(mid)
+            if sample and sample[0] >= 5:
+                count, passed, mean_duration = sample
+                # Shrink sparse observations toward an uninformative 50% prior.
+                estimated_pass_rate = (passed + 2) / (count + 4)
+                score += (0.5 - estimated_pass_rate) * 24
+                if fastest_measured and mean_duration > fastest_measured:
+                    score += min(4.0, math.log(mean_duration / fastest_measured) * 2)
+                reasons.append(f"{task_kind} doğrulanmış sonuç: {passed}/{count}; ortalama {mean_duration:.1f} sn")
             verified = bool(status.get("quota_verified"))
             observed = status.get("observed_at")
             # Snapshots older than 15 minutes do not claim live remaining quota.

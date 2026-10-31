@@ -1040,3 +1040,24 @@ dialog#project-dialog::backdrop {
   .update-versions { grid-template-columns: 1fr; gap: 6px; }
   .update-panel-actions { flex-wrap: wrap; }
 }
+
+.instruction-delivery-control{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 10px;color:#435675;font-size:11px;font-weight:600}
+.instruction-delivery-control select{max-width:240px;padding:7px 9px;border:1px solid #cbd8eb;border-radius:7px;background:#f8faff;font-size:11px}
+.instruction-delivery-control small{color:#71829c;font-size:10px;font-weight:400}
+.instruction-queue{display:grid;gap:7px;margin:10px 0 15px}
+.instruction-card{border:1px solid #dbe5f5;border-left:3px solid #7395e0;border-radius:7px;background:#f8faff;padding:8px 11px;font-size:11px}
+.instruction-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px;color:#455c83}
+.instruction-card-head strong{font-size:10px}
+.instruction-card-body{margin-top:5px;white-space:pre-wrap;overflow-wrap:anywhere;color:#283650}
+.instruction-card-state{font-size:10px;color:#657995}
+.instruction-card-state.status-failed{color:#b23d4d}
+.instruction-card-state.status-delivery_unknown{color:#ad6e1f}
+.instruction-card-state.status-applied,.instruction-card-state.status-delivered{color:#24826a}
+.chat-delivery-select{max-width:126px;border:1px solid #cbd8eb;border-radius:6px;background:#f8faff;padding:6px;font-size:10px}
+.program-phase-note{margin:4px 0 9px;color:#61718a;font-size:11px;line-height:1.5}
+.program-demo-chip,.program-schedule-chip{display:inline-block;margin:0 7px 8px 0;padding:4px 8px;border-radius:99px;background:#edf4ff;color:#4c648f;font-size:10px}
+.user-test-request{display:grid;gap:8px;margin:11px 0;padding:15px;border:1px solid #d9e9d8;border-radius:9px;background:#f6fbf5;color:#2d4936}
+.user-test-request p{margin:0;white-space:pre-wrap;font-size:12px;line-height:1.5}
+.user-test-answer{width:100%;min-height:72px;padding:9px;border:1px solid #c8dbc9;border-radius:7px;background:#fff;resize:vertical;font-size:12px}
+.user-test-request button{justify-self:start}
+@media(max-width:650px){.instruction-delivery-control{align-items:flex-start;flex-direction:column;gap:5px}.instruction-delivery-control select{max-width:100%}}

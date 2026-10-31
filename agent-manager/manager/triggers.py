@@ -73,6 +73,22 @@ def _parse_iso(iso_str: str | None) -> datetime | None:
         return None
 
 
+def _future_utc_run_at(value: object, now_dt: datetime | None = None) -> str:
+    """Accept an explicit, future, timezone-aware ISO instant for one-shot work."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Tek seferlik görev için run_at gerekli.")
+    try:
+        run_dt = datetime.fromisoformat(value.strip())
+    except ValueError as exc:
+        raise ValueError("run_at ISO tarih/saat olmalı.") from exc
+    if run_dt.tzinfo is None or run_dt.utcoffset() is None:
+        raise ValueError("run_at saat dilimi içermeli.")
+    run_utc = run_dt.astimezone(timezone.utc)
+    if run_utc <= (now_dt or datetime.now(timezone.utc)):
+        raise ValueError("run_at gelecekte olmalı; geçmiş görev sessizce başlatılmaz.")
+    return run_utc.isoformat()
+
+
 class TriggerManager:
     def __init__(self, data_dir: Path, engine=None):
         self.data_dir = Path(data_dir).resolve()
@@ -126,12 +142,16 @@ class TriggerManager:
             now_dt = datetime.now(timezone.utc)
             interval = max(10, int(data.get("interval_seconds", 3600)))
             t_type = data.get("type", "interval")
-            if t_type not in {"interval", "file_watch"}:
+            if t_type not in {"interval", "file_watch", "once"}:
                 t_type = "interval"
 
             next_run = None
+            run_at = None
             if t_type == "interval":
                 next_run = (now_dt + timedelta(seconds=interval)).isoformat()
+            elif t_type == "once":
+                run_at = _future_utc_run_at(data.get("run_at"), now_dt)
+                next_run = run_at
 
             trigger = {
                 "id": f"trg_{uuid.uuid4().hex[:12]}",
@@ -139,6 +159,7 @@ class TriggerManager:
                 "description": str(data.get("description", ""))[:300],
                 "type": t_type,
                 "interval_seconds": interval,
+                "run_at": run_at,
                 "workspace": str(data.get("workspace", "")),
                 "prompt": str(data.get("prompt", "Proje sağlık durumunu kontrol et."))[:4000],
                 "mode": data.get("mode", "orchestrate") if data.get("mode") in {"chat", "plan", "orchestrate"} else "orchestrate",
@@ -173,6 +194,16 @@ class TriggerManager:
             target = None
             for t in triggers:
                 if t.get("id") == trigger_id:
+                    if t.get("type") == "once":
+                        if "run_at" in data:
+                            run_at = _future_utc_run_at(data["run_at"])
+                            t["run_at"] = run_at
+                            t["next_run_at"] = run_at
+                            t["last_status"] = "idle"
+                        if data.get("enabled") is True and (
+                            t.get("run_count", 0) or not t.get("next_run_at")
+                        ) and "run_at" not in data:
+                            raise ValueError("Çalışmış tek seferlik görevi açmak için yeni run_at verin.")
                     for key in ["name", "description", "prompt", "workspace", "allow_writes"]:
                         if key in data:
                             t[key] = data[key]
@@ -213,6 +244,9 @@ class TriggerManager:
                     if t.get("type") == "interval":
                         sec = t.get("interval_seconds", 3600)
                         t["next_run_at"] = (datetime.now(timezone.utc) + timedelta(seconds=sec)).isoformat()
+                    elif t.get("type") == "once":
+                        t["enabled"] = False
+                        t["next_run_at"] = None
                     break
             self._save_atomic(store)
 
@@ -279,6 +313,9 @@ class TriggerManager:
                 for t in store.get("triggers", []):
                     if t.get("id") == t_id:
                         t["last_status"] = f"error: {str(exc)[:50]}"
+                        if t.get("type") == "once":
+                            t["enabled"] = False
+                            t["next_run_at"] = None
                         break
                 self._save_atomic(store)
         return None
@@ -306,6 +343,13 @@ class TriggerManager:
                     if t_type == "interval":
                         next_dt = _parse_iso(t.get("next_run_at"))
                         if next_dt is None or now_dt >= next_dt:
+                            if t.get("last_status") != "running":
+                                await self.execute_trigger(t)
+
+                    # One-shot check: mark consumed at run start; never repeat.
+                    elif t_type == "once":
+                        next_dt = _parse_iso(t.get("next_run_at"))
+                        if next_dt is not None and next_dt.tzinfo is not None and now_dt >= next_dt:
                             if t.get("last_status") != "running":
                                 await self.execute_trigger(t)
 
