@@ -415,6 +415,19 @@ class WorkRecordManager:
                 rows = await cur.fetchall()
         return [self._deliverable(row) for row in rows]
 
+    async def latest_deliverable(self, kind: str = "") -> dict | None:
+        """Most recent delivery, optionally filtered by kind (developer screen)."""
+        async with self.lock:
+            if kind:
+                cursor = await self.db.execute(
+                    "SELECT * FROM deliverables WHERE kind=? ORDER BY created_at DESC LIMIT 1",
+                    (kind,))
+            else:
+                cursor = await self.db.execute(
+                    "SELECT * FROM deliverables ORDER BY created_at DESC LIMIT 1")
+            row = await cursor.fetchone()
+        return self._deliverable(row) if row else None
+
     async def find_deliverable(self, work_id: str, idempotency_key: str) -> dict | None:
         if not idempotency_key:
             return None
