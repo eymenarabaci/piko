@@ -3623,12 +3623,13 @@ function runtimeMetricsCard() {
 
 
 async function loadBridgeStatus(force = false) {
-  if (!force && state.bridgeStatus && Date.now() - (state.bridgeStatusAt || 0) < 5000) return;
+  if (!force && state.bridgeCards && Date.now() - (state.bridgeStatusAt || 0) < 5000) return;
   try {
-    state.bridgeStatus = await api('/api/bridges/office/status');
+    const data = await api('/api/bridges/status');
+    state.bridgeCards = data.packs || [];
     state.bridgeStatusAt = Date.now();
   } catch (error) {
-    state.bridgeStatus = null;
+    state.bridgeCards = [];
     toast(errorText(error));
   }
 }
@@ -3638,7 +3639,7 @@ function bridgeCard(status) {
   const bridge = status.bridge || {};
   const head = node('div', 'delivery-card-head');
   const title = node('div', '');
-  title.append(node('b', '', `office · v${bridge.version || '—'}`));
+  title.append(node('b', '', `${bridge.id || 'paket'} · v${bridge.version || '—'}`));
   head.append(title, node('span', 'status-badge', (bridge.levels || []).join(' · ')));
   card.append(head);
   if (bridge.description) card.append(node('p', 'delivery-section', bridge.description));
@@ -3653,10 +3654,13 @@ function bridgeCard(status) {
   card.append(meta);
 
   const manager = status.personas?.manager || {};
-  const granted = (manager.bridges?.office?.levels || []).join(', ') || '—';
+  const bridgeId = bridge.id || 'office';
+  const granted = (manager.bridges?.[bridgeId]?.levels || []).join(', ') || '—';
+  const needsToken = bridge.approval?.apply === 'per_call_token';
   card.append(node('div', 'delivery-section',
     `Yönetici personası (${manager.role || 'scheduler'}): ${granted}. `
-    + 'apply ayrı onay token’ı ister.'));
+    + (needsToken ? 'apply ayrı, tek kullanımlık onay token’ı ister.'
+                  : 'apply bu pakette tanımlı değil.')));
 
   card.append(node('h4', 'inspector-title', 'Son teslim'));
   const last = status.last_delivery;
@@ -3700,10 +3704,11 @@ function renderBridgeInspector(container) {
   container.append(holder);
   loadBridgeStatus().then(() => {
     holder.replaceChildren();
-    if (!state.bridgeStatus) {
-      holder.append(node('p', 'empty-note', 'Köprü durumu alınamadı.'));
+    const cards = state.bridgeCards || [];
+    if (!cards.length) {
+      holder.append(node('p', 'empty-note', 'Kayıtlı köprü paketi yok.'));
       return;
     }
-    holder.append(bridgeCard(state.bridgeStatus));
+    for (const card of cards) holder.append(bridgeCard(card));
   });
 }
