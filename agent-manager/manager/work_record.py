@@ -100,6 +100,7 @@ class WorkRecordManager:
                 idempotency_key TEXT,
                 content_hash TEXT NOT NULL,
                 note TEXT NOT NULL DEFAULT '',
+                bridge_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -108,6 +109,11 @@ class WorkRecordManager:
                 WHERE idempotency_key IS NOT NULL AND idempotency_key != '';
             CREATE INDEX IF NOT EXISTS deliverable_work ON deliverables(work_id, version);
         """)
+        try:
+            await self.db.execute(
+                "ALTER TABLE deliverables ADD COLUMN bridge_id TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
         try:
             await self.db.execute(
                 "ALTER TABLE work_items ADD COLUMN workspace TEXT NOT NULL DEFAULT ''")
@@ -344,7 +350,8 @@ class WorkRecordManager:
     def _deliverable(row):
         keys = ("id", "work_id", "run_id", "version", "parent_version", "title", "kind",
                 "summary", "requirements", "evidence", "open_points", "files", "status",
-                "idempotency_key", "content_hash", "note", "created_at", "updated_at")
+                "idempotency_key", "content_hash", "note", "bridge_id", "created_at",
+                "updated_at")
         item = dict(zip(keys, row))
         for key in ("requirements", "evidence", "open_points", "files"):
             item[key] = json.loads(item[key] or "[]")
@@ -354,7 +361,7 @@ class WorkRecordManager:
                               kind: str = "report", summary: str = "", requirements=(),
                               evidence=(), open_points=(), files=(), status: str = "delivered",
                               idempotency_key: str = "", parent_version: int | None = None,
-                              note: str = "") -> dict:
+                              note: str = "", bridge_id: str = "") -> dict:
         work = await self.get(work_id)
         if work is None:
             raise ValueError("İş kaydı bulunamadı.")
@@ -390,17 +397,19 @@ class WorkRecordManager:
                 "evidence": _json_list(evidence), "open_points": _json_list(open_points),
                 "files": _json_list(files), "status": status,
                 "idempotency_key": idempotency_key, "content_hash": content_hash,
-                "note": str(note)[:2000], "created_at": _now(), "updated_at": _now(),
+                "note": str(note)[:2000], "bridge_id": str(bridge_id or "")[:60],
+                "created_at": _now(), "updated_at": _now(),
             }
             await self.db.execute(
-                "INSERT INTO deliverables VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO deliverables VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (item["id"], work_id, item["run_id"], version, parent_version, item["title"],
                  item["kind"], item["summary"],
                  json.dumps(item["requirements"], ensure_ascii=False),
                  json.dumps(item["evidence"], ensure_ascii=False),
                  json.dumps(item["open_points"], ensure_ascii=False),
                  json.dumps(item["files"], ensure_ascii=False), status, idempotency_key,
-                 content_hash, item["note"], item["created_at"], item["updated_at"]))
+                 content_hash, item["note"], item["bridge_id"], item["created_at"],
+                 item["updated_at"]))
             await self.db.commit()
         await self.add_output(work_id, item["id"])
         await self.update(work_id, status="waiting",
@@ -415,10 +424,14 @@ class WorkRecordManager:
                 rows = await cur.fetchall()
         return [self._deliverable(row) for row in rows]
 
-    async def latest_deliverable(self, kind: str = "") -> dict | None:
-        """Most recent delivery, optionally filtered by kind (developer screen)."""
+    async def latest_deliverable(self, kind: str = "", bridge_id: str = "") -> dict | None:
+        """Most recent delivery, optionally filtered by kind or bridge."""
         async with self.lock:
-            if kind:
+            if bridge_id:
+                cursor = await self.db.execute(
+                    "SELECT * FROM deliverables WHERE bridge_id=? "
+                    "ORDER BY created_at DESC LIMIT 1", (bridge_id,))
+            elif kind:
                 cursor = await self.db.execute(
                     "SELECT * FROM deliverables WHERE kind=? ORDER BY created_at DESC LIMIT 1",
                     (kind,))
