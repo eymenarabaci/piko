@@ -341,7 +341,10 @@ class Engine:
                            error="Servis kesildi. Devam et ile son kayıttan sürdürebilirsiniz.")
                 await self.store.save(run)
                 await self.store.event(run["id"], "interrupted", run["error"])
-                await self.sync_work(run, "blocked", "Servis kesildi; devam et kararı bekleniyor.")
+                # Keep the work active so the unattended driver resumes it; a
+                # crash must not require the user to press "continue".
+                await self.sync_work(run, "active",
+                                     "Servis kesildi; otomatik devam edilecek.")
 
     async def model_availability(self) -> dict[str, bool]:
         """Check executable presence and local Ollama tags, without claiming account quota."""

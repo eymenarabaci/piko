@@ -119,6 +119,12 @@ class EngineDriverHooks:
         await manager.notify(kind, title, body, work_id=work_id, run_id=run_id,
                              dedupe_key=dedupe_key, severity=severity)
 
+    async def beat(self, source_id: str, *, kind: str | None = None,
+                   detail: str | None = None) -> None:
+        """Forward the driver heartbeat to the health database."""
+        from . import health
+        await health.beat(source_id, kind=kind, detail=detail)
+
     async def on_recovery(self, proposals) -> None:
         """Store recovery questions; the UI asks exactly one question each."""
         self.recovery_questions = list(proposals or [])
