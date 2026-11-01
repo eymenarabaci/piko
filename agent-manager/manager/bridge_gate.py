@@ -98,6 +98,14 @@ class BridgeGate:
             )
 
         approval_used = False
+
+        if level in {"apply", "dangerous"}:
+            idempotency_key = str(idempotency_key or "").strip()
+            if not idempotency_key:
+                raise ValueError(f"'{level}' çağrısı bir idempotency anahtarı gerektirir.")
+        else:
+            idempotency_key = str(idempotency_key or "").strip()
+
         if level == "dangerous":
             approval_used = consume(approval_token, bridge_id, level)
         elif level == "apply":
@@ -106,13 +114,6 @@ class BridgeGate:
                 approval_used = consume(approval_token, bridge_id, level)
             elif mode == "none":
                 raise BridgeDenied(f"'{bridge_id}' için apply onay politikası kapalı.")
-
-        if level in {"apply", "dangerous"}:
-            idempotency_key = str(idempotency_key or "").strip()
-            if not idempotency_key:
-                raise ValueError(f"'{level}' çağrısı bir idempotency anahtarı gerektirir.")
-        else:
-            idempotency_key = str(idempotency_key or "").strip()
 
         payload_hash = _payload_hash(payload)
         material = f"{bridge_id}|{level}|{idempotency_key}|{payload_hash}"

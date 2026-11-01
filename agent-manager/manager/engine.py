@@ -209,6 +209,7 @@ class Engine:
             decision["operation_id"] = operation["id"]
             decision["operation_status"] = operation["status"]
             decision["replayed"] = bool(operation.get("replayed"))
+            decision["should_execute"] = bool(operation.get("should_execute", True))
         return decision
 
     async def finish_bridge(self, decision: dict, *, result=None, error: str = "",
