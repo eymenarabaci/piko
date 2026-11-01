@@ -1378,10 +1378,15 @@ function renderInspector() {
   const moreLabel = $('#inspector-more-label');
   if (moreLabel) moreLabel.textContent = ['flow', 'output'].includes(state.tab) ? 'Diğer' : tabNames[state.tab] || 'Diğer';
 
-  if (!run) {
+  if (!run && state.tab !== 'bridges') {
     const empty = node('div', 'inspector-empty');
     empty.append(node('span', '', '⋈'), node('h3', '', 'Henüz bir görev yok'), node('p', '', 'Plan, alt ajanlar, persona kartları ve canlı sohbet burada görünür.'));
     container.append(empty);
+    return;
+  }
+  if (!run && state.tab === 'bridges') {
+    renderBridgeInspector(container);
+    container.scrollTop = previousScroll;
     return;
   }
 
@@ -1731,6 +1736,11 @@ function renderInspector() {
       container.append(runtimeMetricsCard());
     }
     if (!state.runtimeMetrics) fetchRuntimeMetrics();
+  }
+
+  // 8. KÖPRÜ PAKETLERİ TAB
+  else if (state.tab === 'bridges') {
+    renderBridgeInspector(container);
   }
 
   if (archivedPlanSelected()) {
@@ -2401,7 +2411,9 @@ async function pollEvents(generation = state.generation) {
     state.events = state.events.slice(-150);
   }
   state.cursor = data.cursor ?? state.cursor;
-  if (state.tab === 'events' || state.tab === 'work') renderInspector();
+  if (state.tab === 'events' || state.tab === 'work' || state.tab === 'bridges') {
+    renderInspector();
+  }
 }
 
 function schedulePoll(delay = 1000) {
@@ -3009,6 +3021,7 @@ $$('[data-tab]').forEach(el => el.addEventListener('click', () => {
   state.tab = el.dataset.tab;
   el.closest('details')?.removeAttribute('open');
   if (state.tab === 'work' && state.run) loadWorkForRun(state.run);
+  if (state.tab === 'bridges') loadBridgeStatus(true);
   renderInspector();
 }));
 $$('[data-example]').forEach(el => el.addEventListener('click', () => {
@@ -3606,4 +3619,91 @@ function runtimeMetricsCard() {
   card.append(row);
   card.append(node('small', '', `En yüksek eşzamanlılık: ${slots.slot_max_observed ?? 0}`));
   return card;
+}
+
+
+async function loadBridgeStatus(force = false) {
+  if (!force && state.bridgeStatus && Date.now() - (state.bridgeStatusAt || 0) < 5000) return;
+  try {
+    state.bridgeStatus = await api('/api/bridges/office/status');
+    state.bridgeStatusAt = Date.now();
+  } catch (error) {
+    state.bridgeStatus = null;
+    toast(errorText(error));
+  }
+}
+
+function bridgeCard(status) {
+  const card = node('article', 'bridge-card');
+  const bridge = status.bridge || {};
+  const head = node('div', 'delivery-card-head');
+  const title = node('div', '');
+  title.append(node('b', '', `office · v${bridge.version || '—'}`));
+  head.append(title, node('span', 'status-badge', (bridge.levels || []).join(' · ')));
+  card.append(head);
+  if (bridge.description) card.append(node('p', 'delivery-section', bridge.description));
+
+  const meta = node('div', 'worker-meta');
+  for (const level of bridge.levels || []) {
+    const needsApproval = level === 'apply' && bridge.approval?.apply === 'per_call_token';
+    meta.append(node('span', 'worker-id-pill',
+      needsApproval ? `${level} (tek kullanımlık onay)` : level));
+  }
+  meta.append(node('span', 'worker-id-pill', `kanıt: ${bridge.evidence_format || '—'}`));
+  card.append(meta);
+
+  const manager = status.personas?.manager || {};
+  const granted = (manager.bridges?.office?.levels || []).join(', ') || '—';
+  card.append(node('div', 'delivery-section',
+    `Yönetici personası (${manager.role || 'scheduler'}): ${granted}. `
+    + 'apply ayrı onay token’ı ister.'));
+
+  card.append(node('h4', 'inspector-title', 'Son teslim'));
+  const last = status.last_delivery;
+  if (!last) {
+    card.append(node('p', 'empty-note', 'Bu paketten henüz teslim yok.'));
+    return card;
+  }
+  const lastHead = node('div', 'delivery-card-head');
+  const lastTitle = node('div', '');
+  lastTitle.append(node('b', '', last.title || 'Teslim'),
+    node('span', 'delivery-version', `v${last.version}`));
+  lastHead.append(lastTitle,
+    node('span', `status-badge status-${last.status}`, last.status));
+  card.append(lastHead);
+  card.append(node('div', 'delivery-summary', last.summary || ''));
+
+  if (last.files?.length) {
+    const block = node('div', 'delivery-section');
+    block.append(node('strong', '', 'Dosyalar'));
+    const list = node('ul', '');
+    for (const file of last.files) list.append(node('li', '', file));
+    block.append(list);
+    card.append(block);
+  }
+  if (last.evidence?.length) {
+    const block = node('div', 'delivery-section');
+    block.append(node('strong', '', 'Kanıt'));
+    const list = node('ul', '');
+    for (const line of last.evidence) list.append(node('li', '', String(line)));
+    block.append(list);
+    card.append(block);
+  }
+  card.append(node('small', '', `Teslim ${new Date(last.created_at).toLocaleString('tr-TR')}`));
+  return card;
+}
+
+function renderBridgeInspector(container) {
+  container.append(node('h3', 'inspector-title', 'Köprü paketleri'));
+  const holder = node('div', 'bridge-cards');
+  holder.append(node('p', 'empty-note', 'Paket durumu yükleniyor…'));
+  container.append(holder);
+  loadBridgeStatus().then(() => {
+    holder.replaceChildren();
+    if (!state.bridgeStatus) {
+      holder.append(node('p', 'empty-note', 'Köprü durumu alınamadı.'));
+      return;
+    }
+    holder.append(bridgeCard(state.bridgeStatus));
+  });
 }

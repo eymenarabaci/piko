@@ -1102,3 +1102,10 @@ body.view-piko #toggle-inspector{display:none}
 .notification-preferences input,.notification-preferences select{display:block;width:100%;margin-top:4px;padding:7px;border:1px solid #d6dfed;border-radius:5px;font-size:11px;background:#fff}
 .choice-dialog-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 @media(max-width:650px){.view-switch button{padding:5px 7px}.notification-button{padding:5px 7px;font-size:10px}.notification-preferences{grid-template-columns:1fr}.piko-mascot{font-size:9px}}
+
+/* Bridge pack card (developer view) */
+.bridge-cards{display:grid;gap:10px}
+.bridge-card{border:1px solid #dbe6f7;border-radius:10px;background:#fff;padding:14px 16px;display:grid;gap:6px}
+.bridge-card h4{margin:4px 0 0;font-size:11px;color:#465c7e;font-weight:600}
+.bridge-card .delivery-section{margin:2px 0}
+.bridge-card .worker-meta{margin:2px 0 4px}
