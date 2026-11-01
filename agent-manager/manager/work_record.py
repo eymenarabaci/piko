@@ -231,7 +231,7 @@ class WorkRecordManager:
 
     async def update(self, work_id: str, **fields) -> dict:
         allowed = {"title", "goal", "priority", "due_at", "status", "next_action",
-                   "last_result", "requirements", "acceptance", "dependencies"}
+                   "last_result", "requirements", "acceptance", "dependencies", "run_id"}
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"Güncellenemeyen alan: {', '.join(sorted(unknown))}")
