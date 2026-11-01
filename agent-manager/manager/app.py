@@ -37,7 +37,8 @@ from .providers import Providers
 from .outcomes import ensure_usable_result, is_infrastructure_error
 from .schema import Plan, RunRequest
 from .request_routing import classify_with_model
-from . import health
+from . import health, packs
+from .packs import office_flow
 from .scheduling import missed_run, ordered_work
 from .store import Store, now
 from .triggers import TriggerManager
@@ -160,6 +161,8 @@ def create_app(data_dir=None, providers=None):
                 resource_locks = ResourceLocks(data_dir / "locks.sqlite")
                 await resource_locks.open()
                 bridge_gate = BridgeGate(token_store=ledger)
+                registered_packs = packs.register_shipped(bridge_gate.registry)
+                app.state.registered_packs = registered_packs
                 app.state.work = work
                 app.state.notifications = notifications
                 app.state.ledger = ledger
@@ -548,7 +551,81 @@ def create_app(data_dir=None, providers=None):
     @app.get("/api/bridges")
     async def list_bridges():
         gate = app.state.bridge_gate
-        return {"bridges": gate.registry.catalog()}
+        return {"bridges": gate.registry.catalog(),
+                "shipped": getattr(app.state, "registered_packs", [])}
+
+    @app.get("/api/bridges/office/status")
+    async def office_status():
+        """Developer screen: one card per pack with its last delivery + evidence."""
+        spec = app.state.bridge_gate.registry.get("office")
+        latest = await app.state.work.latest_deliverable(kind="office-report")
+        return {
+            "bridge": {"id": spec["id"], "version": spec["version"],
+                       "levels": spec["levels"],
+                       "approval": spec["approval"],
+                       "evidence_format": spec["evidence"]["format"],
+                       "description": spec.get("description", "")},
+            "personas": {"manager": office_flow.office.MANAGER_PERSONA,
+                         "approver": office_flow.office.APPROVER_PERSONA},
+            "last_delivery": None if latest is None else {
+                "id": latest["id"], "work_id": latest["work_id"],
+                "version": latest["version"], "status": latest["status"],
+                "title": latest["title"], "summary": latest["summary"],
+                "files": latest["files"], "evidence": latest["evidence"],
+                "created_at": latest["created_at"]},
+        }
+
+    @app.post("/api/bridges/office/draft")
+    async def office_draft(request: Request):
+        """Manager level: produce an in-memory draft (no write)."""
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "JSON nesnesi gerekli.")
+        persona = body.get("persona") or office_flow.office.MANAGER_PERSONA
+        try:
+            await app.state.engine.authorize_bridge(
+                persona, "office", "draft", payload=body.get("request"))
+            draft = office_flow.draft_payload(body.get("request") or {})
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"title": draft["title"],
+                "files": [{"path": name, "sha256": digest, "bytes": len(
+                    draft["files"][name])} for name, digest in sorted(draft["hashes"].items())],
+                "notes": draft["notes"], "summary": draft["summary"]}
+
+    @app.post("/api/bridges/office/approve")
+    async def office_approve(request: Request):
+        """Local user approval: a single-use token bound to the draft hash."""
+        body = await request.json()
+        try:
+            draft = office_flow.draft_payload((body or {}).get("request") or {})
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return office_flow.issue_approval(draft)
+
+    @app.post("/api/bridges/office/deliver")
+    async def office_deliver(request: Request):
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "JSON nesnesi gerekli.")
+        try:
+            result = await office_flow.deliver(
+                app.state.engine,
+                persona=body.get("persona") or office_flow.office.MANAGER_PERSONA,
+                request=body.get("request") or {},
+                target=str(body.get("target") or ""),
+                approval_token=str(body.get("approval_token") or ""),
+                idempotency_key=str(body.get("idempotency_key") or ""),
+                work_id=str(body.get("work_id") or ""),
+                run_id=str(body.get("run_id") or ""),
+                workspace=str(body.get("workspace") or ""))
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return result
 
     @app.post("/api/bridges/authorize")
     async def authorize_bridge(request: Request):
