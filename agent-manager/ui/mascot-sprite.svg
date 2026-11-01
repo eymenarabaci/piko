@@ -1,0 +1,125 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="piko-sprite" aria-hidden="true" focusable="false">
+  <!-- Piko mascot sprite: one symbol per state. JS swaps the <use> reference only. -->
+  <symbol id="piko-idle" data-state="idle" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="55" rx="15" ry="2.6" fill="#1b2c48" opacity=".10"/>
+    <line x1="32" y1="14" x2="32" y2="8" stroke="#a9c2ff" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="7" r="3.2" fill="#4d7cfe"/>
+    <circle cx="32" cy="33" r="19" fill="#eaf0fc" stroke="#cfdcf5" stroke-width="2"/>
+    <circle cx="25" cy="31" r="2.6" fill="#33455f"/>
+    <circle cx="39" cy="31" r="2.6" fill="#33455f"/>
+    <path d="M27.5 39 q4.5 3.4 9 0" fill="none" stroke="#33455f" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="20" cy="37" r="2.4" fill="#f7b7c2" opacity=".65"/>
+    <circle cx="44" cy="37" r="2.4" fill="#f7b7c2" opacity=".65"/>
+  </symbol>
+
+  <symbol id="piko-konusuyor" data-state="konusuyor" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="55" rx="15" ry="2.6" fill="#1b2c48" opacity=".10"/>
+    <line x1="32" y1="14" x2="32" y2="8" stroke="#a9c2ff" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="7" r="3.2" fill="#4d7cfe"/>
+    <circle cx="32" cy="33" r="19" fill="#eaf0fc" stroke="#cfdcf5" stroke-width="2"/>
+    <circle cx="25" cy="30" r="2.6" fill="#33455f"/>
+    <circle cx="39" cy="30" r="2.6" fill="#33455f"/>
+    <ellipse cx="32" cy="40" rx="4.6" ry="3.4" fill="#33455f"/>
+    <circle cx="20" cy="37" r="2.4" fill="#f7b7c2" opacity=".7"/>
+    <circle cx="44" cy="37" r="2.4" fill="#f7b7c2" opacity=".7"/>
+    <path d="M50 26 q4 6 0 12" fill="none" stroke="#4d7cfe" stroke-width="2" stroke-linecap="round" opacity=".7"/>
+    <path d="M54 22 q6 10 0 20" fill="none" stroke="#4d7cfe" stroke-width="2" stroke-linecap="round" opacity=".45"/>
+  </symbol>
+
+  <symbol id="piko-yuruyor" data-state="yuruyor" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="57" rx="14" ry="2.4" fill="#1b2c48" opacity=".10"/>
+    <line x1="32" y1="12" x2="32" y2="6" stroke="#a9c2ff" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="5" r="3.2" fill="#4d7cfe"/>
+    <circle cx="32" cy="31" r="19" fill="#eaf0fc" stroke="#cfdcf5" stroke-width="2"/>
+    <circle cx="25" cy="29" r="2.6" fill="#33455f"/>
+    <circle cx="39" cy="29" r="2.6" fill="#33455f"/>
+    <path d="M28 37 q4 2.6 8 0" fill="none" stroke="#33455f" stroke-width="2" stroke-linecap="round"/>
+    <ellipse cx="26" cy="52" rx="4.2" ry="2.4" fill="#a9c2ff" transform="rotate(-14 26 52)"/>
+    <ellipse cx="38" cy="53" rx="4.2" ry="2.4" fill="#a9c2ff" transform="rotate(14 38 53)"/>
+    <path d="M6 28 h11" stroke="#cfdcf5" stroke-width="2.4" stroke-linecap="round"/>
+    <path d="M9 34 h8" stroke="#cfdcf5" stroke-width="2.4" stroke-linecap="round" opacity=".7"/>
+  </symbol>
+
+  <symbol id="piko-calisiyor" data-state="calisiyor" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="55" rx="15" ry="2.6" fill="#1b2c48" opacity=".10"/>
+    <line x1="32" y1="14" x2="32" y2="8" stroke="#a9c2ff" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="7" r="3.2" fill="#4d7cfe"/>
+    <circle cx="32" cy="33" r="19" fill="#eaf0fc" stroke="#cfdcf5" stroke-width="2"/>
+    <path d="M22 30 h6" stroke="#33455f" stroke-width="2.6" stroke-linecap="round"/>
+    <path d="M36 30 h6" stroke="#33455f" stroke-width="2.6" stroke-linecap="round"/>
+    <path d="M29 40 h6" stroke="#33455f" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="50" cy="43" r="7" fill="none" stroke="#4d7cfe" stroke-width="2.4" stroke-dasharray="2.6 2.6"/>
+    <circle cx="50" cy="43" r="2.2" fill="#4d7cfe"/>
+    <path d="M41 40 l5 4" stroke="#a9c2ff" stroke-width="2.4" stroke-linecap="round"/>
+  </symbol>
+
+  <symbol id="piko-dagitiyor" data-state="dagitiyor" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="55" rx="15" ry="2.6" fill="#1b2c48" opacity=".10"/>
+    <line x1="32" y1="14" x2="32" y2="8" stroke="#a9c2ff" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="7" r="3.2" fill="#4d7cfe"/>
+    <circle cx="32" cy="33" r="19" fill="#eaf0fc" stroke="#cfdcf5" stroke-width="2"/>
+    <circle cx="25" cy="31" r="2.6" fill="#33455f"/>
+    <circle cx="39" cy="31" r="2.6" fill="#33455f"/>
+    <path d="M28 39 q4 3 8 0" fill="none" stroke="#33455f" stroke-width="2" stroke-linecap="round"/>
+    <rect x="3" y="17" width="10" height="8" rx="2" fill="#fff" stroke="#a9c2ff" stroke-width="1.8"/>
+    <rect x="51" y="13" width="10" height="8" rx="2" fill="#fff" stroke="#a9c2ff" stroke-width="1.8"/>
+    <rect x="52" y="35" width="10" height="8" rx="2" fill="#fff" stroke="#a9c2ff" stroke-width="1.8"/>
+    <path d="M16 22 q5 3 8 6" fill="none" stroke="#4d7cfe" stroke-width="2" stroke-linecap="round"/>
+    <path d="M49 18 q-5 3 -8 6" fill="none" stroke="#4d7cfe" stroke-width="2" stroke-linecap="round"/>
+    <path d="M50 39 q-4 1 -8 2" fill="none" stroke="#4d7cfe" stroke-width="2" stroke-linecap="round"/>
+  </symbol>
+
+  <symbol id="piko-teslim" data-state="teslim" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="57" rx="17" ry="2.8" fill="#1b2c48" opacity=".10"/>
+    <line x1="32" y1="14" x2="32" y2="8" stroke="#a9c2ff" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="7" r="3.2" fill="#4d7cfe"/>
+    <circle cx="32" cy="32" r="19" fill="#eaf0fc" stroke="#cfdcf5" stroke-width="2"/>
+    <path d="M22 29 q3 -3 6 0" fill="none" stroke="#33455f" stroke-width="2.2" stroke-linecap="round"/>
+    <path d="M36 29 q3 -3 6 0" fill="none" stroke="#33455f" stroke-width="2.2" stroke-linecap="round"/>
+    <path d="M28 37 q4 3 8 0" fill="none" stroke="#33455f" stroke-width="2" stroke-linecap="round"/>
+    <rect x="21" y="41" width="22" height="12" rx="2.4" fill="#fff" stroke="#a9c2ff" stroke-width="2"/>
+    <path d="M27 47 l3.4 3.4 l7 -7" fill="none" stroke="#2f9e6f" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M21 45 q-5 -1 -7 -5" fill="none" stroke="#a9c2ff" stroke-width="2.4" stroke-linecap="round"/>
+    <path d="M43 45 q5 -1 7 -5" fill="none" stroke="#a9c2ff" stroke-width="2.4" stroke-linecap="round"/>
+  </symbol>
+
+  <symbol id="piko-bekliyor" data-state="bekliyor" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="55" rx="15" ry="2.6" fill="#1b2c48" opacity=".10"/>
+    <line x1="32" y1="14" x2="32" y2="8" stroke="#e2c58f" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="7" r="3.2" fill="#e0b866"/>
+    <circle cx="32" cy="33" r="19" fill="#fff7e3" stroke="#f0d9a6" stroke-width="2"/>
+    <circle cx="25" cy="31" r="2.6" fill="#6b5a34"/>
+    <circle cx="39" cy="31" r="2.6" fill="#6b5a34"/>
+    <path d="M28.5 39 h7" stroke="#6b5a34" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="50" cy="19" r="7" fill="#fff" stroke="#e0b866" stroke-width="2"/>
+    <path d="M50 15 v4 h3" fill="none" stroke="#c49a45" stroke-width="2" stroke-linecap="round"/>
+    <path d="M41 46 q5 2 8 -1" fill="none" stroke="#e2c58f" stroke-width="2.2" stroke-linecap="round"/>
+  </symbol>
+
+  <symbol id="piko-takildi" data-state="takildi" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="55" rx="15" ry="2.6" fill="#1b2c48" opacity=".10"/>
+    <line x1="32" y1="14" x2="32" y2="8" stroke="#f0c3ca" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="7" r="3.2" fill="#d9534f"/>
+    <circle cx="32" cy="33" r="19" fill="#fdeef0" stroke="#f0c3ca" stroke-width="2"/>
+    <path d="M21 26 l7 3" stroke="#8a3b3b" stroke-width="2.2" stroke-linecap="round"/>
+    <path d="M43 26 l-7 3" stroke="#8a3b3b" stroke-width="2.2" stroke-linecap="round"/>
+    <circle cx="25" cy="32" r="2.2" fill="#8a3b3b"/>
+    <circle cx="39" cy="32" r="2.2" fill="#8a3b3b"/>
+    <path d="M27 41 q2.5 -2.5 5 0 q2.5 2.5 5 0" fill="none" stroke="#8a3b3b" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="52" cy="15" r="8" fill="#fdeef0" stroke="#f0c3ca" stroke-width="2"/>
+    <path d="M52 10 v6" stroke="#d9534f" stroke-width="2.6" stroke-linecap="round"/>
+    <circle cx="52" cy="19.5" r="1.5" fill="#d9534f"/>
+  </symbol>
+
+  <symbol id="piko-uyuyor" data-state="uyuyor" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="55" rx="15" ry="2.6" fill="#1b2c48" opacity=".08"/>
+    <line x1="32" y1="15" x2="32" y2="10" stroke="#cfdcf5" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="9" r="3" fill="#a9c2ff"/>
+    <circle cx="32" cy="34" r="19" fill="#f0f4fb" stroke="#dbe6f7" stroke-width="2"/>
+    <path d="M22 32 q3 2.4 6 0" fill="none" stroke="#7d8fa8" stroke-width="2.2" stroke-linecap="round"/>
+    <path d="M36 32 q3 2.4 6 0" fill="none" stroke="#7d8fa8" stroke-width="2.2" stroke-linecap="round"/>
+    <ellipse cx="32" cy="41" rx="2.2" ry="1.6" fill="#7d8fa8"/>
+    <text x="48" y="16" font-family="Verdana, sans-serif" font-size="11" fill="#8aa2c8">z</text>
+    <text x="54" y="10" font-family="Verdana, sans-serif" font-size="8" fill="#a9bcd8">z</text>
+  </symbol>
+</svg>
