@@ -22,17 +22,22 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from .engine import Engine
 from .ao import AOClient
 from .attachments import AttachmentStore, MAX_REQUEST_BYTES, attachment_prompt, validate_for_model
+from .bridge_gate import BridgeGate
+from .daemon import DriverDaemon
+from .driver_hooks import EngineDriverHooks as DriverHooks
 from .integrations import IntegrationGate
 from .metrics import MetricsStore
 from .model_router import NoEligibleModel, infer_role
 from .notifications import NotificationManager
 from .operations import OperationLedger
+from .resource_locks import ResourceLocks
 from .projects import ProjectManager
 from .processes import _record
 from .providers import Providers
 from .outcomes import ensure_usable_result, is_infrastructure_error
 from .schema import Plan, RunRequest
 from .request_routing import classify_with_model
+from . import health
 from .scheduling import missed_run, ordered_work
 from .store import Store, now
 from .triggers import TriggerManager
@@ -152,25 +157,43 @@ def create_app(data_dir=None, providers=None):
                 await metrics.open()
                 integrations = IntegrationGate(data_dir, engine.default_workspace, ledger=ledger)
                 await integrations.open()
+                resource_locks = ResourceLocks(data_dir / "locks.sqlite")
+                await resource_locks.open()
+                bridge_gate = BridgeGate(token_store=ledger)
                 app.state.work = work
                 app.state.notifications = notifications
                 app.state.ledger = ledger
                 app.state.metrics = metrics
                 app.state.integrations = integrations
+                app.state.resource_locks = resource_locks
+                app.state.bridge_gate = bridge_gate
                 engine.attach_infrastructure(work=work, notifications=notifications,
                                              ledger=ledger, metrics=metrics,
-                                             integrations=integrations)
+                                             integrations=integrations,
+                                             resource_locks=resource_locks,
+                                             bridge_gate=bridge_gate,
+                                             heartbeat=health.beat,
+                                             heartbeat_retire=health.retire)
+                driver = DriverDaemon(work, DriverHooks(engine),
+                                      state_path=data_dir / "driver.sqlite",
+                                      ledger=ledger)
+                app.state.driver = driver
+                app.state.driver_hooks = driver.hooks
                 triggers = TriggerManager(data_dir, engine)
                 app.state.triggers = triggers
                 daemon_task = asyncio.create_task(triggers.run_daemon())
+                driver_task = asyncio.create_task(driver.run_daemon())
                 await engine.recover()
                 try:
                     yield
                 finally:
                     await triggers.stop_daemon()
-                    daemon_task.cancel()
+                    driver.stop()
+                    for task in (daemon_task, driver_task):
+                        task.cancel()
                     await engine.close()
-                    for manager in (integrations, metrics, ledger, notifications, work):
+                    for manager in (resource_locks, integrations, metrics, ledger,
+                                    notifications, work):
                         try:
                             await manager.close()
                         except Exception:
@@ -493,6 +516,66 @@ def create_app(data_dir=None, providers=None):
     @app.get("/api/operations")
     async def list_operations(limit: int = 100):
         return {"items": await app.state.ledger.list(limit=limit)}
+
+    @app.get("/api/driver/status")
+    async def driver_status():
+        driver = app.state.driver
+        return {"stats": dict(driver.stats), "running": driver._opened,
+                "recovery": list(driver.recovery_proposals)}
+
+    @app.get("/api/health")
+    async def health_report():
+        return health.report()
+
+    @app.get("/api/recovery")
+    async def list_recovery():
+        hooks = app.state.driver_hooks
+        return {"questions": list(getattr(hooks, "recovery_questions", []))}
+
+    @app.post("/api/recovery/{operation_id}/answer")
+    async def answer_recovery(operation_id: str, request: Request):
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "JSON nesnesi gerekli.")
+        try:
+            return await app.state.driver_hooks.answer_recovery(
+                operation_id, str(body.get("answer", "")),
+                note=str(body.get("note", "")))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/api/bridges")
+    async def list_bridges():
+        gate = app.state.bridge_gate
+        return {"bridges": gate.registry.catalog()}
+
+    @app.post("/api/bridges/authorize")
+    async def authorize_bridge(request: Request):
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "JSON nesnesi gerekli.")
+        try:
+            decision = await app.state.engine.authorize_bridge(
+                body.get("persona", "implementer"), body.get("bridge", ""),
+                body.get("level", "read"),
+                approval_token=body.get("approval_token"),
+                idempotency_key=body.get("idempotency_key"),
+                payload=body.get("payload"))
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return decision
+
+    @app.post("/api/bridges/{operation_id}/finish")
+    async def finish_bridge(operation_id: str, request: Request):
+        body = await request.json() if request.headers.get("content-length", "0") not in {"0", ""} else {}
+        body = body if isinstance(body, dict) else {}
+        ledger = app.state.ledger
+        if body.get("error"):
+            return await ledger.fail(operation_id, str(body["error"]),
+                                     uncertain=bool(body.get("uncertain")))
+        return await ledger.complete(operation_id, body.get("result"))
 
     @app.get("/api/metrics")
     async def get_metrics(task_kind: str = ""):
