@@ -196,10 +196,21 @@ class Engine:
 
     async def authorize_bridge(self, persona, bridge, level: str, *,
                                approval_token=None, idempotency_key=None,
-                               payload=None) -> dict:
-        """Authorize a bridge call and record an apply/dangerous call in the ledger."""
+                               payload=None, proactive: bool = False) -> dict:
+        """Authorize a bridge call and record an apply/dangerous call in the ledger.
+
+        ``proactive=True`` marks the unattended background flow: it may only use
+        the pack's read-only levels, so a proactive path can never draft or send.
+        """
         if self.bridge_gate is None:
             raise PermissionError("Köprü kapısı yapılandırılmadı; dış işlem başlatılamaz.")
+        if proactive:
+            from .packs import PROACTIVE_LEVELS
+            allowed = PROACTIVE_LEVELS.get(str(bridge or ""), frozenset({"read"}))
+            if str(level or "").strip().lower() not in allowed:
+                raise PermissionError(
+                    f"Proaktif akış yalnız {sorted(allowed)} seviyesini çağırabilir; "
+                    f"'{level}' reddedildi.")
         decision = await self.bridge_gate.authorize(
             persona, bridge, level, approval_token=approval_token,
             idempotency_key=idempotency_key, payload=payload)
