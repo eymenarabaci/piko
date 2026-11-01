@@ -1728,7 +1728,9 @@ function renderInspector() {
         audit.append(node('small', '', `${step.title}: ${result.status || 'bekliyor'} · ${result.model_id || step.model_id || 'auto'}${result.independent_review ? ' · denetim: ' + (result.independent_review.status || result.independent_review.verdict || 'var') : ''}`));
       }
       container.append(audit);
+      container.append(runtimeMetricsCard());
     }
+    if (!state.runtimeMetrics) fetchRuntimeMetrics();
   }
 
   if (archivedPlanSelected()) {
@@ -3568,4 +3570,40 @@ function bindWorkUi() {
       refreshNotifications();
     } catch (error) { toast(errorText(error)); }
   });
+}
+
+let runtimeMetricsTimer = null;
+async function fetchRuntimeMetrics(force = false) {
+  if (!force && runtimeMetricsTimer && Date.now() - runtimeMetricsTimer < 5000) return;
+  try {
+    const data = await api('/api/metrics');
+    state.runtimeMetrics = data;
+    runtimeMetricsTimer = Date.now();
+    if (state.tab === 'work') renderInspector();
+  } catch {}
+}
+
+function runtimeMetricsCard() {
+  const card = node('div', 'worker-card');
+  card.append(node('div', 'worker-card-title', 'Sistem kapasitesi'));
+  const metrics = state.runtimeMetrics;
+  if (!metrics) {
+    card.append(node('small', '', 'Kapasite ölçümü yükleniyor…'));
+    return card;
+  }
+  const slots = metrics.slots || {};
+  const runtime = metrics.runtime || {};
+  const occupancy = runtime.slot_occupancy_percent ?? 0;
+  const active = slots.slot_active ?? 0;
+  const cap = slots.max_concurrent_runs ?? 2;
+  const row = node('div', 'worker-meta');
+  row.append(node('span', 'worker-id-pill', `slot ${active}/${cap}`));
+  row.append(node('span', 'worker-id-pill', `doluluk %${occupancy}`));
+  row.append(node('span', 'worker-id-pill', `bekleyen ${slots.slot_waiters ?? 0}`));
+  row.append(node('span', 'worker-id-pill', `kabul edilen ${slots.slot_wait_count ?? 0}`));
+  row.append(node('span', 'worker-id-pill',
+    `ort. bekleme ${Number(runtime.slot_wait_avg_seconds ?? 0).toFixed(2)} sn`));
+  card.append(row);
+  card.append(node('small', '', `En yüksek eşzamanlılık: ${slots.slot_max_observed ?? 0}`));
+  return card;
 }
