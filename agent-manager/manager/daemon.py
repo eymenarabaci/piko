@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -27,6 +28,7 @@ from typing import Protocol, runtime_checkable
 
 import aiosqlite
 
+from .health import DAEMON_KIND, DAEMON_SOURCE_ID
 from .recovery import collect_proposals, proposal_for, summarize as summarize_recovery
 
 log = logging.getLogger("manager.daemon")
@@ -76,7 +78,18 @@ class DriverHooks(Protocol):
     async def notify(self, kind: str, title: str, body: str = "", *,
                      work_id: str = "", run_id: str = "", dedupe_key: str = "",
                      severity: str = "normal") -> None:
-        """Surface a decision reminder or blocker to the user."""
+        """Surface a decision reminder or blocker to the user.
+
+        The main application forwards this to NotificationManager, which
+        de-duplicates by ``dedupe_key`` and honours quiet hours.
+        """
+
+    async def beat(self, source_id: str, *, kind: str | None = None,
+                   detail: str | None = None) -> None:
+        """Stamp the daemon heartbeat read by the external watchdog."""
+
+    async def on_recovery(self, proposals) -> None:
+        """Receive unknown-operation proposals; never apply them here."""
 
 
 class DriverState:
@@ -192,8 +205,8 @@ class DriverDaemon:
                 log.info("Kurtarma sorusu: %s", proposal["question"])
             callback = getattr(self.hooks, "on_recovery", None)
             if callback is not None:
-                # INTEGRATION: the main app may show these proposals; it must not
-                # apply them without an explicit user answer.
+                # Surfaced as questions only; nothing is applied without an
+                # explicit user answer through the main application.
                 await callback(self.recovery_proposals)
 
     async def close(self):
@@ -239,6 +252,7 @@ class DriverDaemon:
             raise ValueError("Sürücü zamanı saat dilimi içermeli.")
         moment = moment.astimezone(timezone.utc)
         self.stats["tick"] += 1
+        await self._beat("tick")
 
         works = await self.work.list(limit=WORK_LIMIT)
         done_ids = {item["id"] for item in works if item["status"] == "done"}
@@ -268,6 +282,17 @@ class DriverDaemon:
             if item["status"] == "waiting":
                 await self._process_decisions(item, moment)
         return dict(self.stats)
+
+    async def _beat(self, detail: str = "") -> None:
+        """Stamp the daemon heartbeat for the external watchdog."""
+        callback = getattr(self.hooks, "beat", None)
+        if callback is None:
+            return
+        try:
+            await callback(DAEMON_SOURCE_ID, kind=DAEMON_KIND, detail=detail or None)
+        except Exception:
+            self.stats["errors"] += 1
+            log.debug("Sürücü kalp atışı yazılamadı.", exc_info=True)
 
     async def _resolve_blocked(self, item: dict, done_ids: set[str]) -> dict:
         if item["status"] != "blocked":
@@ -306,7 +331,6 @@ class DriverDaemon:
         if run_id in self._resumed:
             return
         try:
-            # INTEGRATION: main app adapter re-attaches the engine run here.
             resumed = await self.hooks.resume_work(dict(item))
         except asyncio.CancelledError:
             raise
@@ -326,7 +350,8 @@ class DriverDaemon:
         if item["id"] in self._started:
             return
         try:
-            # INTEGRATION: main app adapter creates exactly one run per work id.
+            # The adapter links the created run to this work row; a retried
+            # tick therefore finds ``run_id`` set and never creates a second run.
             run_id = await self.hooks.start_work(dict(item))
         except asyncio.CancelledError:
             raise
@@ -426,7 +451,6 @@ class DriverDaemon:
         if callback is None:
             return
         try:
-            # INTEGRATION: main app adapter forwards to NotificationManager.
             await callback(kind, title, body, work_id=work_id, run_id=run_id,
                            dedupe_key=dedupe_key, severity=severity)
         except asyncio.CancelledError:
@@ -529,10 +553,80 @@ def main(argv=None) -> int:
         print("dry-run: hiçbir iş başlatılmadı, hiçbir kayıt değiştirilmedi.")
         return 0
 
-    print("INTEGRATION: DriverHooks adapter'ı (engine bağlantısı) verilmeden sürücü "
-          "başlatılamaz. Önce --dry-run ile durumu inceleyin; ana oturum adapter'ı "
-          "bağladığında bu komut döngüyü çalıştıracak.", file=sys.stderr)
-    return 2
+    return asyncio.run(serve(data_dir, tick_seconds=args.tick_seconds))
+
+
+async def build_driver(data_dir, *, tick_seconds: int = TICK_SECONDS,
+                       default_mode: str = "orchestrate", allow_writes: bool = False):
+    """Build a headless engine stack plus the daemon; used by the CLI and the app.
+
+    Returns ``(daemon, hooks, stack)``; ``stack`` owns the async context manager
+    that must stay open for the daemon's lifetime.
+    """
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    from . import health
+    from .app import load_and_discover_models, ROOT
+    from .driver_hooks import EngineDriverHooks
+    from .engine import Engine
+    from .integrations import IntegrationGate
+    from .metrics import MetricsStore
+    from .notifications import NotificationManager
+    from .operations import OperationLedger
+    from .providers import Providers
+    from .resource_locks import ResourceLocks
+    from .store import Store
+    from .work_record import WorkRecordManager
+
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    store = Store(data_dir / "runs.sqlite")
+    await store.open()
+    stack = contextlib.AsyncExitStack()
+    try:
+        saver = await stack.enter_async_context(
+            AsyncSqliteSaver.from_conn_string(str(data_dir / "checkpoints.sqlite")))
+        models = await load_and_discover_models(ROOT)
+        engine = Engine(store, saver, Providers(models, ROOT), ROOT)
+        work = await stack.enter_async_context(_opened(WorkRecordManager(data_dir / "work.sqlite")))
+        notifications = await stack.enter_async_context(
+            _opened(NotificationManager(data_dir / "notifications.sqlite")))
+        ledger = await stack.enter_async_context(_opened(OperationLedger(data_dir / "operations.sqlite")))
+        metrics = await stack.enter_async_context(_opened(MetricsStore(data_dir / "metrics.sqlite")))
+        integrations = await stack.enter_async_context(
+            _opened(IntegrationGate(data_dir, engine.default_workspace, ledger=ledger)))
+        locks = await stack.enter_async_context(_opened(ResourceLocks(data_dir / "locks.sqlite")))
+        engine.attach_infrastructure(
+            work=work, notifications=notifications, ledger=ledger, metrics=metrics,
+            integrations=integrations, resource_locks=locks,
+            heartbeat=health.beat, heartbeat_retire=health.retire)
+        hooks = EngineDriverHooks(engine, default_mode=default_mode,
+                                  allow_writes=allow_writes)
+        daemon = DriverDaemon(work, hooks, state_path=data_dir / "driver.sqlite",
+                              ledger=ledger, tick_seconds=tick_seconds)
+    except BaseException:
+        await stack.aclose()
+        await store.close()
+        raise
+    return daemon, hooks, stack
+
+
+@contextlib.asynccontextmanager
+async def _opened(manager):
+    await manager.open()
+    try:
+        yield manager
+    finally:
+        await manager.close()
+
+
+async def serve(data_dir, *, tick_seconds: int = TICK_SECONDS) -> int:
+    daemon, _hooks, stack = await build_driver(data_dir, tick_seconds=tick_seconds)
+    try:
+        await daemon.run()
+    finally:
+        await stack.aclose()
+    return 0
 
 
 if __name__ == "__main__":
