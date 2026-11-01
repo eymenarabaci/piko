@@ -86,7 +86,7 @@ async def stack(tmp_path):
     locks = ResourceLocks(tmp_path / "locks.sqlite")
     await locks.open()
     gate = BridgeGate(token_store=ledger)
-    assert packs.register_shipped(gate.registry) == ["office", "github"]
+    assert packs.register_shipped(gate.registry) == ["office", "github", "communication"]
     try:
         async with AsyncSqliteSaver.from_conn_string(str(tmp_path / "checkpoints.sqlite")) as saver:
             engine = Engine(store, saver, QuietProviders(), tmp_path)
