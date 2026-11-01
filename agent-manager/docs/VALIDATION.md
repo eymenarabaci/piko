@@ -138,3 +138,12 @@ Uzun süreli yük testi, tüm katalog modelleri ve gerçek büyük kod üretim g
 - Windows'ta yeni açılmış, adım sonunda kapatılan Codex terminalinde bu işaretçi canlı giriş alanının tamamını oluşturuyor ve karakter sayısı gönderilen istemle eşleşiyorsa CAO yalnız `Enter` tuşunu yeniden iletiyor. Tam istem tekrar yapıştırılmıyor; değişmiş girişe otomatik `Enter` gönderilmiyor.
 - Başarısız veya iptal edilmiş adımın terminali girişe `/exit` yazılmadan kapatılıyor. Başarılı adımın olağan kapanışı sürüyor.
 - Model çağrısı yapmayan doğrulama: `python -m unittest discover -s .\vendor\cao-upstream\tests -p test_agent_step_delivery.py -v` sonucu **7 test geçti**; değişen Python dosyalarının sözdizimi kontrolü geçti. Canlı uçtan uca teslim henüz doğrulanmadı.
+
+# 2026-11-01 doğrulaması
+
+- Komut: `.venv/Scripts/python.exe -m pytest tests -q` — 223 test başarılı (yeni iş kaydı, teslim sürümleri, bildirim, işlem defteri, bütçe, entegrasyon kapısı, zamanlama, ölçüm ve API testleri dahil).
+- Komut: `node --check ui/app.js` — başarılı.
+- Arayüz smoke: `node tests/ui-work-smoke.cjs` (TEST_URL=http://127.0.0.1:8767). Bootstrap, Piko/Geliştirici geçişi, bildirim diyaloğu ve tercih kaydı, maskot durum bağı, iş kaydı sekmesi, teslim kabulü ve mobil taşma kontrolü geçti; sayfa/istek hatası yok. Ekran görüntüleri `work/visual/` altında.
+- Gerçek model çağrısı yapılmadı; canlı CLI/CODEX yürütmesi ve token tasarrufu ölçümü bu doğrulamanın kapsamı dışındadır.
+- Sınır: dış servis bağlayıcıları (GitHub, takvim, Drive, e-posta) yalnız sözleşme ve izin katmanı olarak doğrulandı; gerçek API kimlik doğrulaması test edilmedi. Bağlayıcısı olmayan servis `failed` döndürür.
+- Sınır: işlem defteri yeniden başlatmada `pending` kaydı `unknown` yapar ve otomatik tekrar çalıştırmaz; bu davranış test edildi, gerçek bir dış servisle kesinti senaryosu çalıştırılmadı.

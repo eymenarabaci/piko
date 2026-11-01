@@ -1,7 +1,8 @@
 const fs=require('node:fs');
 const path=require('node:path');
 const {spawnSync}=require('node:child_process');
-const {chromium}=require('C:/Users/user/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
+function loadPlaywright(){const candidates=[process.env.PLAYWRIGHT_MODULE,path.join(process.env.USERPROFILE||'','.cache','codex-runtimes','codex-primary-runtime','dependencies','node','node_modules','playwright'),'playwright'].filter(Boolean);for(const candidate of candidates){try{return require(candidate)}catch{}}throw new Error('Playwright modülü bulunamadı. PLAYWRIGHT_MODULE ile yol verin.')}
+const {chromium}=loadPlaywright();
 const root=path.resolve(__dirname,'..');
 const base=process.env.TEST_URL||'http://127.0.0.1:8766';
 (async()=>{

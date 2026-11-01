@@ -277,6 +277,61 @@ def test_api_local_boundary_and_unknown_run(tmp_path):
         assert client.post("/api/runs", json={"prompt": "x", "planner_model": "missing", "executor_model": "worker"}).status_code == 400
 
 
+def test_api_work_delivery_notifications_and_integrations(tmp_path):
+    app = create_app(data_dir=tmp_path, providers=FakeProviders())
+    with TestClient(app) as client:
+        created = client.post("/api/work", json={
+            "goal": "Rapor hazırla", "title": "Rapor", "priority": "high",
+            "due_at": "2026-11-02T10:00:00+03:00", "acceptance": ["Rapor dosyası hazır"]})
+        assert created.status_code == 201
+        work_id = created.json()["id"]
+        detail = client.get(f"/api/work/{work_id}").json()
+        assert detail["summary"]["what_was_asked"] == "Rapor hazırla"
+        assert detail["summary"]["next_action"]
+
+        deliverable = client.post(f"/api/work/{work_id}/deliverables", json={
+            "summary": "Rapor hazır.", "evidence": ["pytest: 3 passed"],
+            "requirements": ["Rapor dosyası hazır"]})
+        assert deliverable.status_code == 201
+        assert deliverable.json()["version"] == 1
+        deliverable_id = deliverable.json()["id"]
+
+        accepted = client.post(f"/api/deliverables/{deliverable_id}/accept", json={"note": "uygun"})
+        assert accepted.status_code == 200
+        assert accepted.json()["status"] == "accepted"
+        assert client.get(f"/api/work/{work_id}").json()["work"]["status"] == "done"
+
+        decision = client.post(f"/api/work/{work_id}/decisions", json={"question": "Hangi biçim?"})
+        assert decision.status_code == 201
+        notes = client.get("/api/notifications?include_suppressed=1").json()["items"]
+        assert any(note["kind"] == "decision" for note in notes)
+        unread = client.get("/api/notifications?unread=1").json()["items"]
+        if unread:
+            marked = client.post(f"/api/notifications/{unread[0]['id']}/read")
+            assert marked.status_code == 200 and marked.json()["read"] is True
+
+        prefs = client.put("/api/notifications/preferences", json={
+            "enabled": True, "quiet_start": "23:00", "quiet_end": "07:00",
+            "timezone": "Europe/Istanbul"}).json()
+        assert prefs["quiet_start"] == "23:00"
+
+        services = client.get("/api/integrations").json()["services"]
+        assert any(item["service"] == "local_files" and item["available"] for item in services)
+        draft = client.post("/api/integrations/drafts", json={
+            "service": "local_files", "target": "out/report.txt", "content": "Rapor",
+            "workspace": str(tmp_path)})
+        assert draft.status_code == 201
+        confirmation = client.post(f"/api/integrations/drafts/{draft.json()['id']}/confirm").json()
+        applied = client.post(f"/api/integrations/drafts/{draft.json()['id']}/apply", json={
+            "confirmation_id": confirmation["confirmation_id"],
+            "content_hash": confirmation["content_hash"]})
+        assert applied.status_code == 200 and applied.json()["applied"] is True
+        assert (tmp_path / "out" / "report.txt").read_text(encoding="utf-8") == "Rapor"
+
+        assert "items" in client.get("/api/operations").json()
+        assert "models" in client.get("/api/metrics").json()
+
+
 def routing_models():
     return [
         {"id": "planner", "provider": "test", "execution_supported": True},
@@ -471,3 +526,47 @@ async def test_cao_parent_can_call_one_bounded_worker(tmp_path):
         assert cao.parent_calls == 2
         assert len(cao.worker_calls) == 1
         assert done["results"]["response"]["worker_results"][0]["output"] == "İşçi özeti"
+
+
+@pytest.mark.asyncio
+async def test_completion_records_deliverable_notification_and_metric(tmp_path):
+    from manager.metrics import MetricsStore
+    from manager.notifications import NotificationManager
+    from manager.work_record import WorkRecordManager
+
+    work = WorkRecordManager(tmp_path / "work.sqlite")
+    await work.open()
+    notifications = NotificationManager(tmp_path / "notifications.sqlite")
+    await notifications.open()
+    metrics = MetricsStore(tmp_path / "metrics.sqlite")
+    await metrics.open()
+    try:
+        async with engine_at(tmp_path, FakeProviders()) as engine:
+            engine.attach_infrastructure(work=work, notifications=notifications, metrics=metrics)
+            created = await engine.create(request(mode="chat", allow_writes=True))
+            done = await settle(engine, created["id"])
+            assert done["status"] == "completed", done.get("error")
+
+            item = await work.by_run(done["id"])
+            assert item is not None
+            assert item["goal"] == created["prompt"]
+            deliverables = await work.list_deliverables(item["id"])
+            assert len(deliverables) == 1
+            assert deliverables[0]["version"] == 1
+            assert deliverables[0]["evidence"]
+            assert deliverables[0]["run_id"] == done["id"]
+
+            notes = await notifications.list()
+            assert [note["kind"] for note in notes] == ["delivery"]
+
+            summary = await metrics.summary()
+            assert summary["record_count"] == 1
+            assert summary["models"][0]["successes"] == 1
+
+            await engine.record_delivery(done, "same execution again")
+            assert len(await work.list_deliverables(item["id"])) == 1
+            assert (await metrics.summary())["record_count"] == 1
+    finally:
+        await metrics.close()
+        await notifications.close()
+        await work.close()

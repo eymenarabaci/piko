@@ -10,6 +10,7 @@ import threading
 import uuid
 
 from .schema import RunRequest
+from .scheduling import event_key, missed_run, proactive_decision
 
 TEMPLATES = [
     {
@@ -232,6 +233,15 @@ class TriggerManager:
             self._save_atomic(store)
             return True
 
+    def _mark_event_key(self, trigger_id: str, value: str):
+        with self._lock:
+            store = self._load()
+            for t in store.get("triggers", []):
+                if t.get("id") == trigger_id:
+                    t["last_event_key"] = value
+                    break
+            self._save_atomic(store)
+
     def record_run_start(self, trigger_id: str, run_id: str):
         with self._lock:
             store = self._load()
@@ -278,7 +288,7 @@ class TriggerManager:
             pass
         return max_m
 
-    async def execute_trigger(self, trigger: dict) -> str | None:
+    async def execute_trigger(self, trigger: dict, *, reason: str = "") -> str | None:
         if not self.engine:
             return None
         t_id = trigger.get("id")
@@ -302,7 +312,7 @@ class TriggerManager:
                             run_id,
                             "proactive_trigger_fired",
                             f"Proaktif tetikleyici '{trigger.get('name')}' otonom olarak devreye girdi.",
-                            {"trigger_id": t_id, "type": trigger.get("type")}
+                            {"trigger_id": t_id, "type": trigger.get("type"), "reason": reason or "Zamanlanmış çalışma zamanı geldi."}
                         )
                     except Exception:
                         pass
@@ -344,7 +354,12 @@ class TriggerManager:
                         next_dt = _parse_iso(t.get("next_run_at"))
                         if next_dt is None or now_dt >= next_dt:
                             if t.get("last_status") != "running":
-                                await self.execute_trigger(t)
+                                decision = missed_run(t, now=now_dt)
+                                if decision.get("missed") and not decision.get("should_run", True):
+                                    await self.execute_trigger(
+                                        t, reason="Kaçırılan çalışma çok eski; bir kez telafi edildi.")
+                                else:
+                                    await self.execute_trigger(t, reason=decision.get("reason", ""))
 
                     # One-shot check: mark consumed at run start; never repeat.
                     elif t_type == "once":
@@ -376,9 +391,20 @@ class TriggerManager:
                         elif state["change_detected_at"] is not None:
                             # Quiet period elapsed?
                             if (now_ts - state["change_detected_at"]) >= debounce_sec:
+                                event_key_value = event_key(
+                                    "file_watch", ws_key, f"{current_max_mtime:.3f}")
+                                already_seen = t.get("last_event_key") == event_key_value
                                 state["change_detected_at"] = None
-                                if t.get("last_status") != "running":
-                                    await self.execute_trigger(t)
+                                if not already_seen and t.get("last_status") != "running":
+                                    decision = proactive_decision(
+                                        {"kind": "file_watch", "id": ws_key,
+                                         "version": f"{current_max_mtime:.3f}"},
+                                        {"enabled": True, "quiet_start": "00:00",
+                                         "quiet_end": "00:00"},
+                                        now=now_dt)
+                                    await self.execute_trigger(
+                                        t, reason=decision.get("reason", "Dosya değişikliği algılandı."))
+                                    self._mark_event_key(t_id, event_key_value)
 
             except Exception:
                 pass

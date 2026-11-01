@@ -63,7 +63,8 @@ const state = {
   fingerprint: '', polling: false, settings: {},
   personasData: { personas: [], skills: [], mcps: [] },
   activeTerminalId: null, runTokens: 0,
-  projects: [], activeProject: null, pendingAttachments: [], conversationRuns: [], runTokenTotals: {}
+  projects: [], activeProject: null, pendingAttachments: [], conversationRuns: [], runTokenTotals: {},
+  view: 'piko', notifications: [], notificationsAt: 0
 };
 
 const MAX_ATTACHMENT_BYTES = 6000000;
@@ -1119,6 +1120,8 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
 function renderRun() {
   const run = state.run;
   const container = $('#run-content');
+  updateMascot(run);
+  if (run?.id && !workState.jobs[run.id] && !workState.loading[run.id]) loadWorkForRun(run);
   $('#welcome').hidden = !!state.selectedId;
   container.hidden = !state.selectedId;
 
@@ -1220,6 +1223,7 @@ function renderRun() {
     renderRunMessages(planRun, section, questionDrafts);
     container.append(section);
   }
+  renderWorkPanel(run, container);
   if (false) {
   container.replaceChildren();
 
@@ -1370,7 +1374,7 @@ function renderInspector() {
   const previousScroll = container.scrollTop;
   container.replaceChildren();
   const run = inspectedPlan();
-  const tabNames = {flow: 'Plan', output: 'Çıktılar', terminals: 'Ajanlar', personas: 'Uzmanlıklar', chat: 'Sohbet', events: 'Etkinlik'};
+  const tabNames = {flow: 'Plan', output: 'Çıktılar', terminals: 'Ajanlar', personas: 'Uzmanlıklar', chat: 'Sohbet', events: 'Etkinlik', work: 'İş kaydı'};
   const moreLabel = $('#inspector-more-label');
   if (moreLabel) moreLabel.textContent = ['flow', 'output'].includes(state.tab) ? 'Diğer' : tabNames[state.tab] || 'Diğer';
 
@@ -1688,6 +1692,42 @@ function renderInspector() {
       if (event.created_at) time.dateTime = event.created_at;
       item.append(time, node('div', '', event.message || event.kind));
       container.append(item);
+    }
+
+  // 7. İŞ KAYDI TAB
+  } else if (state.tab === 'work') {
+    const job = workState.jobs[run.id];
+    container.append(node('h3', 'inspector-title', 'İş kaydı ve denetim'));
+    if (!job?.work) {
+      container.append(node('p', 'empty-note', 'Bu iş için kalıcı kayıt henüz yüklenmedi.'));
+      loadWorkForRun(run);
+    } else {
+      const work = job.work;
+      const card = node('div', 'work-status-card');
+      card.append(node('b', '', 'Hedef'), node('div', '', work.goal || ''));
+      card.append(node('b', '', 'Durum'), node('div', '', `${work.status} · öncelik: ${work.priority}`));
+      if (work.due_at) card.append(node('b', '', 'Son tarih'), node('div', '', new Date(work.due_at).toLocaleString('tr-TR')));
+      if (work.dependencies?.length) card.append(node('b', '', 'Bağımlılıklar'), node('div', '', work.dependencies.join(', ')));
+      card.append(node('div', 'work-next', `Sıradaki adım: ${work.next_action || '—'}`));
+      container.append(card);
+
+      container.append(node('h3', 'inspector-title', 'Teslim sürümleri'));
+      if (!job.deliverables?.length) container.append(node('p', 'empty-note', 'Henüz teslim kaydı yok.'));
+      for (const deliverable of job.deliverables || []) {
+        const item = node('div', 'worker-card');
+        item.append(node('div', 'worker-card-title', `${deliverable.title} · v${deliverable.version}`));
+        item.append(node('small', '', deliverable.summary || ''));
+        item.append(node('div', 'worker-meta', `${deliverable.status}${deliverable.parent_version ? ' · v' + deliverable.parent_version + ' üzerinden' : ''}`));
+        container.append(item);
+      }
+
+      const audit = node('div', 'worker-card');
+      audit.append(node('div', 'worker-card-title', 'Ajanlar ve modeller'));
+      for (const step of run.plan?.steps || []) {
+        const result = run.results?.[step.id] || {};
+        audit.append(node('small', '', `${step.title}: ${result.status || 'bekliyor'} · ${result.model_id || step.model_id || 'auto'}${result.independent_review ? ' · denetim: ' + (result.independent_review.status || result.independent_review.verdict || 'var') : ''}`));
+      }
+      container.append(audit);
     }
   }
 
@@ -2359,7 +2399,7 @@ async function pollEvents(generation = state.generation) {
     state.events = state.events.slice(-150);
   }
   state.cursor = data.cursor ?? state.cursor;
-  if (state.tab === 'events') renderInspector();
+  if (state.tab === 'events' || state.tab === 'work') renderInspector();
 }
 
 function schedulePoll(delay = 1000) {
@@ -2379,6 +2419,10 @@ async function poll() {
     renderRun();
     fetchRunTokens(id);
     await pollEvents(generation);
+    if (!state.notificationsAt || Date.now() - state.notificationsAt > 8000) {
+      state.notificationsAt = Date.now();
+      refreshNotifications();
+    }
     connected(true);
   } catch (error) {
     if (generation === state.generation) {
@@ -2816,21 +2860,35 @@ $('#composer').addEventListener('submit', async event => {
   const attachments = attachmentIds();
   const prompt = $('#prompt').value.trim() || (attachments.length ? 'Eklediğim dosyaları incele ve özetle.' : '');
   if (!prompt) return;
+  let startFresh = false;
   if (state.run && activeStatuses.has(state.run.status)) {
-    if (attachments.length) { toast('Çalışan göreve ek talimatta dosya eki desteklenmiyor.'); return; }
-    setBusy(true);
-    try {
-      await submitActiveInstruction(state.run, prompt, $('#instruction-delivery').value);
+    if (/^(neredesin|nerede|ne durumda|durum ne|nerelere geldin)\b/i.test(prompt.trim())) {
       $('#prompt').value = '';
-    } catch (error) { toast(errorText(error)); }
-    finally { setBusy(false); }
-    return;
+      await answerWhere(state.run);
+      return;
+    }
+    if (attachments.length) { toast('Çalışan göreve ek talimatta dosya eki desteklenmiyor.'); return; }
+    let delivery = 'amend';
+    if (looksLikeNewRequest(prompt)) {
+      delivery = await askNewOrCorrection();
+      if (delivery === null) return;
+    }
+    if (delivery === 'amend') {
+      setBusy(true);
+      try {
+        await submitActiveInstruction(state.run, prompt, $('#instruction-delivery').value);
+        $('#prompt').value = '';
+      } catch (error) { toast(errorText(error)); }
+      finally { setBusy(false); }
+      return;
+    }
+    startFresh = true;
   }
   if (!state.bootstrap) {
     toast('Önce yerel sunucu bağlantısının kurulmasını bekleyin.');
     return;
   }
-  const previousId = state.selectedId;
+  const previousId = startFresh ? '' : state.selectedId;
   const clientRunId = crypto.randomUUID().replaceAll('-', '');
   const requestedModel = $('#chat-model').value;
   const generation = ++state.generation;
@@ -2948,6 +3006,7 @@ $$('[data-page]').forEach(el => el.addEventListener('click', () => setPage(el.da
 $$('[data-tab]').forEach(el => el.addEventListener('click', () => {
   state.tab = el.dataset.tab;
   el.closest('details')?.removeAttribute('open');
+  if (state.tab === 'work' && state.run) loadWorkForRun(state.run);
   renderInspector();
 }));
 $$('[data-example]').forEach(el => el.addEventListener('click', () => {
@@ -3144,6 +3203,8 @@ async function initialize() {
     connected(true);
     $('#version-label').textContent = `Piko ${state.bootstrap.version || ''}`;
     applySettings();
+    bindWorkUi();
+    refreshNotifications();
     await fetchProjects();
     populateModels();
     await loadPersonas();
@@ -3178,3 +3239,333 @@ initialize().finally(() => {
     sessionStorage.removeItem('agent-manager-update-attachments');
   } catch {}
 });
+
+/* ---------- Ortak iş kaydı, teslim masası, bildirimler ve görünüm ---------- */
+const workState = { jobs: {}, loading: {} };
+
+const mascotStates = {
+  working: ['queued', 'planning', 'running', 'waiting_quota'],
+  waiting: ['planned', 'awaiting_user_test', 'awaiting_review'],
+  blocked: ['failed', 'interrupted'],
+  done: ['completed']
+};
+
+function applyView(view = state.view || 'piko') {
+  state.view = view === 'developer' ? 'developer' : 'piko';
+  document.body.classList.toggle('view-piko', state.view === 'piko');
+  document.body.classList.toggle('view-developer', state.view === 'developer');
+  $('#view-piko')?.classList.toggle('active', state.view === 'piko');
+  $('#view-dev')?.classList.toggle('active', state.view === 'developer');
+  $('#view-piko')?.setAttribute('aria-pressed', String(state.view === 'piko'));
+  $('#view-dev')?.setAttribute('aria-pressed', String(state.view === 'developer'));
+  save('piko-view', state.view);
+  if (state.view === 'developer') {
+    $('#inspector')?.classList.add('open');
+    $('#toggle-inspector')?.setAttribute('aria-expanded', 'true');
+  }
+}
+
+function mascotState(run) {
+  if (!run) return { state: 'idle', label: 'Hazır' };
+  const status = run.status;
+  if (mascotStates.done.includes(status)) return { state: 'done', label: 'Tamamlandı' };
+  if (mascotStates.blocked.includes(status)) return { state: 'blocked', label: 'Müdahale gerekiyor' };
+  if (status === 'awaiting_user_test') return { state: 'waiting', label: 'Test yanıtı bekliyor' };
+  if (mascotStates.waiting.includes(status)) return { state: 'waiting', label: 'Onay bekliyor' };
+  if (mascotStates.working.includes(status)) {
+    return { state: 'working', label: run.current_steps?.length ? 'Ajanlar çalışıyor' : 'Çalışıyor' };
+  }
+  return { state: 'idle', label: statusLabels[status] || 'Hazır' };
+}
+
+function updateMascot(run) {
+  const mascot = $('#piko-mascot');
+  if (!mascot) return;
+  const info = mascotState(run);
+  mascot.dataset.state = info.state;
+  mascot.setAttribute('aria-label', `Piko durumu: ${info.label}`);
+  const label = $('#mascot-label');
+  if (label) label.textContent = info.label;
+}
+
+async function loadWorkForRun(run) {
+  if (!run?.id || workState.loading[run.id]) return;
+  workState.loading[run.id] = true;
+  try {
+    const list = await api('/api/work?limit=200');
+    const linked = (list.items || []).find(item => item.run_id === run.id)
+      || (list.items || []).find(item => item.conversation_id === (run.conversation_id || run.id));
+    if (!linked) return;
+    const data = await api(`/api/work/${encodeURIComponent(linked.id)}`);
+    workState.jobs[run.id] = data;
+    if (state.run?.id === run.id) {
+      state.fingerprint = '';
+      renderRun();
+    }
+  } catch {} finally {
+    workState.loading[run.id] = false;
+  }
+}
+
+function decisionWaiting(work) {
+  return (work?.decisions || []).find(item => item.status === 'waiting');
+}
+
+function deliveryCard(deliverable) {
+  const card = node('article', 'delivery-card');
+  const head = node('div', 'delivery-card-head');
+  const title = node('div', '');
+  title.append(node('b', '', deliverable.title || 'Teslim'), node('span', 'delivery-version', `v${deliverable.version}`));
+  const labels = {
+    accepted: 'Kabul edildi', repair_requested: 'Düzeltme istendi',
+    test_failed: 'Test başarısız', test_passed: 'Test geçti', test_pending: 'Test bekleniyor'
+  };
+  head.append(title, node('span', `status-badge status-${deliverable.status}`,
+    labels[deliverable.status] || 'İncelemeye hazır'));
+  card.append(head);
+  card.append(node('div', 'delivery-summary', deliverable.summary || ''));
+  if (deliverable.requirements?.length) {
+    const block = node('div', 'delivery-section');
+    block.append(node('strong', '', 'Karşılanan gereksinimler'));
+    const list = node('ul', '');
+    for (const item of deliverable.requirements) list.append(node('li', '', item));
+    block.append(list);
+    card.append(block);
+  }
+  const details = node('details', 'delivery-details technical');
+  details.append(node('summary', 'details-toggle', 'Ayrıntıları göster'));
+  if (deliverable.evidence?.length) {
+    const block = node('div', 'delivery-section');
+    block.append(node('strong', '', 'Doğrulama kanıtları'));
+    const list = node('ul', '');
+    for (const item of deliverable.evidence) list.append(node('li', '', item));
+    block.append(list);
+    details.append(block);
+  }
+  if (deliverable.open_points?.length) {
+    const block = node('div', 'delivery-section');
+    block.append(node('strong', '', 'Açık kalan noktalar'));
+    const list = node('ul', '');
+    for (const item of deliverable.open_points) list.append(node('li', '', item));
+    block.append(list);
+    details.append(block);
+  }
+  if (deliverable.files?.length) {
+    const block = node('div', 'delivery-section');
+    block.append(node('strong', '', 'Dosyalar'));
+    for (const file of deliverable.files) block.append(node('div', '', String(file)));
+    details.append(block);
+  }
+  if (details.children.length > 1) card.append(details);
+
+  const actions = node('div', 'delivery-actions');
+  if (deliverable.status !== 'accepted') {
+    actions.append(button('Kabul et', 'primary-button', () => actOnDelivery(deliverable, 'accept')));
+  }
+  actions.append(button('Düzeltme iste', 'outline-button', () => actOnDelivery(deliverable, 'repair')));
+  actions.append(button('Test sonucu bildir', 'outline-button', () => actOnDelivery(deliverable, 'test')));
+  card.append(actions);
+  return card;
+}
+
+async function actOnDelivery(deliverable, action) {
+  let body = {};
+  if (action === 'repair' || action === 'test') {
+    const note = window.prompt(action === 'repair' ? 'Neyin düzeltilmesini istiyorsunuz?' : 'Test sonucunuzu kısaca yazın (geçti/kaldı ayrıntısı).', '');
+    if (note === null) return;
+    if (!note.trim()) { toast('Kısa bir açıklama gerekli.'); return; }
+    body.note = note.trim();
+    if (action === 'test') body.passed = !/kald[ıi]|ba[şs]ar[ıi]s[ıi]z|hata|çalışm[ıi]yor/i.test(note);
+  }
+  try {
+    await api(`/api/deliverables/${encodeURIComponent(deliverable.id)}/${action}`, {
+      method: 'POST', body: JSON.stringify(body)
+    });
+    toast(action === 'accept' ? 'Teslim kabul edildi.'
+      : action === 'repair' ? 'Düzeltme isteği kaydedildi.' : 'Test sonucu kaydedildi.');
+    if (state.run) {
+      delete workState.jobs[state.run.id];
+      await loadWorkForRun(state.run);
+    }
+    refreshNotifications();
+  } catch (error) { toast(errorText(error)); }
+}
+
+function renderWorkPanel(run, container) {
+  if (!run || run.id !== state.run?.id) return;
+  const job = workState.jobs[run.id];
+  if (!job?.work) return;
+  const work = job.work;
+  const panel = node('article', 'message-bubble plan-overview-bubble work-panel');
+  const head = node('div', 'plan-overview-head');
+  const identity = node('div', 'plan-identity');
+  identity.append(node('span', 'plan-emblem', '^'), node('b', '', work.title || 'İş kaydı'));
+  const workLabel = work.status === 'done' ? 'Tamamlandı' : work.status === 'blocked'
+    ? 'Engellendi' : work.status === 'waiting' ? 'Bekliyor' : 'Sürüyor';
+  head.append(identity, node('span', `status-badge status-${work.status}`, workLabel));
+  panel.append(head);
+
+  const info = node('div', 'work-status-card');
+  info.append(node('b', '', 'Ne istendi'), node('div', '', work.goal || ''));
+  info.append(node('b', '', 'Ne yapıldı'), node('div', '', work.last_result || 'Henüz sonuç yok.'));
+  info.append(node('div', 'work-next', `Sıradaki adım: ${work.next_action || 'Teslimi incele.'}`));
+  if (work.due_at) info.append(node('div', '', `Son tarih: ${new Date(work.due_at).toLocaleString('tr-TR')}`));
+  panel.append(info);
+
+  const decision = decisionWaiting(work);
+  if (decision) {
+    const form = node('form', 'user-test-request');
+    form.append(node('strong', '', 'Piko sizden karar bekliyor'), node('p', '', decision.question));
+    const answer = node('textarea', 'user-test-answer');
+    answer.rows = 2;
+    answer.required = true;
+    form.append(answer, button('Kararı gönder', 'primary-button'));
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      if (!answer.value.trim()) return;
+      try {
+        await api(`/api/work/${encodeURIComponent(work.id)}/decisions/${encodeURIComponent(decision.id)}/answer`, {
+          method: 'POST', body: JSON.stringify({answer: answer.value.trim()})
+        });
+        toast('Karar kaydedildi.');
+        delete workState.jobs[run.id];
+        await loadWorkForRun(run);
+        refreshNotifications();
+      } catch (error) { toast(errorText(error)); }
+    });
+    panel.append(form);
+  }
+
+  for (const deliverable of (job.deliverables || []).slice(-2)) panel.append(deliveryCard(deliverable));
+  container.append(panel);
+}
+
+function notificationItem(item) {
+  const card = node('article', `notification-item${item.read ? '' : ' unread'}`);
+  card.append(node('b', '', item.title || item.kind));
+  if (item.body) card.append(node('p', '', item.body));
+  card.append(node('time', '', new Date(item.created_at).toLocaleString('tr-TR')));
+  if (!item.read) {
+    card.append(button('Okundu', 'outline-button', async () => {
+      try {
+        await api(`/api/notifications/${encodeURIComponent(item.id)}/read`, {method: 'POST', body: '{}'});
+        refreshNotifications();
+        openNotifications();
+      } catch (error) { toast(errorText(error)); }
+    }));
+  }
+  return card;
+}
+
+async function refreshNotifications() {
+  try {
+    const data = await api('/api/notifications?unread=1');
+    state.notifications = data.items || [];
+    const count = state.notifications.length;
+    const badge = $('#notification-count');
+    badge.hidden = count === 0;
+    badge.textContent = String(count);
+    $('#notification-button').classList.toggle('has-unread', count > 0);
+  } catch {}
+}
+
+async function openNotifications() {
+  const dialog = $('#notifications-dialog');
+  try {
+    const [data, prefs] = await Promise.all([
+      api('/api/notifications'),
+      api('/api/notifications/preferences')
+    ]);
+    const list = $('#notification-list');
+    list.replaceChildren();
+    for (const item of data.items || []) list.append(notificationItem(item));
+    $('#notification-empty').hidden = (data.items || []).length > 0;
+    $('#notif-enabled').value = prefs.enabled ? '1' : '0';
+    $('#notif-severity').value = prefs.min_severity || 'low';
+    $('#notif-quiet-start').value = prefs.quiet_start || '22:00';
+    $('#notif-quiet-end').value = prefs.quiet_end || '08:00';
+    $('#notif-timezone').value = prefs.timezone || '';
+    dialog.showModal();
+  } catch (error) { toast(errorText(error)); }
+}
+
+function whereSummary(job) {
+  const work = job?.work;
+  if (!work) return 'Şu anda kayıtlı bir işim yok. Yeni bir hedef verirsen planlayıp başlayabilirim.';
+  const latest = (job.deliverables || []).slice(-1)[0];
+  const parts = [
+    `İş: ${work.title || work.goal}`,
+    `Durum: ${work.status === 'done' ? 'tamamlandı' : work.status === 'waiting' ? 'bekliyor' : work.status === 'blocked' ? 'engellendi' : 'sürüyor'}`,
+    latest ? `Son teslim: v${latest.version} - ${latest.summary}` : '',
+    `Sıradaki adım: ${work.next_action || 'Teslimi incele.'}`
+  ].filter(Boolean);
+  return parts.join('\n');
+}
+
+async function answerWhere(run) {
+  if (!run?.id) return false;
+  let job = workState.jobs[run.id];
+  if (!job) { await loadWorkForRun(run); job = workState.jobs[run.id]; }
+  const bubble = node('article', 'message-bubble chat-bubble-assistant where-answer');
+  const body = node('div', 'markdown-body');
+  body.textContent = whereSummary(job);
+  bubble.append(node('div', 'chat-bubble-head', '^ Piko'), body);
+  $('#run-content')?.append(bubble);
+  return true;
+}
+
+function looksLikeNewRequest(message) {
+  const text = message.trim().toLocaleLowerCase('tr');
+  return /^(yeni|ayrıca|ayri|bundan bağımsız|farklı bir iş|yeni görev|yeni iş)/.test(text)
+    || /(yeni bir görev|yeni bir iş|ayrı bir görev|ayrı bir iş|bundan bağımsız)/.test(text);
+}
+
+function askNewOrCorrection() {
+  return new Promise(resolve => {
+    const dialog = $('#choice-dialog');
+    const finish = value => {
+      dialog.removeEventListener('close', onClose);
+      if (dialog.open) dialog.close();
+      resolve(value);
+    };
+    const onClose = () => resolve(null);
+    $('#choice-amend').onclick = () => finish('amend');
+    $('#choice-new').onclick = () => finish('new');
+    $('#choice-cancel').onclick = () => finish(null);
+    dialog.addEventListener('close', onClose, {once: true});
+    dialog.showModal();
+  });
+}
+
+function bindWorkUi() {
+  applyView(load('piko-view', 'piko'));
+  $('#view-piko')?.addEventListener('click', () => applyView('piko'));
+  $('#view-dev')?.addEventListener('click', () => applyView('developer'));
+  $('#notification-button')?.addEventListener('click', openNotifications);
+  $('#close-notifications')?.addEventListener('click', () => $('#notifications-dialog').close());
+  $('#notification-read-all')?.addEventListener('click', async () => {
+    try {
+      await api('/api/notifications/read-all', {method: 'POST', body: '{}'});
+      toast('Bildirimler okundu.');
+      await openNotifications();
+      refreshNotifications();
+    } catch (error) { toast(errorText(error)); }
+  });
+  $('#notification-preferences-form')?.addEventListener('submit', async event => {
+    event.preventDefault();
+    try {
+      await api('/api/notifications/preferences', {
+        method: 'PUT',
+        body: JSON.stringify({
+          enabled: $('#notif-enabled').value === '1',
+          min_severity: $('#notif-severity').value,
+          quiet_start: $('#notif-quiet-start').value || '22:00',
+          quiet_end: $('#notif-quiet-end').value || '08:00',
+          timezone: $('#notif-timezone').value.trim()
+        })
+      });
+      toast('Bildirim tercihleri kaydedildi.');
+      refreshNotifications();
+    } catch (error) { toast(errorText(error)); }
+  });
+}

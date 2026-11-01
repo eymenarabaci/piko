@@ -22,16 +22,22 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from .engine import Engine
 from .ao import AOClient
 from .attachments import AttachmentStore, MAX_REQUEST_BYTES, attachment_prompt, validate_for_model
+from .integrations import IntegrationGate
+from .metrics import MetricsStore
 from .model_router import NoEligibleModel, infer_role
+from .notifications import NotificationManager
+from .operations import OperationLedger
 from .projects import ProjectManager
 from .processes import _record
 from .providers import Providers
 from .outcomes import ensure_usable_result, is_infrastructure_error
 from .schema import Plan, RunRequest
 from .request_routing import classify_with_model
+from .scheduling import missed_run, ordered_work
 from .store import Store, now
 from .triggers import TriggerManager
 from .updates import Updater, UpdateError
+from .work_record import WorkRecordManager
 from .worker_catalog import list_workers
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -136,6 +142,24 @@ def create_app(data_dir=None, providers=None):
                 engine = Engine(store, saver, provider_set, ROOT)
                 app.state.engine = engine
                 app.state.project_memory = engine.project_memory
+                work = WorkRecordManager(data_dir / "work.sqlite")
+                await work.open()
+                notifications = NotificationManager(data_dir / "notifications.sqlite")
+                await notifications.open()
+                ledger = OperationLedger(data_dir / "operations.sqlite")
+                await ledger.open()
+                metrics = MetricsStore(data_dir / "metrics.sqlite")
+                await metrics.open()
+                integrations = IntegrationGate(data_dir, engine.default_workspace, ledger=ledger)
+                await integrations.open()
+                app.state.work = work
+                app.state.notifications = notifications
+                app.state.ledger = ledger
+                app.state.metrics = metrics
+                app.state.integrations = integrations
+                engine.attach_infrastructure(work=work, notifications=notifications,
+                                             ledger=ledger, metrics=metrics,
+                                             integrations=integrations)
                 triggers = TriggerManager(data_dir, engine)
                 app.state.triggers = triggers
                 daemon_task = asyncio.create_task(triggers.run_daemon())
@@ -146,6 +170,11 @@ def create_app(data_dir=None, providers=None):
                     await triggers.stop_daemon()
                     daemon_task.cancel()
                     await engine.close()
+                    for manager in (integrations, metrics, ledger, notifications, work):
+                        try:
+                            await manager.close()
+                        except Exception:
+                            pass
         finally:
             await store.close()
 
@@ -296,7 +325,212 @@ def create_app(data_dir=None, providers=None):
                 "skills": engine.persona_mgr.list_skills(),
                 "workers": list_workers(),
                 "daily_tokens": await engine.optimizer.get_daily_total(),
-                "workspace_default": str(ROOT)}
+                "workspace_default": str(ROOT),
+                "features": {"work_records": True, "notifications": True,
+                             "deliverables": True, "developer_view": True}}
+
+    @app.get("/api/work")
+    async def list_work(status: str = "", conversation_id: str = "", limit: int = 100):
+        return {"items": await app.state.work.list(status=status,
+                                                  conversation_id=conversation_id,
+                                                  limit=limit)}
+
+    @app.post("/api/work", status_code=201)
+    async def create_work(request: Request):
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "JSON nesnesi gerekli.")
+        try:
+            item = await app.state.work.create(
+                body.get("goal", ""), title=body.get("title", ""),
+                conversation_id=body.get("conversation_id", ""),
+                run_id=body.get("run_id", ""),
+                requirements=body.get("requirements", ()),
+                acceptance=body.get("acceptance", ()),
+                priority=body.get("priority", "normal"),
+                due_at=body.get("due_at", ""),
+                dependencies=body.get("dependencies", ()),
+                next_action=body.get("next_action", ""))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return item
+
+    @app.get("/api/workboard/order")
+    async def work_order():
+        items = await app.state.work.list(limit=200)
+        ordered = ordered_work(items)
+        return {"items": ordered}
+
+    @app.get("/api/work/{work_id}")
+    async def get_work(work_id: str):
+        item = await app.state.work.get(work_id)
+        if item is None:
+            raise HTTPException(404, "İş kaydı bulunamadı.")
+        return {"work": item,
+                "deliverables": await app.state.work.list_deliverables(work_id),
+                "summary": await app.state.work.summary(work_id)}
+
+    @app.put("/api/work/{work_id}")
+    async def update_work(work_id: str, request: Request):
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "JSON nesnesi gerekli.")
+        try:
+            return await app.state.work.update(work_id, **body)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/work/{work_id}/decisions", status_code=201)
+    async def add_work_decision(work_id: str, request: Request):
+        body = await request.json()
+        try:
+            decision = await app.state.work.add_decision(
+                work_id, body.get("question", ""), options=body.get("options", ()))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        await app.state.notifications.notify(
+            "decision", "Karar bekleniyor", body.get("question", "")[:400],
+            work_id=work_id, dedupe_key=f"decision:{decision['id']}", severity="high")
+        return decision
+
+    @app.post("/api/work/{work_id}/decisions/{decision_id}/answer")
+    async def answer_work_decision(work_id: str, decision_id: str, request: Request):
+        body = await request.json()
+        try:
+            return await app.state.work.answer_decision(work_id, decision_id,
+                                                        body.get("answer", ""))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/work/{work_id}/deliverables", status_code=201)
+    async def add_deliverable(work_id: str, request: Request):
+        body = await request.json()
+        try:
+            return await app.state.work.add_deliverable(
+                work_id, run_id=body.get("run_id", ""), title=body.get("title", ""),
+                kind=body.get("kind", "report"), summary=body.get("summary", ""),
+                requirements=body.get("requirements", ()),
+                evidence=body.get("evidence", ()),
+                open_points=body.get("open_points", ()),
+                files=body.get("files", ()),
+                idempotency_key=body.get("idempotency_key", ""))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/deliverables/{deliverable_id}/accept")
+    async def accept_deliverable(deliverable_id: str, request: Request):
+        body = await request.json() if request.headers.get("content-length", "0") not in {"0", ""} else {}
+        try:
+            deliverable = await app.state.work.accept(deliverable_id,
+                                                      str((body or {}).get("note", "")))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        await app.state.metrics.record(
+            work_id=deliverable["work_id"], run_id=deliverable["run_id"],
+            task_kind="delivery", success=True, user_acceptance="accepted")
+        return deliverable
+
+    @app.post("/api/deliverables/{deliverable_id}/repair")
+    async def repair_deliverable(deliverable_id: str, request: Request):
+        body = await request.json()
+        try:
+            deliverable = await app.state.work.request_repair(
+                deliverable_id, str((body or {}).get("note", "")))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        await app.state.metrics.record(
+            work_id=deliverable["work_id"], run_id=deliverable["run_id"],
+            task_kind="delivery", success=False, repairs=1, user_acceptance="rejected")
+        return deliverable
+
+    @app.post("/api/deliverables/{deliverable_id}/test")
+    async def test_deliverable(deliverable_id: str, request: Request):
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("passed"), bool):
+            raise HTTPException(400, "passed alanı boolean olmalı.")
+        try:
+            deliverable = await app.state.work.record_test(
+                deliverable_id, body["passed"], str(body.get("note", "")))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        await app.state.metrics.record(
+            work_id=deliverable["work_id"], run_id=deliverable["run_id"],
+            task_kind="delivery", success=body["passed"],
+            executed_test="pass" if body["passed"] else "fail")
+        return deliverable
+
+    @app.get("/api/notifications")
+    async def list_notifications(unread: int = 0, include_suppressed: int = 0):
+        items = await app.state.notifications.list(
+            unread_only=bool(unread), include_suppressed=bool(include_suppressed))
+        return {"items": items, "unread": sum(1 for item in items if not item["read"])}
+
+    @app.post("/api/notifications/{notification_id}/read")
+    async def read_notification(notification_id: str):
+        try:
+            return await app.state.notifications.mark_read(notification_id)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.post("/api/notifications/read-all")
+    async def read_all_notifications():
+        return {"updated": await app.state.notifications.mark_all_read()}
+
+    @app.get("/api/notifications/preferences")
+    async def get_notification_preferences():
+        return await app.state.notifications.get_preferences()
+
+    @app.put("/api/notifications/preferences")
+    async def set_notification_preferences(request: Request):
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "JSON nesnesi gerekli.")
+        try:
+            return await app.state.notifications.set_preferences(**body)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/api/operations")
+    async def list_operations(limit: int = 100):
+        return {"items": await app.state.ledger.list(limit=limit)}
+
+    @app.get("/api/metrics")
+    async def get_metrics(task_kind: str = ""):
+        return await app.state.metrics.summary(task_kind=task_kind)
+
+    @app.get("/api/integrations")
+    async def list_integrations():
+        return {"services": app.state.integrations.registry()}
+
+    @app.post("/api/integrations/drafts", status_code=201)
+    async def create_integration_draft(request: Request):
+        body = await request.json()
+        try:
+            return await app.state.integrations.create_draft(
+                service=str(body.get("service", "")), target=body.get("target", ""),
+                content=body.get("content", ""), title=body.get("title", ""),
+                role=body.get("role", "implementer"),
+                workspace=body.get("workspace", ""))
+        except (ValueError, PermissionError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/integrations/drafts/{draft_id}/confirm")
+    async def request_integration_confirmation(draft_id: str):
+        try:
+            return await app.state.integrations.request_confirmation(draft_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/integrations/drafts/{draft_id}/apply")
+    async def apply_integration_draft(draft_id: str, request: Request):
+        body = await request.json()
+        try:
+            return await app.state.integrations.confirm_and_apply(
+                draft_id, str((body or {}).get("confirmation_id", "")),
+                content_hash=str((body or {}).get("content_hash", "")),
+                role=str((body or {}).get("role", "implementer")))
+        except (ValueError, PermissionError) as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.get("/api/update/status")
     async def update_status(request: Request):

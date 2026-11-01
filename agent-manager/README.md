@@ -82,6 +82,10 @@ Planlama, model atama, bağımlı/paralel yürütme, plan düzenleme, iptal, kal
 
 - `data/runs.sqlite`: iş/olay indeksi, asenkron SQLite + WAL.
 - `data/checkpoints.sqlite`: upstream LangGraph checkpoint kayıtları.
+- `data/work.sqlite`: kalıcı iş kaydı, bekleyen kararlar ve sürümlü teslimler.
+- `data/notifications.sqlite`: tekilleştirilmiş bildirimler ve tercihler (sessiz saat, saat dilimi).
+- `data/operations.sqlite`: dış işlem idempotency defteri ve token/süre/düzeltme bütçeleri.
+- `data/metrics.sqlite`: görev türü ve model bazında başarı, süre, maliyet, düzeltme; denetçi/test/kullanıcı kararları ayrı.
 - `work/resource-ledger.json`: sunucu ve CLI yardımcılarının kimlik/kapanma kayıtları; komut satırı ve prompt içermez.
 - Graphify, mevcut proje defterine **ek** kod ilişkisi bağlamı sağlar. `setup.cmd`, `graphifyy==0.9.97` paketini ayrı `.graphify-venv` ortamına kurar. Yerel AST grafiği `data/graphify/` altında arka planda hazırlanır; ilk tarama görevi bekletmez. Hazır sorgu sonucu plan ve adım bağlamına en fazla 1800 karakter olarak eklenir. Graphify kullanılamazsa proje defteri çalışmaya devam eder. Bağımlı adım çıktıları ayrı olarak kırpılır; tam çıktı görev kaydında kalır.
 - CLI stdout+stderr toplam sınırı 2 MiB. Beş saniyelik etkinlik olayları geçen süreyi ve alınan bayt sayısını gösterir. Yanıt metni CLI tamamlanınca gösterilir.
@@ -94,6 +98,13 @@ Planlama, model atama, bağımlı/paralel yürütme, plan düzenleme, iptal, kal
 .\.venv\Scripts\python.exe -m pytest -q --basetemp work/test-local
 .\.venv\Scripts\python.exe tests/smoke_cli.py
 node tests/browser-smoke.cjs
+$env:TEST_URL='http://127.0.0.1:8767'; node tests/ui-work-smoke.cjs
 ```
 
+`ui-work-smoke.cjs` iş kaydı, teslim kabulü, bildirim tercihleri, Piko/Geliştirici görünümü ve maskot durumunu gerçek model çağrısı yapmadan doğrular; sunucunun ayrı bir `AGENT_MANAGER_DATA` klasörüyle açılması önerilir. Playwright yolu `PLAYWRIGHT_MODULE` ile değiştirilebilir.
+
 CLI smoke gerçek sağlayıcı çağrısı yapar. Tarayıcı testi bu bilgisayardaki Playwright/Chrome yollarını kullanır; `TEST_URL` ile sunucu değiştirilebilir. Çıktılar ve ekran görüntüleri `work/visual/` altındadır. Kurulum sürümleri `requirements.lock.txt` ile sabittir. Araştırma gerekçesi `docs/UPSTREAM.md`, doğrulama sonuçları `docs/VALIDATION.md` içindedir.
+
+## Ortak iş kaydı, teslim ve bildirim
+
+Her görev kalıcı bir iş kaydına bağlanır (hedef, gereksinimler, kabul koşulları, öncelik, son tarih, bağımlılıklar, bekleyen kararlar). Sohbet uzasa veya Piko yeniden başlasa da "ne istendi / ne yapıldı / sıradaki adım" buradan okunur. Biten yürütme sürümlü bir teslim üretir; kullanıcı kabul eder, düzeltme ister veya test sonucu bildirir, önceki sürüm korunur. Teslim, engel, karar ve gecikme bildirimleri tekilleştirilir; sessiz saatte ertelenip pencere bitince bir kez teslim edilir. Arayüzde Piko (sade) ve Geliştirici (plan, ajan, terminal, iş kaydı) görünümleri aynı sohbeti korur; maskot gerçek motor durumunu yansıtır. Ayrıntılar `docs/WORKFLOW.md` içindedir.

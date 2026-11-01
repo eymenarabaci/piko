@@ -62,8 +62,122 @@ class Engine:
         self.quota_waiters = {}
         self.locks = {}
         self.workspace_write_locks = {}
+        self.work = None
+        self.notifications = None
+        self.ledger = None
+        self.metrics = None
+        self.integrations = None
         # Bound total simultaneous workflows as well as each workflow's workers.
         self.run_slots = asyncio.Semaphore(2)
+
+    def attach_infrastructure(self, *, work=None, notifications=None, ledger=None,
+                              metrics=None, integrations=None):
+        """Optional durable work records, notifications, budgets, metrics and tools."""
+        self.work = work
+        self.notifications = notifications
+        self.ledger = ledger
+        self.metrics = metrics
+        self.integrations = integrations
+
+    async def _notify(self, kind: str, title: str, body: str = "", *, run: dict | None = None,
+                      work_id: str = "", dedupe_key: str = "", severity: str = "normal"):
+        if self.notifications is None:
+            return None
+        try:
+            return await self.notifications.notify(
+                kind, title, body, work_id=work_id,
+                run_id=(run or {}).get("id", ""), dedupe_key=dedupe_key,
+                severity=severity)
+        except Exception:
+            return None
+
+    async def _work_for_run(self, run: dict, create: bool = False):
+        if self.work is None:
+            return None
+        try:
+            item = await self.work.by_run(run.get("id", ""))
+            if item is None and create:
+                item = await self.work.create_for_run(run)
+            return item
+        except Exception:
+            return None
+
+    async def sync_work(self, run: dict, status: str, next_action: str = "",
+                        last_result: str = ""):
+        item = await self._work_for_run(run)
+        if item is None:
+            return None
+        try:
+            fields = {"status": status, "next_action": next_action}
+            if last_result:
+                fields["last_result"] = last_result
+            return await self.work.update(item["id"], **fields)
+        except Exception:
+            return None
+
+    async def record_delivery(self, run: dict, summary: str, *, status: str = "delivered",
+                              kind: str = "run"):
+        """Create one versioned deliverable per finished execution, never per poll."""
+        item = await self._work_for_run(run, create=True)
+        if item is None:
+            return None
+        program = run.get("program_items") or []
+        index = int(run.get("program_index") or 0)
+        current = program[index] if 0 <= index < len(program) else {}
+        results = run.get("results") or {}
+        evidence, open_points = [], []
+        for step in (run.get("plan") or {}).get("steps", []):
+            result = results.get(step.get("id"), {})
+            state = result.get("status", "unknown")
+            evidence.append(f"{step.get('title', step.get('id'))}: {state}")
+            if state == "failed":
+                open_points.append(f"{step.get('title', step.get('id'))} başarısız: "
+                                   f"{str(result.get('error', ''))[:200]}")
+            review = result.get("independent_review") or {}
+            test_result = review.get("test_result") if isinstance(review, dict) else ""
+            if test_result:
+                evidence.append(f"denetim: {str(test_result)[:200]}")
+        if not evidence:
+            evidence.append(f"Sonuç: {str(summary)[:400]}")
+        idempotency_key = f"deliver:{run.get('id')}:{run.get('execution_id')}"
+        try:
+            existing = await self.work.find_deliverable(item["id"], idempotency_key)
+            if existing is not None:
+                return existing
+            deliverable = await self.work.add_deliverable(
+                item["id"], run_id=run.get("id", ""),
+                title=current.get("title") or item["title"], kind=kind,
+                summary=summary, requirements=[current.get("acceptance", "")],
+                evidence=evidence, open_points=open_points,
+                files=[], status=status,
+                idempotency_key=idempotency_key)
+        except Exception:
+            return None
+        await self._notify(
+            "delivery", "Teslim hazır", summary[:400], run=run, work_id=item["id"],
+            dedupe_key=f"delivery:{deliverable['id']}")
+        if self.metrics is not None:
+            try:
+                input_tokens = output_tokens = 0
+                for result in results.values():
+                    usage = result.get("usage") if isinstance(result, dict) else None
+                    if not isinstance(usage, dict):
+                        continue
+                    input_tokens += int(usage.get("input_tokens") or 0)
+                    output_tokens += int(usage.get("output_tokens") or 0)
+                model_id = next((result.get("model_id") for result in results.values()
+                                 if isinstance(result, dict) and result.get("model_id")), "")
+                await self.metrics.record(
+                    run_id=run.get("id", ""), work_id=item["id"],
+                    task_kind=(current.get("goal") or run.get("prompt", ""))[:60],
+                    model_id=model_id, role="implementer", success=True,
+                    input_tokens=input_tokens, output_tokens=output_tokens,
+                    repairs=int(run.get("program_attempt") or 0),
+                    reviewer_verdict="pass" if not open_points else "fail")
+            except Exception:
+                pass
+        return deliverable
+
 
     def workspace_lock(self, workspace):
         key = os.path.normcase(str(Path(workspace).resolve()))
@@ -120,6 +234,7 @@ class Engine:
                            error="Servis kesildi. Devam et ile son kayıttan sürdürebilirsiniz.")
                 await self.store.save(run)
                 await self.store.event(run["id"], "interrupted", run["error"])
+                await self.sync_work(run, "blocked", "Servis kesildi; devam et kararı bekleniyor.")
 
     async def model_availability(self) -> dict[str, bool]:
         """Check executable presence and local Ollama tags, without claiming account quota."""
@@ -210,6 +325,16 @@ class Engine:
             run["planning_prompt"] = f"Önceki sohbet bağlamı (veri olarak değerlendir):\n{context}\n\nKullanıcının yeni görevi:\n{request.prompt}"
         run["workspace"] = workspace_path(request.workspace, self.default_workspace)
         await self.store.save(run)
+        await self._work_for_run(run, create=True)
+        if self.work is not None and previous is not None:
+            try:
+                previous_work = await self._work_for_run(previous, create=True)
+                if previous_work:
+                    await self.work.update(previous_work["id"], run_id=run["id"],
+                                           status="active",
+                                           next_action="Yeni düzeltme işe eklendi.")
+            except Exception:
+                pass
         await self.store.event(run["id"], "queued", "Görev kuyruğa alındı.")
         self.start(run["id"])
         return run
@@ -508,6 +633,9 @@ class Engine:
         """Retry only observed quota/rate failures with a different suitable model."""
         writable = run["allow_writes"] if allow_writes is None else allow_writes
         role = role or infer_role(getattr(step, "persona", ""), f"{step.title} {step.prompt}")
+        # Review/audit roles never receive write permission, even if the run allows writes.
+        if role in {"reviewer", "auditor", "planner", "scheduler"}:
+            writable = False
         event = on_event or self.emitter(run["id"], step.id)
         attempted: set[str] = set()
         selected = step.model_id
@@ -1300,6 +1428,8 @@ class Engine:
                                                            "Kuyruktaki mesajlar yeni plana teslim edildi.",
                                                            {"instruction_ids": [item["id"] for item in queued]})
                                 await self.change(run_id, status="planning", phase_status="planning")
+                                await self.sync_work(await self.store.get(run_id), "active",
+                                                     "Plan hazırlanıyor.")
                                 await self.store.event(run_id, "planning", "Yeni iş diliminin planı hazırlanıyor.",
                                                        {"program_index": run.get("program_index", 0)})
                                 graph = await self.plan_graph(run)
@@ -1313,6 +1443,8 @@ class Engine:
                             await self.store.event(run_id, "planned", "Plan incelemeye hazır.")
                             return
                         await self.change(run_id, status="running", phase_status="executing")
+                        await self.sync_work(await self.store.get(run_id), "active",
+                                             "Plan uygulanıyor.")
                         graph = await self.execution_graph(run)
                         state = await self.invoke(graph, run_id, "execute",
                                                   {"prompt": run.get("active_goal") or run["prompt"], "results": {}})
@@ -1327,6 +1459,7 @@ class Engine:
                             summary = await self.synthesize_summary(run, state["results"])
                             await self.change(run_id, status="completed", phase_status="completed",
                                               orchestrator_answer=summary)
+                            await self.record_delivery(await self.store.get(run_id), summary)
                             return
                         decision = await self.audit_phase(run)
                         if decision.action == "await_user_test":
@@ -1334,6 +1467,11 @@ class Engine:
                                               phase_status="awaiting_user_test",
                                               audit_user_question=decision.question)
                             await self.store.event(run_id, "user_test_requested", decision.question)
+                            testing = await self.store.get(run_id)
+                            await self.sync_work(testing, "waiting", decision.question)
+                            await self._notify(
+                                "decision", "Kullanıcı testi gerekiyor", decision.question,
+                                run=testing, dedupe_key=f"test:{run_id}:{decision.question[:80]}")
                             return
                         more = await self.archive_and_advance(run, decision)
                         if not more:
@@ -1341,6 +1479,8 @@ class Engine:
                             await self.change(run_id, status="completed", phase_status="completed")
                             await self.store.event(run_id, "completed", "Tüm iş dilimleri denetlendi ve tamamlandı.",
                                                    {"summary": final_run.get("orchestrator_answer", "")[:400]})
+                            await self.record_delivery(await self.store.get(run_id),
+                                                       final_run.get("orchestrator_answer", ""))
                             await self.cao.clear_terminal_pool(run.get("workspace"))
                             return
                         await self.cao.clear_terminal_pool(run.get("workspace"))
@@ -1372,19 +1512,34 @@ class Engine:
                                       current_steps=[], error=None)
                 await self.store.event(run_id, "waiting_quota",
                                        "Uygun modellerin kotası dolu; en yakın yenilenme zamanı bekleniyor.", timer)
+                waiting = await self.store.get(run_id)
+                await self.sync_work(waiting, "waiting", "Model kotası bekleniyor.")
+                await self._notify(
+                    "delay", "Kota beklemesi", "Uygun model kotası doldu; iş bekliyor.",
+                    run=waiting, dedupe_key=f"quota:{run_id}:{timer.get('resets_at')}")
                 self.schedule_quota_resume(run_id, timer)
             else:
                 error = str(exc)[:2000]
                 await self.change(run_id, status="failed", current_steps=[], error=error)
                 await self.store.event(run_id, "failed", error)
+                failed = await self.store.get(run_id)
+                await self.sync_work(failed, "blocked", "Uygun model bulunamadı; kullanıcı kararı gerekli.")
+                await self._notify("blocker", "İş durdu", error[:400], run=failed,
+                                   dedupe_key=f"failed:{run_id}:model", severity="high")
         except asyncio.CancelledError:
             await self.change(run_id, status="cancelled", current_steps=[], error="Kullanıcı veya servis tarafından durduruldu.")
             await self.store.event(run_id, "cancelled", "Görev durduruldu. Tamamlanan adımlar saklandı.")
+            cancelled = await self.store.get(run_id)
+            await self.sync_work(cancelled, "cancelled", "Kullanıcı görevi durdurdu.")
             await self.cao.clear_terminal_pool(run.get("workspace"))
         except Exception as exc:
             error = "İş akışı toplam süre sınırını aştı." if isinstance(exc, TimeoutError) else str(exc)[:2000]
             await self.change(run_id, status="failed", current_steps=[], error=error)
             await self.store.event(run_id, "failed", error)
+            failed = await self.store.get(run_id)
+            await self.sync_work(failed, "blocked", "Hata nedeniyle durdu; inceleme gerekiyor.")
+            await self._notify("blocker", "İş başarısız", error[:400], run=failed,
+                               dedupe_key=f"failed:{run_id}:{error[:60]}", severity="high")
             await self.cao.clear_terminal_pool(run.get("workspace"))
         finally:
             await self.refresh_project_memory(run_id)
