@@ -441,6 +441,31 @@ class WorkRecordManager:
             row = await cursor.fetchone()
         return self._deliverable(row) if row else None
 
+    async def latest_for_bridge(self, bridge_id: str) -> dict | None:
+        """Latest delivery of a pack, matching either bridge_id or the kind prefix.
+
+        Older office deliveries stored no ``bridge_id``; their ``kind`` is
+        ``office-report``. Matching both keeps pack cards stable without
+        rewriting history.
+        """
+        if not bridge_id:
+            return None
+        async with self.lock:
+            async with self.db.execute(
+                    "SELECT * FROM deliverables WHERE bridge_id=? OR kind LIKE ? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (bridge_id, f"{bridge_id}-%")) as cur:
+                row = await cur.fetchone()
+        return self._deliverable(row) if row else None
+
+    async def pending_repair(self, work_id: str) -> dict | None:
+        """Latest deliverable still waiting for a repair run, if any."""
+        deliverables = await self.list_deliverables(work_id)
+        for deliverable in reversed(deliverables):
+            if deliverable["status"] == "repair_requested":
+                return deliverable
+        return None
+
     async def find_deliverable(self, work_id: str, idempotency_key: str) -> dict | None:
         if not idempotency_key:
             return None
@@ -465,6 +490,13 @@ class WorkRecordManager:
         item = await self.get_deliverable(deliverable_id)
         if item is None:
             raise ValueError("Teslim bulunamadı.")
+        if status == "accepted":
+            from .delivery_evidence import inspect
+            view = inspect(item)
+            if view["bridge"] and not view["complete"]:
+                raise ValueError(
+                    "Kanıt eksik; teslim kabul edilemez: "
+                    + ", ".join(view["missing"]))
         async with self.lock:
             await self.db.execute(
                 "UPDATE deliverables SET status=?,note=?,updated_at=? WHERE id=?",
@@ -474,8 +506,13 @@ class WorkRecordManager:
         if status == "accepted":
             await self.update(item["work_id"], status="done", next_action="")
         elif status == "repair_requested":
-            await self.update(item["work_id"], status="active",
-                              next_action=f"Teslim v{item['version']} için düzeltme uygulanıyor.")
+            # The driver owns the repair run: re-open the work and drop the old
+            # run link so the next tick starts a fresh, parent-linked version.
+            # The user is not blocked meanwhile; the queue keeps moving.
+            await self.update(
+                item["work_id"], status="open", run_id="",
+                next_action=(f"Teslim v{item['version']} için düzeltme isteği: "
+                             f"{str(note)[:400]}"))
         elif status == "test_pending":
             await self.update(item["work_id"], status="waiting",
                               next_action="Kullanıcı testi bekleniyor.")
