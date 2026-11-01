@@ -41,6 +41,16 @@ class MetricsStore:
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS metric_task ON task_metrics(task_kind, model_id);
+            CREATE TABLE IF NOT EXISTS runtime_gauges(
+                name TEXT PRIMARY KEY,
+                value REAL NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS runtime_counters(
+                name TEXT PRIMARY KEY,
+                value REAL NOT NULL,
+                updated_at TEXT NOT NULL
+            );
         """)
         await self.db.commit()
 
@@ -159,3 +169,52 @@ class MetricsStore:
                                       -item["runs"]))
         return {"task_kind": task_kind or "all", "models": result,
                 "record_count": len(records)}
+
+    async def set_gauges(self, values: dict[str, float]) -> dict:
+        """Upsert point-in-time runtime gauges (slot occupancy, waiters)."""
+        if not values:
+            return await self.runtime()
+        moment = _now()
+        async with self.lock:
+            for name, value in values.items():
+                await self.db.execute(
+                    "INSERT INTO runtime_gauges(name,value,updated_at) VALUES(?,?,?) "
+                    "ON CONFLICT(name) DO UPDATE SET value=excluded.value,"
+                    "updated_at=excluded.updated_at",
+                    (str(name)[:80], float(value), moment))
+            await self.db.commit()
+        return await self.runtime()
+
+    async def add_counters(self, values: dict[str, float]) -> dict:
+        """Increment monotonic runtime counters (queue wait count and seconds)."""
+        if not values:
+            return await self.runtime()
+        moment = _now()
+        async with self.lock:
+            for name, value in values.items():
+                await self.db.execute(
+                    "INSERT INTO runtime_counters(name,value,updated_at) VALUES(?,?,?) "
+                    "ON CONFLICT(name) DO UPDATE SET value=value+excluded.value,"
+                    "updated_at=excluded.updated_at",
+                    (str(name)[:80], float(value), moment))
+            await self.db.commit()
+        return await self.runtime()
+
+    async def runtime(self) -> dict:
+        async with self.lock:
+            async with self.db.execute("SELECT name,value,updated_at FROM runtime_gauges") as cur:
+                gauges = {row[0]: row[1] for row in await cur.fetchall()}
+            async with self.db.execute("SELECT name,value FROM runtime_counters") as cur:
+                counters = {row[0]: row[1] for row in await cur.fetchall()}
+        wait_count = counters.get("slot_wait_count", 0.0)
+        wait_total = counters.get("slot_wait_seconds_total", 0.0)
+        return {
+            "gauges": gauges,
+            "counters": counters,
+            "slot_occupancy_percent": (
+                round(100.0 * gauges.get("slot_active", 0.0)
+                      / gauges["max_concurrent_runs"], 1)
+                if gauges.get("max_concurrent_runs") else 0.0),
+            "slot_wait_avg_seconds": (round(wait_total / wait_count, 3)
+                                     if wait_count else 0.0),
+        }
