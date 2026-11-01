@@ -35,3 +35,21 @@ Piko görünümü sohbet, iş özeti, teslim kartları ve kısa ilerleme göster
 ## Zamanlama ve proaktif çalışma
 
 İş sırası son tarih, öncelik, bağımlılık ve yaşa göre deterministik hesaplanır. Proaktif tetikleyiciler kaçırılan çalışmayı saat dilimi ve sessiz saat kurallarıyla telafi eder; dosya değişikliği olayı sürüm anahtarıyla bir kez işlenir ve neden çalıştığı olay kaydında yazar. Model seçimi; başarı, süre, maliyet ve düzeltme sayısı ayrı kaydedilerek geliştirilir. Denetçi kanaati, çalıştırılmış test ve kullanıcı kabulü ayrı alanlardır.
+
+## Denetimsiz sürücü, sağlık ve kaynak kilidi
+
+- `manager/daemon.py` işleri 10 saniyelik tick ile yürütür ve motorla yalnız `DriverHooks` üzerinden konuşur. `manager/driver_hooks.py` bu sözleşmeyi motora bağlar: `active` iş mevcut run'a yeniden bağlanır (yeni run açılmaz), vakti gelen `open` iş için tek run açılır, `waiting`/`blocked` işler döngüyü meşgul etmez.
+- CLI: `python -m manager.daemon --dry-run` yalnız rapor üretir; `python -m manager.daemon` gerçek sürücü döngüsünü çalıştırır. Uygulama açıkken aynı sürücü uygulama süreci içinde de çalışır.
+- `manager/health.py` kalp atışları: sürücü her tick'te, motor her run fazında `beat()` yazar; run bitince `retire()`. `tools/watchdog.ps1` kalp atışı 5 dakikadan eskiyse sürücüyü başlatır, 10 dakikada 3 kez yeniden başlatmayı aşarsa durup `piko-crash.log` yazar. Görev `PikoWatchdog` olarak 2 dakikada bir çalışır.
+- `manager/resource_locks.py` run başlatma yolunda kullanılır: aynı çalışma alanında ikinci run kilit alana kadar `queued` kalır ve kısa aralıklarla yeniden denenir; kilit run bitince (veya TTL dolunca) bırakılır.
+- `manager/bridge_gate.py` motorun dış etki kapısıdır: rol tavanı, persona izni, onay politikası ve idempotency doğrulanır; `apply`/`dangerous` çağrıları `OperationLedger.begin` ile kaydedilir, tek kullanımlık onay token'ları kalıcıdır (yeniden başlatmada da tüketilmiş sayılır). Adaptör yalnız defter anahtarı yazıldıktan sonra yüklenir.
+- Kurtarma: açılışta `unknown` işlemler için tam olarak bir soru üretilir (`GET /api/recovery`), yanıt yalnız kullanıcı kararıyla uygulanır (`POST /api/recovery/{id}/answer`). Sürücü hiçbir işlemi kendiliğinden yeniden çalıştırmaz.
+
+## Altın test (kesinti + yeniden başlatma)
+
+`tests/golden_restart.py`: devam eden bir run ve `pending` dış işlem tohumlanır, gerçek sunucu açılır, `taskkill /F` ile öldürülür, yeniden açılır. Doğrulandı:
+
+- Sürücü kesilen run'ı yeniden ele aldı (`resumed: 1`), aynı iş için **ikinci run açılmadı** ve iş kaydı aynı run'a bağlı kaldı.
+- İkinci sert kesinti sonrası da tek run ve tek kurtarma sorusu vardı; soru tekilleştirildi (tekrar bildirim yok).
+- Kalp atışı `daemon_alive: true` döndü.
+- Not: bu makinede uygun model kotası/erişimi olmadığında yeniden başlayan run `planning` aşamasında bekler; altın test model yanıtı gerektirmez.

@@ -147,3 +147,12 @@ Uzun süreli yük testi, tüm katalog modelleri ve gerçek büyük kod üretim g
 - Gerçek model çağrısı yapılmadı; canlı CLI/CODEX yürütmesi ve token tasarrufu ölçümü bu doğrulamanın kapsamı dışındadır.
 - Sınır: dış servis bağlayıcıları (GitHub, takvim, Drive, e-posta) yalnız sözleşme ve izin katmanı olarak doğrulandı; gerçek API kimlik doğrulaması test edilmedi. Bağlayıcısı olmayan servis `failed` döndürür.
 - Sınır: işlem defteri yeniden başlatmada `pending` kaydı `unknown` yapar ve otomatik tekrar çalıştırmaz; bu davranış test edildi, gerçek bir dış servisle kesinti senaryosu çalıştırılmadı.
+
+## 2026-11-01 entegrasyon doğrulaması
+
+- Komut: `.venv/Scripts/python.exe -m pytest -q` — **232 test + 5 alt test** başarılı (74 sn).
+- Yeni kapsam: `tests/test_driver_wiring.py` (9 test) — sürücü tek run açar, tamamlanan run'ı yeniden başlatmaz, kayıp run'ı işi yeniden açar, tick yalnız vakti gelen `open` işi başlatır, `waiting`/`blocked` atlanır, hatırlatma aralık başına bir kez gider, köprü onay token'ı kalıcı ve tek kullanımlıdır, `apply` işlemi deftere yazılır ve tekrar oynatılmaz, çalışma alanı kilidi ikinci run'ı bekletir.
+- Altın test: `.venv/Scripts/python.exe tests/golden_restart.py` — gerçek sunucu iki kez `taskkill /T /F` ile öldürülüp yeniden açıldı. Sonuç: `resumed: 1`, tek run, iş kaydı aynı run'a bağlı, `recovery_questions: 1` (ikinci kesintiden sonra da 1), `daemon_alive: true`.
+- Watchdog: `tools/watchdog.ps1 -DryRun` iki senaryoda denendi (taze kalp atışı → eylem yok; kalp atışı yok → 1/3 yeniden başlatma ve başlatma kararı). `PikoWatchdog` görevi 2 dakikalık tekrarla kaydedildi; kuru çalıştırma görevi `LastTaskResult: 0` döndürdü, ardından gerçek görevle değiştirildi.
+- Sınır: sürücü CLI'si (`python -m manager.daemon`) uygulamayla aynı veri klasörünü kullanır; iki süreç aynı anda açıksa run'lar kaynak kilidiyle sıraya girer, ancak tek süreç çalıştırmak önerilir. Kotası/erişimi olmayan model ortamında kesinti sonrası run model beklemeye geçer; bu durum altın testte model çağrısı gerektirmeyecek şekilde ayrıştırıldı.
+- Sınır: köprü adaptörleri (GitHub, takvim, Drive, e-posta) hâlâ gerçek API bağlayıcısı değildir; kapı, onay ve defter yolu doğrulanmıştır, dış servis çağrısı test edilmemiştir.
