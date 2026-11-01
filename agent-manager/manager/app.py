@@ -38,7 +38,8 @@ from .outcomes import ensure_usable_result, is_infrastructure_error
 from .schema import Plan, RunRequest
 from .request_routing import classify_with_model
 from . import health, packs
-from .packs import github as github_pack, github_flow, office_flow
+from .packs import (communication as communication_pack, communication_flow,
+                    github as github_pack, github_flow, office_flow)
 from .scheduling import missed_run, ordered_work
 from .store import Store, now
 from .triggers import TriggerManager
@@ -593,6 +594,91 @@ def create_app(data_dir=None, providers=None):
     async def github_status():
         latest = await app.state.work.latest_deliverable(bridge_id="github")
         return _bridge_card("github", latest)
+
+    @app.get("/api/bridges/communication/status")
+    async def communication_status():
+        latest = await app.state.work.latest_deliverable(bridge_id="communication")
+        return _bridge_card("communication", latest)
+
+    @app.get("/api/bridges/communication/read")
+    async def communication_read(workspace: str = "", mode: str = "proactive",
+                                 day: str = ""):
+        """Proactive flow entry point: read-only, enforced by the engine gate."""
+        try:
+            await app.state.engine.authorize_bridge(
+                communication_pack.PROACTIVE_PERSONA, "communication", "read",
+                payload={"mode": mode}, proactive=True)
+            adapter = communication_pack.adapter()
+            if mode == "inbox":
+                return await adapter.read(workspace or str(ROOT), mode="inbox")
+            if mode == "calendar":
+                return await adapter.read(workspace or str(ROOT), mode="calendar",
+                                          day=day)
+            return await adapter.read(workspace or str(ROOT), mode="proactive")
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/bridges/communication/draft")
+    async def communication_draft(request: Request):
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "JSON nesnesi gerekli.")
+        persona = body.get("persona") or communication_pack.MANAGER_PERSONA
+        try:
+            await app.state.engine.authorize_bridge(
+                persona, "communication", "draft", payload=body.get("request"))
+            adapter = communication_pack.adapter()
+            payload = body.get("request") or {}
+            if str(payload.get("kind") or "mail") == "meeting":
+                return await adapter.draft(kind="meeting",
+                                           workspace=body.get("workspace") or "",
+                                           title=payload.get("title", ""),
+                                           start_at=payload.get("start_at", ""),
+                                           end_at=payload.get("end_at", ""),
+                                           attendees=payload.get("attendees", []),
+                                           agenda=payload.get("agenda", ""))
+            return await adapter.draft(kind="mail",
+                                       workspace=body.get("workspace") or "",
+                                       to=payload.get("to", []),
+                                       subject=payload.get("subject", ""),
+                                       body=payload.get("body", ""))
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/bridges/communication/approve")
+    async def communication_approve(request: Request):
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "JSON nesnesi gerekli.")
+        try:
+            return communication_flow.issue_approval(body.get("request") or {})
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/bridges/communication/deliver")
+    async def communication_deliver(request: Request):
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "JSON nesnesi gerekli.")
+        try:
+            return await communication_flow.deliver(
+                app.state.engine,
+                persona=body.get("persona") or communication_pack.MANAGER_PERSONA,
+                request=body.get("request") or {},
+                approval_token=str(body.get("approval_token") or ""),
+                idempotency_key=str(body.get("idempotency_key") or ""),
+                work_id=str(body.get("work_id") or ""),
+                run_id=str(body.get("run_id") or ""),
+                workspace=str(body.get("workspace") or ""),
+                draft_only=bool(body.get("draft_only", False)))
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.get("/api/bridges/github/read")
     async def github_read(workspace: str = "", mode: str = "history"):
