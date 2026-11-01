@@ -70,6 +70,7 @@ class WorkRecordManager:
                 priority TEXT NOT NULL,
                 due_at TEXT NOT NULL,
                 dependencies TEXT NOT NULL,
+                workspace TEXT NOT NULL DEFAULT '',
                 outputs TEXT NOT NULL,
                 decisions TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -107,18 +108,28 @@ class WorkRecordManager:
                 WHERE idempotency_key IS NOT NULL AND idempotency_key != '';
             CREATE INDEX IF NOT EXISTS deliverable_work ON deliverables(work_id, version);
         """)
+        try:
+            await self.db.execute(
+                "ALTER TABLE work_items ADD COLUMN workspace TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
         await self.db.commit()
 
     async def close(self):
         await self.db.close()
 
-    @staticmethod
-    def _row(row):
-        keys = ("id", "conversation_id", "run_id", "title", "goal", "requirements",
-                "acceptance", "priority", "due_at", "dependencies", "outputs",
-                "decisions", "status", "next_action", "last_result", "created_at",
-                "updated_at")
-        item = dict(zip(keys, row))
+    WORK_COLUMNS = ("id", "conversation_id", "run_id", "title", "goal", "requirements",
+                    "acceptance", "priority", "due_at", "dependencies", "workspace",
+                    "outputs", "decisions", "status", "next_action", "last_result",
+                    "created_at", "updated_at")
+
+    @classmethod
+    def _select(cls):
+        return ", ".join(cls.WORK_COLUMNS)
+
+    @classmethod
+    def _row(cls, row):
+        item = dict(zip(cls.WORK_COLUMNS, row))
         for key in ("requirements", "acceptance", "dependencies", "outputs", "decisions"):
             item[key] = json.loads(item[key] or "[]")
         return item
@@ -126,7 +137,7 @@ class WorkRecordManager:
     async def create(self, goal: str, *, title: str = "", conversation_id: str = "",
                      run_id: str = "", requirements=(), acceptance=(), priority: str = "normal",
                      due_at: str = "", dependencies=(), status: str = "open",
-                     next_action: str = "") -> dict:
+                     next_action: str = "", workspace: str = "") -> dict:
         goal = str(goal or "").strip()
         if not goal:
             raise ValueError("İş kaydı için hedef gerekli.")
@@ -147,6 +158,7 @@ class WorkRecordManager:
             "priority": priority,
             "due_at": _iso(due_at),
             "dependencies": _json_list(dependencies),
+            "workspace": str(workspace or "")[:1000],
             "outputs": [],
             "decisions": [],
             "status": status,
@@ -157,15 +169,11 @@ class WorkRecordManager:
         }
         async with self.lock:
             await self.db.execute(
-                "INSERT INTO work_items VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (item["id"], item["conversation_id"], item["run_id"] or None, item["title"],
-                 item["goal"], json.dumps(item["requirements"], ensure_ascii=False),
-                 json.dumps(item["acceptance"], ensure_ascii=False), item["priority"],
-                 item["due_at"], json.dumps(item["dependencies"], ensure_ascii=False),
-                 json.dumps(item["outputs"], ensure_ascii=False),
-                 json.dumps(item["decisions"], ensure_ascii=False), item["status"],
-                 item["next_action"], item["last_result"], item["created_at"],
-                 item["updated_at"]))
+                f"INSERT INTO work_items({self._select()}) VALUES({','.join('?' for _ in self.WORK_COLUMNS)})",
+                tuple(item[key] if key not in {"requirements", "acceptance", "dependencies",
+                                               "outputs", "decisions"}
+                      else json.dumps(item[key], ensure_ascii=False)
+                      for key in self.WORK_COLUMNS))
             await self.db.commit()
         return item
 
@@ -198,7 +206,7 @@ class WorkRecordManager:
 
     async def get(self, work_id: str) -> dict | None:
         async with self.lock:
-            async with self.db.execute("SELECT * FROM work_items WHERE id=?", (work_id,)) as cur:
+            async with self.db.execute(f"SELECT {self._select()} FROM work_items WHERE id=?", (work_id,)) as cur:
                 row = await cur.fetchone()
         return self._row(row) if row else None
 
@@ -206,7 +214,7 @@ class WorkRecordManager:
         if not run_id:
             return None
         async with self.lock:
-            async with self.db.execute("SELECT * FROM work_items WHERE run_id=?", (run_id,)) as cur:
+            async with self.db.execute(f"SELECT {self._select()} FROM work_items WHERE run_id=?", (run_id,)) as cur:
                 row = await cur.fetchone()
         return self._row(row) if row else None
 
@@ -224,14 +232,15 @@ class WorkRecordManager:
         params.append(max(1, min(int(limit), 500)))
         async with self.lock:
             async with self.db.execute(
-                    f"SELECT * FROM work_items {where} ORDER BY created_at DESC LIMIT ?",
+                    f"SELECT {self._select()} FROM work_items {where} ORDER BY created_at DESC LIMIT ?",
                     params) as cur:
                 rows = await cur.fetchall()
         return [self._row(row) for row in rows]
 
     async def update(self, work_id: str, **fields) -> dict:
         allowed = {"title", "goal", "priority", "due_at", "status", "next_action",
-                   "last_result", "requirements", "acceptance", "dependencies", "run_id"}
+                   "last_result", "requirements", "acceptance", "dependencies", "run_id",
+                   "workspace"}
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"Güncellenemeyen alan: {', '.join(sorted(unknown))}")
