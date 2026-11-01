@@ -175,16 +175,23 @@ const chromePath = process.env.CHROME_PATH
     if (await bridgeTab.count() === 0) throw new Error('Köprüler sekmesi bulunamadı');
     await page.locator('details.inspector-more > summary').click().catch(() => {});
     await bridgeTab.click({ force: true }).catch(() => {});
-    const card = page.locator('.bridge-card');
-    await card.waitFor({ timeout: 15000 });
-    const cardText = await card.innerText();
-    if (!/office/.test(cardText) || !/read/.test(cardText)) {
-      throw new Error('Bridge card missing pack name or levels: ' + cardText.slice(0, 120));
+    const cards = page.locator('.bridge-card');
+    await cards.first().waitFor({ timeout: 15000 });
+    const cardCount = await cards.count();
+    const officeCard = page.locator('.bridge-card', { hasText: 'office' });
+    const githubCard = page.locator('.bridge-card', { hasText: 'github' });
+    await officeCard.first().waitFor();
+    await githubCard.first().waitFor();
+    const officeText = await officeCard.first().innerText();
+    const githubText = await githubCard.first().innerText();
+    if (!/read/.test(officeText) || !/read/.test(githubText)) {
+      throw new Error('Bridge cards missing permission levels');
     }
-    if (!/Son teslim/i.test(cardText)) {
-      throw new Error('Bridge card missing last delivery section');
+    if (!/Son teslim/i.test(officeText) || !/Son teslim/i.test(githubText)) {
+      throw new Error('Bridge cards missing last delivery section');
     }
-    checks.push('bridge-card-developer-view');
+    if (cardCount < 2) throw new Error('expected one card per shipped pack, got ' + cardCount);
+    checks.push('bridge-cards-developer-view:' + cardCount);
     await page.screenshot({ path: path.join(out, 'bridge-card.png'), fullPage: true });
 
     const accepted = await fetch(base + `/api/deliverables/${(await deliverableResponse.json()).id}/accept`, {
