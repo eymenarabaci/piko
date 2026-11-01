@@ -86,7 +86,81 @@ class Engine:
         self.resource_retry_seconds = 15.0
         self.pending_restarts: set[str] = set()
         # Bound total simultaneous workflows as well as each workflow's workers.
-        self.run_slots = asyncio.Semaphore(2)
+        self.max_concurrent_runs = 2
+        self.run_slots = asyncio.Semaphore(self.max_concurrent_runs)
+        self.slot_active = 0
+        self.slot_waiters = 0
+        self.slot_max_observed = 0
+        self.slot_wait_seconds_total = 0.0
+        self.slot_wait_count = 0
+        self.slot_wait_max = 0.0
+
+    def set_max_concurrent_runs(self, value: int) -> int:
+        """Set the run concurrency ceiling (idle engine only)."""
+        value = max(1, min(int(value), 32))
+        if self.slot_active or self.slot_waiters:
+            raise ValueError("Çalışan görev varken eşzamanlılık sınırı değiştirilemez.")
+        self.max_concurrent_runs = value
+        self.run_slots = asyncio.Semaphore(value)
+        return value
+
+    def slot_snapshot(self) -> dict:
+        return {
+            "max_concurrent_runs": self.max_concurrent_runs,
+            "slot_active": self.slot_active,
+            "slot_waiters": self.slot_waiters,
+            "slot_max_observed": self.slot_max_observed,
+            "slot_wait_seconds_total": round(self.slot_wait_seconds_total, 3),
+            "slot_wait_count": self.slot_wait_count,
+            "slot_wait_max_seconds": round(self.slot_wait_max, 3),
+            "slot_wait_avg_seconds": (round(self.slot_wait_seconds_total / self.slot_wait_count, 3)
+                                      if self.slot_wait_count else 0.0),
+        }
+
+    async def _slot_enter(self, run: dict) -> None:
+        """Take a run slot, recording occupancy and the queue wait time."""
+        self.slot_waiters += 1
+        try:
+            await self.run_slots.acquire()
+        finally:
+            self.slot_waiters -= 1
+        queued_at = 0.0
+        try:
+            queued_at = datetime.fromisoformat(str(run.get("created_at") or "")).timestamp()
+        except ValueError:
+            queued_at = 0.0
+        wait_seconds = max(0.0, time.time() - queued_at) if queued_at else 0.0
+        self.slot_active += 1
+        self.slot_max_observed = max(self.slot_max_observed, self.slot_active)
+        self.slot_wait_seconds_total += wait_seconds
+        self.slot_wait_count += 1
+        self.slot_wait_max = max(self.slot_wait_max, wait_seconds)
+        await self._record_slot_metrics(wait_seconds)
+
+    async def _slot_exit(self) -> None:
+        self.slot_active = max(0, self.slot_active - 1)
+        self.run_slots.release()
+        await self._record_slot_metrics(None)
+
+    async def _record_slot_metrics(self, wait_seconds: float | None) -> None:
+        if self.metrics is None:
+            return
+        try:
+            snapshot = self.slot_snapshot()
+            await self.metrics.set_gauges({
+                "max_concurrent_runs": snapshot["max_concurrent_runs"],
+                "slot_active": snapshot["slot_active"],
+                "slot_waiters": snapshot["slot_waiters"],
+                "slot_max_observed": snapshot["slot_max_observed"],
+                "slot_wait_avg_seconds": snapshot["slot_wait_avg_seconds"],
+            })
+            if wait_seconds is not None:
+                await self.metrics.add_counters({
+                    "slot_wait_count": 1,
+                    "slot_wait_seconds_total": wait_seconds,
+                })
+        except Exception:
+            pass
 
     def attach_infrastructure(self, *, work=None, notifications=None, ledger=None,
                               metrics=None, integrations=None, resource_locks=None,
@@ -1506,19 +1580,24 @@ class Engine:
 
     async def drive(self, run_id, execute=False):
         try:
-            async with self.run_slots:
-                run = await self.store.get(run_id)
-                await self._beat(run_id, detail=f"slot:{run.get('status', '')}")
-                lease = await self._acquire_run_resources(run)
-                if lease is None:
-                    await self.change(
-                        run_id, status="queued", current_steps=[],
-                        error="Çalışma alanı kilidi bekleniyor; otomatik yeniden denenecek.")
-                    return
+            run = await self.store.get(run_id)
+            await self._beat(run_id, detail=f"start:{run.get('status', '')}")
+            # The workspace lease is taken before a concurrency slot: a run that is
+            # waiting for a busy workspace must not occupy one of the run slots.
+            lease = await self._acquire_run_resources(run)
+            if lease is None:
+                await self.change(
+                    run_id, status="queued", current_steps=[],
+                    error="Çalışma alanı kilidi bekleniyor; otomatik yeniden denenecek.")
+                return
+            try:
+                await self._slot_enter(run)
                 try:
                     await self._drive_locked(run_id, execute)
                 finally:
-                    await lease.release()
+                    await self._slot_exit()
+            finally:
+                await lease.release()
         except NoEligibleModel as exc:
             await self._handle_no_model(run_id, exc, execute)
         except asyncio.CancelledError:
