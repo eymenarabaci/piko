@@ -180,17 +180,20 @@ const chromePath = process.env.CHROME_PATH
     const cardCount = await cards.count();
     const officeCard = page.locator('.bridge-card', { hasText: 'office' });
     const githubCard = page.locator('.bridge-card', { hasText: 'github' });
+    const communicationCard = page.locator('.bridge-card', { hasText: 'communication' });
     await officeCard.first().waitFor();
     await githubCard.first().waitFor();
+    await communicationCard.first().waitFor();
     const officeText = await officeCard.first().innerText();
     const githubText = await githubCard.first().innerText();
-    if (!/read/.test(officeText) || !/read/.test(githubText)) {
-      throw new Error('Bridge cards missing permission levels');
+    const communicationText = await communicationCard.first().innerText();
+    for (const text of [officeText, githubText, communicationText]) {
+      if (!/read/.test(text)) throw new Error('Bridge card missing permission levels');
+      if (!/Son teslim/i.test(text)) {
+        throw new Error('Bridge card missing last delivery section');
+      }
     }
-    if (!/Son teslim/i.test(officeText) || !/Son teslim/i.test(githubText)) {
-      throw new Error('Bridge cards missing last delivery section');
-    }
-    if (cardCount < 2) throw new Error('expected one card per shipped pack, got ' + cardCount);
+    if (cardCount < 3) throw new Error('expected one card per shipped pack, got ' + cardCount);
     checks.push('bridge-cards-developer-view:' + cardCount);
     await page.screenshot({ path: path.join(out, 'bridge-card.png'), fullPage: true });
 
