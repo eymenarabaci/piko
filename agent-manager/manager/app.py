@@ -349,6 +349,7 @@ def create_app(data_dir=None, providers=None):
                 "workers": list_workers(),
                 "daily_tokens": await engine.optimizer.get_daily_total(),
                 "workspace_default": str(ROOT),
+                "max_concurrent_runs": engine.max_concurrent_runs,
                 "features": {"work_records": True, "notifications": True,
                              "deliverables": True, "developer_view": True}}
 
@@ -579,7 +580,10 @@ def create_app(data_dir=None, providers=None):
 
     @app.get("/api/metrics")
     async def get_metrics(task_kind: str = ""):
-        return await app.state.metrics.summary(task_kind=task_kind)
+        summary = await app.state.metrics.summary(task_kind=task_kind)
+        summary["runtime"] = await app.state.metrics.runtime()
+        summary["slots"] = app.state.engine.slot_snapshot()
+        return summary
 
     @app.get("/api/integrations")
     async def list_integrations():
