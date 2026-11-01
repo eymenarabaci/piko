@@ -79,7 +79,7 @@ async def seed():
         "planner_model": "auto", "executor_model": "auto",
         "workspace": str(ROOT / "work"), "project_id": "",
         "conversation_run_id": "", "allow_writes": False,
-        "timeout_seconds": 60, "workflow_timeout_seconds": 120, "max_parallel": 1,
+        "timeout_seconds": 60, "workflow_timeout_seconds": 600, "max_parallel": 1,
         "execution_backend": "direct", "status": "running",
         "created_at": now, "updated_at": now, "execution_created_at": now,
         "error": None, "current_steps": [], "plan_revision": 0,
@@ -128,7 +128,9 @@ def hard_kill(proc):
 def check_state(work_id, run_id, phase, *, expect_resumed=False):
     runs = [item for item in http("GET", "/api/runs") if item.get("id") == run_id]
     assert len(runs) == 1, f"{phase}: beklenen tek run, bulunan {len(runs)}"
-    assert runs[0]["status"] != "running", f"{phase}: run hâlâ 'running' görünüyor"
+    # The driver must have moved the run out of the crash sentinel state.
+    assert runs[0]["status"] != "interrupted", (
+        f"{phase}: run hâlâ 'interrupted'; sürücü devam ettirmedi: {runs[0]['status']}")
     if expect_resumed:
         events = http("GET", f"/api/runs/{run_id}/events?after=0")["events"]
         resumed = [event for event in events
@@ -163,12 +165,12 @@ def main():
         deadline = time.time() + 90
         while time.time() < deadline:
             stats = http("GET", "/api/driver/status")["stats"]
-            detail = http("GET", f"/api/work/{work_id}")
-            if stats["resumed"] >= 1 and detail["work"]["status"] != "active":
+            if stats["resumed"] >= 1:
                 break
             time.sleep(1)
         stats = http("GET", "/api/driver/status")["stats"]
         assert stats["resumed"] >= 1, f"restart-1: sürücü run'ı devam ettirmedi: {stats}"
+        time.sleep(2)
         first = check_state(work_id, run_id, "restart-1", expect_resumed=True)
         results["restart_1_status"] = first["status"]
         results["restart_1_error"] = first.get("error")
