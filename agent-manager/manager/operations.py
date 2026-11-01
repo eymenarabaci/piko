@@ -1,0 +1,240 @@
+"""Idempotent external operations, bounded budgets and role/tool permissions."""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import uuid
+from datetime import datetime, timezone
+
+import aiosqlite
+
+
+OPERATION_STATES = {"pending", "applied", "failed", "unknown"}
+ROLE_TOOL_PERMISSIONS = {
+    "implementer": {"read", "write", "draft", "apply"},
+    "repairer": {"read", "write", "draft", "apply"},
+    "reviewer": {"read"},
+    "auditor": {"read"},
+    "planner": {"read"},
+    "scheduler": {"read", "draft"},
+}
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+class BudgetExceeded(ValueError):
+    pass
+
+
+class OperationConflict(ValueError):
+    pass
+
+
+class OperationUncertain(ValueError):
+    pass
+
+
+def allowed_tool(role: str, action: str) -> bool:
+    return action in ROLE_TOOL_PERMISSIONS.get(role, set())
+
+
+def require_tool(role: str, action: str) -> None:
+    if not allowed_tool(role, action):
+        raise PermissionError(f"{role} rolü '{action}' işlemine yetkili değil.")
+
+
+class OperationLedger:
+    """An external side effect gets one idempotency key. After a crash a pending
+    operation becomes 'unknown' and is never silently executed a second time."""
+
+    def __init__(self, path):
+        self.path = str(path)
+        self.lock = asyncio.Lock()
+
+    async def open(self):
+        self.db = await aiosqlite.connect(self.path)
+        await self.db.execute("PRAGMA journal_mode=WAL")
+        await self.db.execute("PRAGMA busy_timeout=5000")
+        await self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS operations(
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                payload_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 1,
+                result TEXT NOT NULL DEFAULT '',
+                error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS budgets(
+                scope TEXT PRIMARY KEY,
+                token_limit INTEGER NOT NULL DEFAULT 0,
+                token_used INTEGER NOT NULL DEFAULT 0,
+                seconds_limit INTEGER NOT NULL DEFAULT 0,
+                seconds_used INTEGER NOT NULL DEFAULT 0,
+                repairs_limit INTEGER NOT NULL DEFAULT 0,
+                repairs_used INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+        """)
+        await self.db.execute(
+            "UPDATE operations SET status='unknown',updated_at=?,"
+            "error=CASE WHEN error='' THEN 'Servis kesintisi; dış işlem sonucu doğrulanamadı.' ELSE error END "
+            "WHERE status='pending'", (_now(),))
+        await self.db.commit()
+
+    async def close(self):
+        await self.db.close()
+
+    @staticmethod
+    def _hash(payload) -> str:
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                         default=str).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _record(row):
+        keys = ("id", "kind", "idempotency_key", "payload_hash", "status", "attempts",
+                "result", "error", "created_at", "updated_at")
+        item = dict(zip(keys, row))
+        try:
+            item["result"] = json.loads(item["result"]) if item["result"] else None
+        except ValueError:
+            pass
+        return item
+
+    async def begin(self, kind: str, idempotency_key: str, payload=None) -> dict:
+        kind = str(kind or "").strip()
+        idempotency_key = str(idempotency_key or "").strip()
+        if not kind or not idempotency_key:
+            raise ValueError("İşlem türü ve idempotency anahtarı gerekli.")
+        if len(idempotency_key) > 200:
+            raise ValueError("Idempotency anahtarı çok uzun.")
+        payload_hash = self._hash(payload if payload is not None else {})
+        async with self.lock:
+            async with self.db.execute(
+                    "SELECT * FROM operations WHERE idempotency_key=?",
+                    (idempotency_key,)) as cur:
+                row = await cur.fetchone()
+            if row:
+                record = self._record(row)
+                if record["payload_hash"] != payload_hash or record["kind"] != kind:
+                    raise OperationConflict("Aynı anahtar farklı bir işlem için kullanılmış.")
+                record["should_execute"] = False
+                if record["status"] == "applied":
+                    record["replayed"] = True
+                elif record["status"] == "pending":
+                    raise OperationUncertain("İşlem hâlâ sürüyor; ikinci kez başlatılmadı.")
+                elif record["status"] == "unknown":
+                    raise OperationUncertain(
+                        "Önceki işlem sonucu belirsiz; dış sistem kontrol edilmeden tekrar çalıştırılmaz.")
+                return record
+            operation_id = uuid.uuid4().hex
+            await self.db.execute(
+                "INSERT INTO operations VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (operation_id, kind, idempotency_key, payload_hash, "pending", 1, "", "",
+                 _now(), _now()))
+            await self.db.commit()
+            async with self.db.execute("SELECT * FROM operations WHERE id=?",
+                                       (operation_id,)) as cur:
+                record = self._record(await cur.fetchone())
+        record["should_execute"] = True
+        record["replayed"] = False
+        return record
+
+    async def complete(self, operation_id: str, result=None) -> dict:
+        async with self.lock:
+            await self.db.execute(
+                "UPDATE operations SET status='applied',result=?,error='',updated_at=? WHERE id=?",
+                (json.dumps(result, ensure_ascii=False, default=str) if result is not None else "",
+                 _now(), operation_id))
+            await self.db.commit()
+            async with self.db.execute("SELECT * FROM operations WHERE id=?",
+                                       (operation_id,)) as cur:
+                row = await cur.fetchone()
+        if row is None:
+            raise ValueError("İşlem bulunamadı.")
+        return self._record(row)
+
+    async def fail(self, operation_id: str, error: str, *, uncertain: bool = False) -> dict:
+        async with self.lock:
+            await self.db.execute(
+                "UPDATE operations SET status=?,error=?,updated_at=? WHERE id=?",
+                ("unknown" if uncertain else "failed", str(error)[:2000], _now(), operation_id))
+            await self.db.commit()
+            async with self.db.execute("SELECT * FROM operations WHERE id=?",
+                                       (operation_id,)) as cur:
+                row = await cur.fetchone()
+        if row is None:
+            raise ValueError("İşlem bulunamadı.")
+        return self._record(row)
+
+    async def get(self, operation_id: str) -> dict | None:
+        async with self.lock:
+            async with self.db.execute("SELECT * FROM operations WHERE id=?",
+                                       (operation_id,)) as cur:
+                row = await cur.fetchone()
+        return self._record(row) if row else None
+
+    async def list(self, limit: int = 100) -> list[dict]:
+        async with self.lock:
+            async with self.db.execute(
+                    "SELECT * FROM operations ORDER BY created_at DESC LIMIT ?",
+                    (max(1, min(int(limit), 500)),)) as cur:
+                rows = await cur.fetchall()
+        return [self._record(row) for row in rows]
+
+    async def configure_budget(self, scope: str, *, token_limit: int = 0,
+                               seconds_limit: int = 0, repairs_limit: int = 0) -> dict:
+        scope = str(scope or "").strip()
+        if not scope:
+            raise ValueError("Bütçe kapsamı gerekli.")
+        for value in (token_limit, seconds_limit, repairs_limit):
+            if int(value) < 0:
+                raise ValueError("Bütçe sınırı negatif olamaz.")
+        async with self.lock:
+            await self.db.execute(
+                "INSERT INTO budgets(scope,token_limit,token_used,seconds_limit,seconds_used,"
+                "repairs_limit,repairs_used,updated_at) VALUES(?,?,0,?,0,?,0,?) "
+                "ON CONFLICT(scope) DO UPDATE SET token_limit=excluded.token_limit,"
+                "seconds_limit=excluded.seconds_limit,repairs_limit=excluded.repairs_limit,"
+                "updated_at=excluded.updated_at",
+                (scope, int(token_limit), int(seconds_limit), int(repairs_limit), _now()))
+            await self.db.commit()
+        return await self.get_budget(scope)
+
+    async def get_budget(self, scope: str) -> dict:
+        async with self.lock:
+            async with self.db.execute("SELECT * FROM budgets WHERE scope=?", (scope,)) as cur:
+                row = await cur.fetchone()
+        if row is None:
+            raise ValueError("Bütçe bulunamadı.")
+        keys = ("scope", "token_limit", "token_used", "seconds_limit", "seconds_used",
+                "repairs_limit", "repairs_used", "updated_at")
+        return dict(zip(keys, row))
+
+    async def consume(self, scope: str, *, tokens: int = 0, seconds: int = 0,
+                      repairs: int = 0) -> dict:
+        for value in (tokens, seconds, repairs):
+            if int(value) < 0:
+                raise ValueError("Bütçe tüketimi negatif olamaz.")
+        current = await self.get_budget(scope)
+        tests = (
+            ("token", current["token_used"] + int(tokens), current["token_limit"]),
+            ("seconds", current["seconds_used"] + int(seconds), current["seconds_limit"]),
+            ("repairs", current["repairs_used"] + int(repairs), current["repairs_limit"]),
+        )
+        for label, used, limit in tests:
+            if limit and used > limit:
+                raise BudgetExceeded(f"{scope} {label} bütçesi aşıldı ({used}/{limit}).")
+        async with self.lock:
+            await self.db.execute(
+                "UPDATE budgets SET token_used=token_used+?,seconds_used=seconds_used+?,"
+                "repairs_used=repairs_used+?,updated_at=? WHERE scope=?",
+                (int(tokens), int(seconds), int(repairs), _now(), scope))
+            await self.db.commit()
+        return await self.get_budget(scope)
