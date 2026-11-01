@@ -126,6 +126,67 @@ const chromePath = process.env.CHROME_PATH
     }
     checks.push('slot-metrics-api:' + metrics.slots.max_concurrent_runs);
 
+    const bridges = await (await fetch(base + '/api/bridges')).json();
+    const office = (bridges.bridges || []).find(item => item.id === 'office');
+    if (!office) throw new Error('office pack not registered');
+    if ((office.levels || []).join(',') !== 'read,draft,apply') {
+      throw new Error('office levels unexpected: ' + office.levels);
+    }
+    checks.push('bridge-registry:office');
+
+    const officeRequest = {
+      title: 'UI smoke ofis raporu',
+      sections: [{ heading: 'Özet', body: 'Köprü uçtan uca çalıştı.', bullets: ['kanıt üretildi'] }],
+      table_headers: ['Ad', 'Durum'],
+      rows: [['rapor', 'bitti']],
+      formats: ['md', 'csv'],
+    };
+    const drafted = await (await fetch(base + '/api/bridges/office/draft', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ request: officeRequest }),
+    })).json();
+    if ((drafted.files || []).length < 2) throw new Error('office draft produced no files');
+
+    const approval = await (await fetch(base + '/api/bridges/office/approve', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ request: officeRequest }),
+    })).json();
+
+    const delivered = await (await fetch(base + '/api/bridges/office/deliver', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        request: officeRequest,
+        target: 'work/office-smoke',
+        approval_token: approval.approval_token,
+        idempotency_key: 'ui-smoke-office-1',
+        work_id: work.id,
+      }),
+    })).json();
+    if (!delivered.ok) throw new Error('office deliver failed: ' + JSON.stringify(delivered).slice(0, 200));
+    if (!(delivered.evidence.files || []).every(item => item.sha256?.length === 64)) {
+      throw new Error('office evidence missing sha256');
+    }
+    if (!delivered.evidence.summary || delivered.evidence.summary.split('\n').length < 1) {
+      throw new Error('office evidence missing summary');
+    }
+    checks.push('office-delivery-evidence');
+
+    const bridgeTab = page.locator('[data-tab="bridges"]');
+    if (await bridgeTab.count() === 0) throw new Error('Köprüler sekmesi bulunamadı');
+    await page.locator('details.inspector-more > summary').click().catch(() => {});
+    await bridgeTab.click({ force: true }).catch(() => {});
+    const card = page.locator('.bridge-card');
+    await card.waitFor({ timeout: 15000 });
+    const cardText = await card.innerText();
+    if (!/office/.test(cardText) || !/read/.test(cardText)) {
+      throw new Error('Bridge card missing pack name or levels: ' + cardText.slice(0, 120));
+    }
+    if (!/Son teslim/i.test(cardText)) {
+      throw new Error('Bridge card missing last delivery section');
+    }
+    checks.push('bridge-card-developer-view');
+    await page.screenshot({ path: path.join(out, 'bridge-card.png'), fullPage: true });
+
     const accepted = await fetch(base + `/api/deliverables/${(await deliverableResponse.json()).id}/accept`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
