@@ -74,6 +74,40 @@ class EngineDriverHooks:
         goal = str(work.get("goal") or "").strip()
         if not goal:
             return None
+        return await self._create_run(work, goal)
+
+    async def start_repair(self, work: dict, deliverable: dict) -> str | None:
+        """Start the repair run for a ``repair_requested`` delivery.
+
+        The new delivery is linked to the rejected version (parent_version+1);
+        the user's note becomes part of the run prompt, and the work stays
+        queued while the user reviews the result, so other work keeps moving.
+        """
+        existing = str(work.get("run_id") or "").strip()
+        if existing:
+            return existing
+        base = str(work.get("goal") or "").strip()
+        if not base:
+            return None
+        note = str((deliverable or {}).get("note") or "").strip()
+        version = int((deliverable or {}).get("version") or 0)
+        goal = base
+        if note:
+            goal = (f"{base}\n\nDüzeltme isteği (teslim v{version}): {note}\n"
+                    "Önceki teslimi koru; yalnız istenen noktaları düzelt ve yeni "
+                    "sürümü kanıtla.")
+        else:
+            goal = (f"{base}\n\nTeslim v{version} için düzeltme istendi; yeni "
+                    "sürümü kanıtla.")
+        run_id = await self._create_run(work, goal)
+        if run_id and self.engine is not None and deliverable:
+            try:
+                await self.engine.record_repair_context(work["id"], deliverable, note)
+            except Exception:
+                log.exception("Onarım bağlamı kaydedilemedi: %s", work.get("id"))
+        return run_id
+
+    async def _create_run(self, work: dict, goal: str) -> str | None:
         workspace = ""
         target = work.get("workspace") or ""
         if target:

@@ -189,7 +189,7 @@ class DriverDaemon:
         self._resumed: set[str] = set()
         self._started: set[str] = set()
         self.stats = {"tick": 0, "resumed": 0, "started": 0, "reminders": 0,
-                      "blocked": 0, "skipped": 0, "errors": 0}
+                      "blocked": 0, "skipped": 0, "errors": 0, "repairs": 0}
 
     async def open(self):
         if self._opened:
@@ -349,10 +349,20 @@ class DriverDaemon:
     async def _start(self, item: dict) -> None:
         if item["id"] in self._started:
             return
+        repair = None
+        try:
+            repair = await self.work.pending_repair(item["id"])
+        except Exception:
+            self.stats["errors"] += 1
+            log.exception("Onarım durumu okunamadı: %s", item["id"])
+        start_repair = getattr(self.hooks, "start_repair", None)
         try:
             # The adapter links the created run to this work row; a retried
             # tick therefore finds ``run_id`` set and never creates a second run.
-            run_id = await self.hooks.start_work(dict(item))
+            if repair is not None and start_repair is not None:
+                run_id = await start_repair(dict(item), dict(repair))
+            else:
+                run_id = await self.hooks.start_work(dict(item))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -365,6 +375,10 @@ class DriverDaemon:
             return
         self._started.add(item["id"])
         self.stats["started"] += 1
+        if repair is not None and start_repair is not None:
+            self.stats["repairs"] += 1
+            log.info("Onarım run'ı başlatıldı: %s (v%s) -> %s",
+                     item["id"], repair.get("version"), run_id)
         try:
             await self.work.create_for_run(
                 {"id": str(run_id), "conversation_id": item.get("conversation_id", ""),

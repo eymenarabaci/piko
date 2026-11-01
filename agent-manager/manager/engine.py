@@ -85,6 +85,8 @@ class Engine:
         self.resource_lock_ttl = 3600.0
         self.resource_retry_seconds = 15.0
         self.pending_restarts: set[str] = set()
+        # work_id -> repair lineage; a repair run's delivery is linked to its parent.
+        self.repair_context: dict[str, dict] = {}
         # Bound total simultaneous workflows as well as each workflow's workers.
         self.max_concurrent_runs = 2
         self.run_slots = asyncio.Semaphore(self.max_concurrent_runs)
@@ -308,12 +310,21 @@ class Engine:
         except Exception:
             return None
 
+    async def record_repair_context(self, work_id: str, deliverable: dict, note: str = ""):
+        """Remember which version a repair run derives from (cleared on delivery)."""
+        self.repair_context[str(work_id)] = {
+            "deliverable_id": str(deliverable.get("id") or ""),
+            "parent_version": int(deliverable.get("version") or 0),
+            "note": str(note or "").strip(),
+        }
+
     async def record_delivery(self, run: dict, summary: str, *, status: str = "delivered",
                               kind: str = "run"):
         """Create one versioned deliverable per finished execution, never per poll."""
         item = await self._work_for_run(run, create=True)
         if item is None:
             return None
+        repair = self.repair_context.get(item["id"])
         program = run.get("program_items") or []
         index = int(run.get("program_index") or 0)
         current = program[index] if 0 <= index < len(program) else {}
@@ -343,9 +354,11 @@ class Engine:
                 summary=summary, requirements=[current.get("acceptance", "")],
                 evidence=evidence, open_points=open_points,
                 files=[], status=status,
+                parent_version=(repair or {}).get("parent_version"),
                 idempotency_key=idempotency_key)
         except Exception:
             return None
+        self.repair_context.pop(item["id"], None)
         await self._notify(
             "delivery", "Teslim hazır", summary[:400], run=run, work_id=item["id"],
             dedupe_key=f"delivery:{deliverable['id']}")
