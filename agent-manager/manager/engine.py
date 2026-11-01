@@ -45,6 +45,16 @@ class State(TypedDict, total=False):
     results: Annotated[dict, operator.or_]
 
 
+class _NullLease:
+    """No-op lease used when cross-process resource locks are not configured."""
+
+    resource = ""
+    run_id = ""
+
+    async def release(self) -> None:
+        return None
+
+
 class Engine:
     def __init__(self, store, checkpointer, providers, default_workspace, ao_client=None, cao_client=None):
         self.store, self.checkpointer, self.providers = store, checkpointer, providers
@@ -67,17 +77,114 @@ class Engine:
         self.ledger = None
         self.metrics = None
         self.integrations = None
+        self.resource_locks = None
+        self.bridge_gate = None
+        self.heartbeat = None
+        self.heartbeat_retire = None
+        self.resource_lock_timeout = 30.0
+        self.resource_lock_ttl = 3600.0
+        self.resource_retry_seconds = 15.0
+        self.pending_restarts: set[str] = set()
         # Bound total simultaneous workflows as well as each workflow's workers.
         self.run_slots = asyncio.Semaphore(2)
 
     def attach_infrastructure(self, *, work=None, notifications=None, ledger=None,
-                              metrics=None, integrations=None):
-        """Optional durable work records, notifications, budgets, metrics and tools."""
+                              metrics=None, integrations=None, resource_locks=None,
+                              bridge_gate=None, heartbeat=None,
+                              heartbeat_retire=None):
+        """Optional durable work records, notifications, budgets, metrics, tools,
+        cross-process resource locks, the bridge gate and health heartbeats."""
         self.work = work
         self.notifications = notifications
         self.ledger = ledger
         self.metrics = metrics
         self.integrations = integrations
+        self.resource_locks = resource_locks
+        self.bridge_gate = bridge_gate
+        self.heartbeat = heartbeat
+        self.heartbeat_retire = heartbeat_retire
+
+    async def _beat(self, source_id: str, *, kind: str = "run", detail: str = ""):
+        if self.heartbeat is None:
+            return
+        try:
+            await self.heartbeat(source_id, kind=kind, detail=detail or None)
+        except Exception:
+            pass
+
+    async def _retire_beat(self, source_id: str):
+        if self.heartbeat_retire is None:
+            return
+        try:
+            await self.heartbeat_retire(source_id)
+        except Exception:
+            pass
+
+    async def authorize_bridge(self, persona, bridge, level: str, *,
+                               approval_token=None, idempotency_key=None,
+                               payload=None) -> dict:
+        """Authorize a bridge call and record an apply/dangerous call in the ledger."""
+        if self.bridge_gate is None:
+            raise PermissionError("Köprü kapısı yapılandırılmadı; dış işlem başlatılamaz.")
+        decision = await self.bridge_gate.authorize(
+            persona, bridge, level, approval_token=approval_token,
+            idempotency_key=idempotency_key, payload=payload)
+        if decision["level"] in {"apply", "dangerous"} and self.ledger is not None:
+            operation = await self.ledger.begin(
+                decision["bridge"], decision["ledger_key"], payload)
+            decision["operation_id"] = operation["id"]
+            decision["operation_status"] = operation["status"]
+            decision["replayed"] = bool(operation.get("replayed"))
+        return decision
+
+    async def finish_bridge(self, decision: dict, *, result=None, error: str = "",
+                            uncertain: bool = False) -> dict | None:
+        operation_id = (decision or {}).get("operation_id")
+        if not operation_id or self.ledger is None:
+            return None
+        if error:
+            return await self.ledger.fail(operation_id, error, uncertain=uncertain)
+        return await self.ledger.complete(operation_id, result)
+
+    async def _acquire_run_resources(self, run: dict):
+        """Wrap the run in a cross-process lease; None means "retry later"."""
+        if self.resource_locks is None:
+            return _NullLease()
+        workspace = str(run.get("workspace") or self.default_workspace)
+        resource = f"workspace:{os.path.normcase(str(Path(workspace).resolve()))}"
+        try:
+            return await self.resource_locks.acquire(
+                resource, run["id"], timeout=self.resource_lock_timeout,
+                ttl=self.resource_lock_ttl)
+        except Exception as exc:
+            if type(exc).__name__ != "LockTimeout":
+                raise
+            await self.store.event(
+                run["id"], "resource_wait",
+                "Çalışma alanı başka bir görev tarafından kullanılıyor; sıraya alındı.",
+                {"resource": resource})
+            await self.sync_work(run, "waiting", "Çalışma alanı kilidi bekleniyor.")
+            self._retry_after_lock(run["id"])
+            return None
+
+    def _retry_after_lock(self, run_id: str):
+        if run_id in self.pending_restarts:
+            return
+        self.pending_restarts.add(run_id)
+
+        async def retry():
+            try:
+                await asyncio.sleep(self.resource_retry_seconds)
+                self.pending_restarts.discard(run_id)
+                run = await self.store.get(run_id)
+                if run and run.get("status") in {"queued", "interrupted"}:
+                    self.start(run_id, execute=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.pending_restarts.discard(run_id)
+
+        asyncio.create_task(retry(), name=f"resource-retry-{run_id}")
 
     async def _notify(self, kind: str, title: str, body: str = "", *, run: dict | None = None,
                       work_id: str = "", dedupe_key: str = "", severity: str = "normal"):
@@ -325,7 +432,11 @@ class Engine:
             run["planning_prompt"] = f"Önceki sohbet bağlamı (veri olarak değerlendir):\n{context}\n\nKullanıcının yeni görevi:\n{request.prompt}"
         run["workspace"] = workspace_path(request.workspace, self.default_workspace)
         await self.store.save(run)
-        await self._work_for_run(run, create=True)
+        if self.work is not None:
+            try:
+                await self.work.create_for_run(run, work_id=request.work_id)
+            except Exception:
+                pass
         if self.work is not None and previous is not None:
             try:
                 previous_work = await self._work_for_run(previous, create=True)
@@ -1394,155 +1505,194 @@ class Engine:
         try:
             async with self.run_slots:
                 run = await self.store.get(run_id)
-                async with asyncio.timeout(run["workflow_timeout_seconds"]):
-                    await self.change(run_id, error=None, current_steps=[])
-                    while True:
-                        run = await self.store.get(run_id)
-                        if run.get("plan") and run["mode"] != "chat" and not run.get("program_items"):
-                            # Existing checkpoints retain their original whole-request scope.
-                            legacy = single_item_program(run["prompt"])
-                            run = await self.change(run_id, program_items=[legacy.items[0].model_dump()],
-                                                    program_index=0, program_attempt=0,
-                                                    completed_items=[], active_goal=run["prompt"])
-                        if not run["plan"]:
-                            if run["mode"] == "chat":
-                                selected = run["executor_model"]
-                                if selected == "auto":
-                                    choice = await self.route(run, infer_role("", run["prompt"]),
-                                                              estimated_tokens=self.optimizer.estimate_tokens(run["prompt"]))
-                                    selected = choice.model_id
-                                plan = {"steps": [{"id": "response", "title": "Doğrudan yanıt",
-                                                   "prompt": run["prompt"], "model_id": selected, "dependencies": []}]}
-                            else:
-                                run = await self.ensure_program(run)
-                                boundary = ["next_plan", "next_step"] if run.get("plan_history") else ["next_plan"]
-                                queued = await self.store.claim_messages(run_id, boundary,
-                                                                         f"plan:{run.get('program_index', 0)}")
-                                if queued:
-                                    planning_prompt = (run.get("planning_prompt", run["prompt"])
-                                                       + "\nBu plana teslim edilen yeni kullanıcı mesajları:\n"
-                                                       + json.dumps([item["message"] for item in queued], ensure_ascii=False))
-                                    run = await self.change(run_id, planning_prompt=planning_prompt)
-                                    await self.instruction_snapshot(run_id)
-                                    await self.store.event(run_id, "instruction_delivered",
-                                                           "Kuyruktaki mesajlar yeni plana teslim edildi.",
-                                                           {"instruction_ids": [item["id"] for item in queued]})
-                                await self.change(run_id, status="planning", phase_status="planning")
-                                await self.sync_work(await self.store.get(run_id), "active",
-                                                     "Plan hazırlanıyor.")
-                                await self.store.event(run_id, "planning", "Yeni iş diliminin planı hazırlanıyor.",
-                                                       {"program_index": run.get("program_index", 0)})
-                                graph = await self.plan_graph(run)
-                                state = await self.invoke(graph, run_id, "plan",
-                                                          {"prompt": run.get("planning_prompt", run["prompt"])})
-                                plan = state["plan"]
-                            await self.change(run_id, plan=plan)
-                            run = await self.store.get(run_id)
-                        if run["mode"] == "plan" and not execute:
-                            await self.change(run_id, status="planned", phase_status="planned")
-                            await self.store.event(run_id, "planned", "Plan incelemeye hazır.")
-                            return
-                        await self.change(run_id, status="running", phase_status="executing")
-                        await self.sync_work(await self.store.get(run_id), "active",
-                                             "Plan uygulanıyor.")
-                        graph = await self.execution_graph(run)
-                        state = await self.invoke(graph, run_id, "execute",
-                                                  {"prompt": run.get("active_goal") or run["prompt"], "results": {}})
-                        await self.change(run_id, results=state["results"], current_steps=[], phase_status="auditing")
-                        run = await self.store.get(run_id)
-                        if run.get("execution_backend") == "ao":
-                            await self.change(run_id, status="awaiting_review", phase_status="awaiting_review")
-                            await self.store.event(run_id, "awaiting_review",
-                                                   "AO işçileri yanıt verdi. Worktree sonuçları birleştirme bekliyor.")
-                            return
-                        if run["mode"] == "chat":
-                            summary = await self.synthesize_summary(run, state["results"])
-                            await self.change(run_id, status="completed", phase_status="completed",
-                                              orchestrator_answer=summary)
-                            await self.record_delivery(await self.store.get(run_id), summary)
-                            return
-                        decision = await self.audit_phase(run)
-                        if decision.action == "await_user_test":
-                            await self.change(run_id, status="awaiting_user_test",
-                                              phase_status="awaiting_user_test",
-                                              audit_user_question=decision.question)
-                            await self.store.event(run_id, "user_test_requested", decision.question)
-                            testing = await self.store.get(run_id)
-                            await self.sync_work(testing, "waiting", decision.question)
-                            await self._notify(
-                                "decision", "Kullanıcı testi gerekiyor", decision.question,
-                                run=testing, dedupe_key=f"test:{run_id}:{decision.question[:80]}")
-                            return
-                        more = await self.archive_and_advance(run, decision)
-                        if not more:
-                            final_run = await self.store.get(run_id)
-                            await self.change(run_id, status="completed", phase_status="completed")
-                            await self.store.event(run_id, "completed", "Tüm iş dilimleri denetlendi ve tamamlandı.",
-                                                   {"summary": final_run.get("orchestrator_answer", "")[:400]})
-                            await self.record_delivery(await self.store.get(run_id),
-                                                       final_run.get("orchestrator_answer", ""))
-                            await self.cao.clear_terminal_pool(run.get("workspace"))
-                            return
-                        await self.cao.clear_terminal_pool(run.get("workspace"))
+                await self._beat(run_id, detail=f"slot:{run.get('status', '')}")
+                lease = await self._acquire_run_resources(run)
+                if lease is None:
+                    await self.change(
+                        run_id, status="queued", current_steps=[],
+                        error="Çalışma alanı kilidi bekleniyor; otomatik yeniden denenecek.")
+                    return
+                try:
+                    await self._drive_locked(run_id, execute)
+                finally:
+                    await lease.release()
         except NoEligibleModel as exc:
-            saved = await self.store.get(run_id)
-            step_id = getattr(exc, "step_id", None)
-            if not step_id:
-                step_id = next((sid for sid, result in saved.get("results", {}).items()
-                                if result.get("status") == "waiting_quota"), None)
-            step = next((item for item in (saved.get("plan") or {}).get("steps", [])
-                         if item["id"] == step_id), None)
-            role = infer_role(step.get("persona", ""), f"{step.get('title', '')} {step.get('prompt', '')}") if step else infer_role("", saved["prompt"])
-            writable = bool(saved["allow_writes"] and
-                            (not step or step.get("persona") not in {"reviewer", "qa_tester", "security_auditor", "architect", "researcher", "analyzer"}))
-            cooldown = await self.router.next_cooldown(
-                role, saved["execution_backend"], writable,
-                availability=await self.model_availability())
-            if cooldown:
-                timer = {"step_id": step_id, "model_id": cooldown["model_id"],
-                         "resets_at": cooldown["cooldown_until"], "execute": bool(execute or saved.get("plan"))}
-                if step_id:
-                    results = dict(saved.get("results", {}))
-                    results[step_id] = {**results.get(step_id, {}), "status": "waiting_quota",
-                                        "resets_at": timer["resets_at"], "model_id": timer["model_id"]}
-                    await self.change(run_id, results=results, status="waiting_quota",
-                                      quota_timer=timer, current_steps=[], error=None)
-                else:
-                    await self.change(run_id, status="waiting_quota", quota_timer=timer,
-                                      current_steps=[], error=None)
-                await self.store.event(run_id, "waiting_quota",
-                                       "Uygun modellerin kotası dolu; en yakın yenilenme zamanı bekleniyor.", timer)
-                waiting = await self.store.get(run_id)
-                await self.sync_work(waiting, "waiting", "Model kotası bekleniyor.")
-                await self._notify(
-                    "delay", "Kota beklemesi", "Uygun model kotası doldu; iş bekliyor.",
-                    run=waiting, dedupe_key=f"quota:{run_id}:{timer.get('resets_at')}")
-                self.schedule_quota_resume(run_id, timer)
-            else:
-                error = str(exc)[:2000]
-                await self.change(run_id, status="failed", current_steps=[], error=error)
-                await self.store.event(run_id, "failed", error)
-                failed = await self.store.get(run_id)
-                await self.sync_work(failed, "blocked", "Uygun model bulunamadı; kullanıcı kararı gerekli.")
-                await self._notify("blocker", "İş durdu", error[:400], run=failed,
-                                   dedupe_key=f"failed:{run_id}:model", severity="high")
+            await self._handle_no_model(run_id, exc, execute)
         except asyncio.CancelledError:
-            await self.change(run_id, status="cancelled", current_steps=[], error="Kullanıcı veya servis tarafından durduruldu.")
-            await self.store.event(run_id, "cancelled", "Görev durduruldu. Tamamlanan adımlar saklandı.")
-            cancelled = await self.store.get(run_id)
-            await self.sync_work(cancelled, "cancelled", "Kullanıcı görevi durdurdu.")
-            await self.cao.clear_terminal_pool(run.get("workspace"))
+            await self._finish_cancelled(run_id)
+            raise
         except Exception as exc:
-            error = "İş akışı toplam süre sınırını aştı." if isinstance(exc, TimeoutError) else str(exc)[:2000]
+            await self._finish_failed(run_id, exc)
+        finally:
+            await self._finish_drive(run_id)
+
+    async def _drive_locked(self, run_id, execute):
+
+        run = await self.store.get(run_id)
+        async with asyncio.timeout(run["workflow_timeout_seconds"]):
+            await self.change(run_id, error=None, current_steps=[])
+            while True:
+                run = await self.store.get(run_id)
+                await self._beat(run_id, detail=f"phase:{run.get('phase_status', '')}")
+                if run.get("plan") and run["mode"] != "chat" and not run.get("program_items"):
+                    # Existing checkpoints retain their original whole-request scope.
+                    legacy = single_item_program(run["prompt"])
+                    run = await self.change(run_id, program_items=[legacy.items[0].model_dump()],
+                                            program_index=0, program_attempt=0,
+                                            completed_items=[], active_goal=run["prompt"])
+                if not run["plan"]:
+                    if run["mode"] == "chat":
+                        selected = run["executor_model"]
+                        if selected == "auto":
+                            choice = await self.route(run, infer_role("", run["prompt"]),
+                                                      estimated_tokens=self.optimizer.estimate_tokens(run["prompt"]))
+                            selected = choice.model_id
+                        plan = {"steps": [{"id": "response", "title": "Doğrudan yanıt",
+                                           "prompt": run["prompt"], "model_id": selected, "dependencies": []}]}
+                    else:
+                        run = await self.ensure_program(run)
+                        boundary = ["next_plan", "next_step"] if run.get("plan_history") else ["next_plan"]
+                        queued = await self.store.claim_messages(run_id, boundary,
+                                                                 f"plan:{run.get('program_index', 0)}")
+                        if queued:
+                            planning_prompt = (run.get("planning_prompt", run["prompt"])
+                                               + "\nBu plana teslim edilen yeni kullanıcı mesajları:\n"
+                                               + json.dumps([item["message"] for item in queued], ensure_ascii=False))
+                            run = await self.change(run_id, planning_prompt=planning_prompt)
+                            await self.instruction_snapshot(run_id)
+                            await self.store.event(run_id, "instruction_delivered",
+                                                   "Kuyruktaki mesajlar yeni plana teslim edildi.",
+                                                   {"instruction_ids": [item["id"] for item in queued]})
+                        await self.change(run_id, status="planning", phase_status="planning")
+                        await self.sync_work(await self.store.get(run_id), "active",
+                                             "Plan hazırlanıyor.")
+                        await self.store.event(run_id, "planning", "Yeni iş diliminin planı hazırlanıyor.",
+                                               {"program_index": run.get("program_index", 0)})
+                        graph = await self.plan_graph(run)
+                        state = await self.invoke(graph, run_id, "plan",
+                                                  {"prompt": run.get("planning_prompt", run["prompt"])})
+                        plan = state["plan"]
+                    await self.change(run_id, plan=plan)
+                    run = await self.store.get(run_id)
+                if run["mode"] == "plan" and not execute:
+                    await self.change(run_id, status="planned", phase_status="planned")
+                    await self.store.event(run_id, "planned", "Plan incelemeye hazır.")
+                    return
+                await self.change(run_id, status="running", phase_status="executing")
+                await self.sync_work(await self.store.get(run_id), "active",
+                                     "Plan uygulanıyor.")
+                graph = await self.execution_graph(run)
+                state = await self.invoke(graph, run_id, "execute",
+                                          {"prompt": run.get("active_goal") or run["prompt"], "results": {}})
+                await self.change(run_id, results=state["results"], current_steps=[], phase_status="auditing")
+                run = await self.store.get(run_id)
+                if run.get("execution_backend") == "ao":
+                    await self.change(run_id, status="awaiting_review", phase_status="awaiting_review")
+                    await self.store.event(run_id, "awaiting_review",
+                                           "AO işçileri yanıt verdi. Worktree sonuçları birleştirme bekliyor.")
+                    return
+                if run["mode"] == "chat":
+                    summary = await self.synthesize_summary(run, state["results"])
+                    await self.change(run_id, status="completed", phase_status="completed",
+                                      orchestrator_answer=summary)
+                    await self.record_delivery(await self.store.get(run_id), summary)
+                    return
+                decision = await self.audit_phase(run)
+                if decision.action == "await_user_test":
+                    await self.change(run_id, status="awaiting_user_test",
+                                      phase_status="awaiting_user_test",
+                                      audit_user_question=decision.question)
+                    await self.store.event(run_id, "user_test_requested", decision.question)
+                    testing = await self.store.get(run_id)
+                    await self.sync_work(testing, "waiting", decision.question)
+                    await self._notify(
+                        "decision", "Kullanıcı testi gerekiyor", decision.question,
+                        run=testing, dedupe_key=f"test:{run_id}:{decision.question[:80]}")
+                    return
+                more = await self.archive_and_advance(run, decision)
+                if not more:
+                    final_run = await self.store.get(run_id)
+                    await self.change(run_id, status="completed", phase_status="completed")
+                    await self.store.event(run_id, "completed", "Tüm iş dilimleri denetlendi ve tamamlandı.",
+                                           {"summary": final_run.get("orchestrator_answer", "")[:400]})
+                    await self.record_delivery(await self.store.get(run_id),
+                                               final_run.get("orchestrator_answer", ""))
+                    await self.cao.clear_terminal_pool(run.get("workspace"))
+                    return
+                await self.cao.clear_terminal_pool(run.get("workspace"))
+
+    async def _handle_no_model(self, run_id, exc, execute):
+        saved = await self.store.get(run_id)
+        step_id = getattr(exc, "step_id", None)
+        if not step_id:
+            step_id = next((sid for sid, result in saved.get("results", {}).items()
+                            if result.get("status") == "waiting_quota"), None)
+        step = next((item for item in (saved.get("plan") or {}).get("steps", [])
+                     if item["id"] == step_id), None)
+        role = infer_role(step.get("persona", ""), f"{step.get('title', '')} {step.get('prompt', '')}") if step else infer_role("", saved["prompt"])
+        writable = bool(saved["allow_writes"] and
+                        (not step or step.get("persona") not in {"reviewer", "qa_tester", "security_auditor", "architect", "researcher", "analyzer"}))
+        cooldown = await self.router.next_cooldown(
+            role, saved["execution_backend"], writable,
+            availability=await self.model_availability())
+        if cooldown:
+            timer = {"step_id": step_id, "model_id": cooldown["model_id"],
+                     "resets_at": cooldown["cooldown_until"], "execute": bool(execute or saved.get("plan"))}
+            if step_id:
+                results = dict(saved.get("results", {}))
+                results[step_id] = {**results.get(step_id, {}), "status": "waiting_quota",
+                                    "resets_at": timer["resets_at"], "model_id": timer["model_id"]}
+                await self.change(run_id, results=results, status="waiting_quota",
+                                  quota_timer=timer, current_steps=[], error=None)
+            else:
+                await self.change(run_id, status="waiting_quota", quota_timer=timer,
+                                  current_steps=[], error=None)
+            await self.store.event(run_id, "waiting_quota",
+                                   "Uygun modellerin kotası dolu; en yakın yenilenme zamanı bekleniyor.", timer)
+            waiting = await self.store.get(run_id)
+            await self.sync_work(waiting, "waiting", "Model kotası bekleniyor.")
+            await self._notify(
+                "delay", "Kota beklemesi", "Uygun model kotası doldu; iş bekliyor.",
+                run=waiting, dedupe_key=f"quota:{run_id}:{timer.get('resets_at')}")
+            self.schedule_quota_resume(run_id, timer)
+        else:
+            error = str(exc)[:2000]
             await self.change(run_id, status="failed", current_steps=[], error=error)
             await self.store.event(run_id, "failed", error)
             failed = await self.store.get(run_id)
-            await self.sync_work(failed, "blocked", "Hata nedeniyle durdu; inceleme gerekiyor.")
-            await self._notify("blocker", "İş başarısız", error[:400], run=failed,
-                               dedupe_key=f"failed:{run_id}:{error[:60]}", severity="high")
-            await self.cao.clear_terminal_pool(run.get("workspace"))
-        finally:
+            await self.sync_work(failed, "blocked", "Uygun model bulunamadı; kullanıcı kararı gerekli.")
+            await self._notify("blocker", "İş durdu", error[:400], run=failed,
+                               dedupe_key=f"failed:{run_id}:model", severity="high")
+
+    async def _finish_cancelled(self, run_id):
+        await self.change(run_id, status="cancelled", current_steps=[], error="Kullanıcı veya servis tarafından durduruldu.")
+        await self.store.event(run_id, "cancelled", "Görev durduruldu. Tamamlanan adımlar saklandı.")
+        cancelled = await self.store.get(run_id)
+        await self.sync_work(cancelled, "cancelled", "Kullanıcı görevi durdurdu.")
+        await self.cao.clear_terminal_pool((cancelled or {}).get("workspace"))
+
+    async def _finish_failed(self, run_id, exc):
+        error = "İş akışı toplam süre sınırını aştı." if isinstance(exc, TimeoutError) else str(exc)[:2000]
+        await self.change(run_id, status="failed", current_steps=[], error=error)
+        await self.store.event(run_id, "failed", error)
+        failed = await self.store.get(run_id)
+        await self.sync_work(failed, "blocked", "Hata nedeniyle durdu; inceleme gerekiyor.")
+        await self._notify("blocker", "İş başarısız", error[:400], run=failed,
+                           dedupe_key=f"failed:{run_id}:{error[:60]}", severity="high")
+        await self.cao.clear_terminal_pool((failed or {}).get("workspace"))
+
+    async def _finish_drive(self, run_id):
+        try:
             await self.refresh_project_memory(run_id)
+        except Exception:
+            pass
+        if self.resource_locks is not None:
+            try:
+                await self.resource_locks.temizle(run_id)
+            except Exception:
+                pass
+        await self._retire_beat(run_id)
+        self.pending_restarts.discard(run_id)
 
     async def clear_cooldown(self, model_id: str) -> None:
         await self.router.clear_cooldown(model_id)

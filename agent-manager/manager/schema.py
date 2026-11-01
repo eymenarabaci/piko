@@ -56,6 +56,7 @@ class RunRequest(BaseModel):
     workspace: str = ""
     project_id: str = ""
     conversation_run_id: str = Field(default="", pattern=r"^(?:[0-9a-f]{32})?$")
+    work_id: str = Field(default="", pattern=r"^(?:[0-9a-f]{32})?$")
     allow_writes: bool = False
     timeout_seconds: int = Field(default=900, ge=10, le=3600)
     workflow_timeout_seconds: int = Field(default=14400, ge=10, le=86400)
