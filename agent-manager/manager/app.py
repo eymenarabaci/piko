@@ -38,7 +38,7 @@ from .outcomes import ensure_usable_result, is_infrastructure_error
 from .schema import Plan, RunRequest
 from .request_routing import classify_with_model
 from . import health, packs
-from .packs import office_flow
+from .packs import github as github_pack, github_flow, office_flow
 from .scheduling import missed_run, ordered_work
 from .store import Store, now
 from .triggers import TriggerManager
@@ -554,19 +554,18 @@ def create_app(data_dir=None, providers=None):
         return {"bridges": gate.registry.catalog(),
                 "shipped": getattr(app.state, "registered_packs", [])}
 
-    @app.get("/api/bridges/office/status")
-    async def office_status():
-        """Developer screen: one card per pack with its last delivery + evidence."""
-        spec = app.state.bridge_gate.registry.get("office")
-        latest = await app.state.work.latest_deliverable(kind="office-report")
+    def _bridge_card(bridge_id: str, latest) -> dict:
+        spec = app.state.bridge_gate.registry.get(bridge_id)
         return {
             "bridge": {"id": spec["id"], "version": spec["version"],
                        "levels": spec["levels"],
                        "approval": spec["approval"],
                        "evidence_format": spec["evidence"]["format"],
+                       "evidence_fields": spec["evidence"].get("fields", []),
+                       "idempotency": spec["idempotency"],
+                       "error_classes": sorted(spec["errors"]),
                        "description": spec.get("description", "")},
-            "personas": {"manager": office_flow.office.MANAGER_PERSONA,
-                         "approver": office_flow.office.APPROVER_PERSONA},
+            "personas": packs.PERSONAS.get(bridge_id, {}),
             "last_delivery": None if latest is None else {
                 "id": latest["id"], "work_id": latest["work_id"],
                 "version": latest["version"], "status": latest["status"],
@@ -574,6 +573,86 @@ def create_app(data_dir=None, providers=None):
                 "files": latest["files"], "evidence": latest["evidence"],
                 "created_at": latest["created_at"]},
         }
+
+    @app.get("/api/bridges/status")
+    async def bridges_status():
+        """Developer screen: one manifest-driven card per shipped pack."""
+        cards = []
+        for entry in packs.shipped_catalog():
+            bridge_id = entry["bridge"]["id"]
+            latest = await app.state.work.latest_deliverable(bridge_id=bridge_id)
+            cards.append(_bridge_card(bridge_id, latest))
+        return {"packs": cards}
+
+    @app.get("/api/bridges/office/status")
+    async def office_status():
+        latest = await app.state.work.latest_deliverable(bridge_id="office")
+        return _bridge_card("office", latest)
+
+    @app.get("/api/bridges/github/status")
+    async def github_status():
+        latest = await app.state.work.latest_deliverable(bridge_id="github")
+        return _bridge_card("github", latest)
+
+    @app.get("/api/bridges/github/read")
+    async def github_read(workspace: str = "", mode: str = "history"):
+        try:
+            return github_pack.adapter().read(workspace or str(ROOT), mode=mode)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/bridges/github/draft")
+    async def github_draft(request: Request):
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "JSON nesnesi gerekli.")
+        persona = body.get("persona") or github_pack.MANAGER_PERSONA
+        try:
+            await app.state.engine.authorize_bridge(
+                persona, "github", "draft", payload=body.get("request"))
+            draft = github_pack.draft(
+                body.get("workspace") or str(ROOT),
+                **(body.get("request") or {}))
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return draft
+
+    @app.post("/api/bridges/github/approve")
+    async def github_approve(request: Request):
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "JSON nesnesi gerekli.")
+        try:
+            draft = github_flow.draft_payload(
+                {**(body.get("request") or {}),
+                 "workspace": body.get("workspace") or str(ROOT)})
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return github_flow.issue_approval(draft)
+
+    @app.post("/api/bridges/github/deliver")
+    async def github_deliver(request: Request):
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "JSON nesnesi gerekli.")
+        try:
+            result = await github_flow.deliver(
+                app.state.engine,
+                persona=body.get("persona") or github_pack.MANAGER_PERSONA,
+                request=body.get("request") or {},
+                approval_token=str(body.get("approval_token") or ""),
+                idempotency_key=str(body.get("idempotency_key") or ""),
+                work_id=str(body.get("work_id") or ""),
+                run_id=str(body.get("run_id") or ""),
+                workspace=str(body.get("workspace") or ""),
+                create_pr=bool(body.get("create_pr", True)))
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return result
 
     @app.post("/api/bridges/office/draft")
     async def office_draft(request: Request):
