@@ -55,7 +55,7 @@ async def stack(tmp_path):
     locks = ResourceLocks(tmp_path / "locks.sqlite")
     await locks.open()
     gate = BridgeGate(token_store=ledger)
-    assert packs.register_shipped(gate.registry) == ["office", "github", "communication"]
+    assert packs.register_shipped(gate.registry) == ["office", "github", "communication", "veri", "izleme", "medya"]
     try:
         async with AsyncSqliteSaver.from_conn_string(str(tmp_path / "checkpoints.sqlite")) as saver:
             engine = Engine(store, saver, QuietProviders(), tmp_path)
@@ -389,7 +389,7 @@ async def test_communication_card_is_manifest_driven(tmp_path):
     from manager.packs import shipped_catalog
     cards = shipped_catalog()
     ids = [entry["bridge"]["id"] for entry in cards]
-    assert ids == ["office", "github", "communication"]
+    assert ids == ["office", "github", "communication", "veri", "izleme", "medya"]
     communication_card = next(entry for entry in cards
                               if entry["bridge"]["id"] == "communication")
     assert communication_card["bridge"]["levels"] == ["read", "draft", "apply"]
@@ -408,7 +408,7 @@ def test_api_lists_three_bridge_cards_and_blocks_proactive_writes(tmp_path):
         cards = client.get("/api/bridges/status")
         assert cards.status_code == 200
         ids = [card["bridge"]["id"] for card in cards.json()["packs"]]
-        assert ids == ["office", "github", "communication"]
+        assert ids == ["office", "github", "communication", "veri", "izleme", "medya"]
         communication = next(card for card in cards.json()["packs"]
                              if card["bridge"]["id"] == "communication")
         assert communication["bridge"]["levels"] == ["read", "draft", "apply"]

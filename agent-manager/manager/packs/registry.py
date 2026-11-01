@@ -3,15 +3,20 @@ from __future__ import annotations
 
 import logging
 
-from . import communication, github, office
+from . import communication, github, izleme, medya, office, veri
 
 log = logging.getLogger("manager.packs")
 
 SHIPPED = {"office": office.register, "github": github.register,
-           "communication": communication.register}
+           "communication": communication.register,
+           "veri": veri.register, "izleme": izleme.register,
+           "medya": medya.register}
 OFFICE_ID = office.BRIDGE_ID
 GITHUB_ID = github.BRIDGE_ID
 COMMUNICATION_ID = communication.BRIDGE_ID
+VERI_ID = veri.BRIDGE_ID
+IZLEME_ID = izleme.BRIDGE_ID
+MEDYA_ID = medya.BRIDGE_ID
 PERSONAS = {
     office.BRIDGE_ID: {"manager": office.MANAGER_PERSONA,
                        "approver": office.APPROVER_PERSONA},
@@ -21,9 +26,18 @@ PERSONAS = {
     communication.BRIDGE_ID: {"manager": communication.MANAGER_PERSONA,
                               "approver": communication.APPROVER_PERSONA,
                               "proactive": communication.PROACTIVE_PERSONA},
+    veri.BRIDGE_ID: {"manager": veri.MANAGER_PERSONA,
+                     "approver": veri.APPROVER_PERSONA,
+                     "proactive": veri.PROACTIVE_PERSONA},
+    izleme.BRIDGE_ID: {"manager": izleme.MANAGER_PERSONA,
+                       "proactive": izleme.PROACTIVE_PERSONA},
+    medya.BRIDGE_ID: {"manager": medya.MANAGER_PERSONA,
+                      "approver": medya.APPROVER_PERSONA},
 }
 # Levels a proactive background flow may ever use, per pack.
-PROACTIVE_LEVELS = {communication.BRIDGE_ID: frozenset({"read"})}
+PROACTIVE_LEVELS = {communication.BRIDGE_ID: frozenset({"read"}),
+                    veri.BRIDGE_ID: frozenset({"read"}),
+                    izleme.BRIDGE_ID: frozenset({"read"})}
 
 
 def register_shipped(registry) -> list[str]:
@@ -38,16 +52,19 @@ def register_shipped(registry) -> list[str]:
     return registered
 
 
+MODULES = (office, github, communication, veri, izleme, medya)
+
+
 def shipped_manifests() -> list[dict]:
     """Every pack manifest, read from disk — the developer card is manifest-driven."""
-    return [office.manifest(), github.manifest(), communication.manifest()]
+    return [module.manifest() for module in MODULES]
 
 
 def shipped_catalog() -> list[dict]:
     """Card data per pack: manifest facts plus persona grants."""
-    return [{"bridge": manifest_value(module),
+    return [{"bridge": module.manifest(),
              "personas": PERSONAS.get(module.BRIDGE_ID, {})}
-            for module in (office, github, communication)]
+            for module in MODULES]
 
 
 def manifest_value(module) -> dict:
@@ -55,5 +72,6 @@ def manifest_value(module) -> dict:
 
 
 __all__ = ["register_shipped", "shipped_manifests", "shipped_catalog",
-           "OFFICE_ID", "GITHUB_ID", "COMMUNICATION_ID", "PERSONAS",
-           "PROACTIVE_LEVELS", "SHIPPED"]
+           "OFFICE_ID", "GITHUB_ID", "COMMUNICATION_ID",
+           "VERI_ID", "IZLEME_ID", "MEDYA_ID", "PERSONAS",
+           "PROACTIVE_LEVELS", "SHIPPED", "MODULES"]
