@@ -1,9 +1,15 @@
 """Bridge call gate: the single place where a persona asks to use a bridge level.
 
-The gate does not perform side effects yet. It validates the role ceiling,
-the persona grant, the approval policy and the idempotency contract, then
-returns a deterministic ledger key that a later task will bind to
-OperationLedger and the persisted approval store.
+The gate validates the role ceiling, the persona grant, the approval policy and
+the idempotency contract, then returns a deterministic ledger key. It never
+executes an adapter; the engine records the key in OperationLedger first and only
+then may load the adapter.
+
+Two entry points:
+
+* ``check()`` — synchronous, in-process single-use tokens (unit tests, CLI).
+* ``authorize()`` — asynchronous; when a durable token store (OperationLedger) is
+  supplied, single-use approval is enforced across restarts.
 """
 from __future__ import annotations
 
@@ -35,8 +41,10 @@ def _payload_hash(payload) -> str:
 
 
 class BridgeGate:
-    def __init__(self, registry: BridgeRegistry | None = None) -> None:
+    def __init__(self, registry: BridgeRegistry | None = None, *,
+                 token_store=None) -> None:
         self.registry = registry if registry is not None else DEFAULT_REGISTRY
+        self.token_store = token_store
         self._used_tokens: set[str] = set()
 
     def _resolve_spec(self, bridge) -> dict:
@@ -60,9 +68,11 @@ class BridgeGate:
             raise ValueError("Persona manifesti bir rol taşımalı.")
         return role, _normalize_bridge_grants(persona.get("bridges"))
 
-    def check(self, persona, bridge, level: str, *, approval_token=None,
-              idempotency_key=None, payload=None) -> dict:
-        """Authorize one bridge call and return its deterministic ledger key."""
+    def _evaluate(self, persona, bridge, level: str, *, approval_token=None,
+                  idempotency_key=None, payload=None, consume):
+        """Validate one call. ``consume(token, bridge, level)`` returns True when
+        the approval token is acceptable; it is called only after all
+        authorization checks pass."""
         spec = self._resolve_spec(bridge)
         role, grants = self._resolve_persona(persona)
         level = str(level or "").strip().lower()
@@ -89,17 +99,13 @@ class BridgeGate:
 
         approval_used = False
         if level == "dangerous":
-            approval_used = self._consume_token(approval_token, bridge_id, level)
-            # INTEGRATION: the approval token is currently kept in memory; it will be
-            # verified against the persisted single-use approval store in a later task.
+            approval_used = consume(approval_token, bridge_id, level)
         elif level == "apply":
             mode = str(spec["approval"].get("apply", "approved"))
             if mode == "per_call_token":
-                approval_used = self._consume_token(approval_token, bridge_id, level)
+                approval_used = consume(approval_token, bridge_id, level)
             elif mode == "none":
                 raise BridgeDenied(f"'{bridge_id}' için apply onay politikası kapalı.")
-            # INTEGRATION: apply calls will be written to OperationLedger.begin(...)
-            # with the ledger_key returned below once the ledger is wired in.
 
         if level in {"apply", "dangerous"}:
             idempotency_key = str(idempotency_key or "").strip()
@@ -111,9 +117,6 @@ class BridgeGate:
         payload_hash = _payload_hash(payload)
         material = f"{bridge_id}|{level}|{idempotency_key}|{payload_hash}"
         ledger_key = f"{bridge_id}:{level}:{hashlib.sha256(material.encode('utf-8')).hexdigest()[:32]}"
-
-        # INTEGRATION: bridge_gate does not execute adapters; the driver will call
-        # registry.load_adapter(bridge_id) only after this key is durably recorded.
         return {
             "bridge": bridge_id,
             "level": level,
@@ -123,6 +126,48 @@ class BridgeGate:
             "ledger_key": ledger_key,
             "approval_used": approval_used,
         }
+
+    def check(self, persona, bridge, level: str, *, approval_token=None,
+              idempotency_key=None, payload=None) -> dict:
+        """Synchronous authorization with in-process single-use tokens."""
+        return self._evaluate(persona, bridge, level, approval_token=approval_token,
+                              idempotency_key=idempotency_key, payload=payload,
+                              consume=self._consume_token)
+
+    async def authorize(self, persona, bridge, level: str, *, approval_token=None,
+                        idempotency_key=None, payload=None) -> dict:
+        """Authorize one call, persisting single-use approval when a store exists."""
+        if self.token_store is None:
+            return self.check(persona, bridge, level, approval_token=approval_token,
+                              idempotency_key=idempotency_key, payload=payload)
+
+        # Dry evaluation first: a denied call must not consume the token.
+        self._evaluate(persona, bridge, level, approval_token="dry-run-token",
+                       idempotency_key=idempotency_key, payload=payload,
+                       consume=lambda *_: True)
+
+        async def consume(token, bridge_id, level_name):
+            token = str(token or "").strip()
+            if not token:
+                raise ApprovalRequired(
+                    f"'{bridge_id}' köprüsünde '{level_name}' seviyesi tekil onay token'ı gerektirir."
+                )
+            accepted = await self.token_store.consume_approval(
+                token, bridge=bridge_id, level=level_name)
+            if not accepted:
+                raise ApprovalRequired(f"Onay token'ı daha önce kullanıldı: '{token}'.")
+            return True
+
+        spec = self._resolve_spec(bridge)
+        level_name = str(level or "").strip().lower()
+        needs_token = level_name == "dangerous" or (
+            level_name == "apply"
+            and str(spec["approval"].get("apply", "approved")) == "per_call_token")
+        if needs_token:
+            await consume(approval_token, spec["id"], level_name)
+        return self._evaluate(persona, bridge, level, approval_token=approval_token,
+                              idempotency_key=idempotency_key, payload=payload,
+                              consume=lambda *_: True)
 
     def _consume_token(self, approval_token, bridge_id: str, level: str) -> bool:
         token = str(approval_token or "").strip()

@@ -81,6 +81,13 @@ class OperationLedger:
                 repairs_used INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS approvals(
+                token_hash TEXT PRIMARY KEY,
+                bridge TEXT NOT NULL DEFAULT '',
+                level TEXT NOT NULL DEFAULT '',
+                scope TEXT NOT NULL DEFAULT '',
+                used_at TEXT NOT NULL
+            );
         """)
         await self.db.execute(
             "UPDATE operations SET status='unknown',updated_at=?,"
@@ -187,6 +194,28 @@ class OperationLedger:
                     (max(1, min(int(limit), 500)),)) as cur:
                 rows = await cur.fetchall()
         return [self._record(row) for row in rows]
+
+    async def consume_approval(self, token: str, *, bridge: str = "", level: str = "",
+                               scope: str = "") -> bool:
+        """Persist a single-use approval token; a replay returns False."""
+        token = str(token or "").strip()
+        if not token:
+            raise ValueError("Onay token'ı gerekli.")
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        async with self.lock:
+            cursor = await self.db.execute(
+                "INSERT OR IGNORE INTO approvals(token_hash,bridge,level,scope,used_at) "
+                "VALUES(?,?,?,?,?)",
+                (digest, str(bridge)[:200], str(level)[:40], str(scope)[:200], _now()))
+            await self.db.commit()
+            return cursor.rowcount > 0
+
+    async def approval_used(self, token: str) -> bool:
+        digest = hashlib.sha256(str(token or "").strip().encode("utf-8")).hexdigest()
+        async with self.lock:
+            async with self.db.execute(
+                    "SELECT 1 FROM approvals WHERE token_hash=?", (digest,)) as cur:
+                return await cur.fetchone() is not None
 
     async def configure_budget(self, scope: str, *, token_limit: int = 0,
                                seconds_limit: int = 0, repairs_limit: int = 0) -> dict:
