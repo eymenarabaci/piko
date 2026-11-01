@@ -114,6 +114,18 @@ const chromePath = process.env.CHROME_PATH
     checks.push('inspector-work-tab');
     await page.screenshot({ path: path.join(out, 'inspector-work.png'), fullPage: true });
 
+    const metrics = await (await fetch(base + '/api/metrics')).json();
+    if (!metrics.slots || typeof metrics.slots.max_concurrent_runs !== 'number') {
+      throw new Error('Slot metrics missing from /api/metrics');
+    }
+    if (!metrics.runtime || typeof metrics.runtime.slot_occupancy_percent !== 'number') {
+      throw new Error('Runtime occupancy metrics missing from /api/metrics');
+    }
+    if (!('slot_wait_count' in metrics.slots) || !('slot_wait_avg_seconds' in metrics.runtime)) {
+      throw new Error('Queue wait counters missing from /api/metrics');
+    }
+    checks.push('slot-metrics-api:' + metrics.slots.max_concurrent_runs);
+
     const accepted = await fetch(base + `/api/deliverables/${(await deliverableResponse.json()).id}/accept`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
