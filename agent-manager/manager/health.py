@@ -334,13 +334,11 @@ def get_default_monitor() -> HealthMonitor:
     return _default_monitor
 
 
-# INTEGRATION (morning merge, engine/daemon owners):
-#   - manager.daemon: `await manager.health.beat(DAEMON_SOURCE_ID, kind="daemon")`
-#     on every tick (target: 30 s).
-#   - engine: `await manager.health.beat(run_id, kind="run")` on every progress
-#     tick, and `await manager.health.retire(run_id)` when the run terminates.
-#   - developer screen: read `manager.health.report()` only; never write here.
-# This session deliberately does not import or edit engine.py / daemon.py.
+# Wiring (see manager/daemon.py and manager/engine.py):
+#   - the driver beats once per tick with DAEMON_SOURCE_ID / kind="daemon";
+#   - the engine beats with its run id on every drive phase and retires the
+#     heartbeat when the run terminates;
+#   - the developer screen only calls report()/detect_stale(), never writes.
 async def beat(source_id: str, *, kind: str | None = None, detail: str | None = None) -> dict[str, Any]:
     return await get_default_monitor().beat(source_id, kind=kind, detail=detail)
 

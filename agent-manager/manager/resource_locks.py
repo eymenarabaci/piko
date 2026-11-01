@@ -239,7 +239,6 @@ class ResourceLocks:
                 "acquired_at": row[2], "expires_at": row[3]}
 
 
-# INTEGRATION: daemon/engine bir run'ı başlatmadan önce her kaynağı
-# `locks.acquire(<kaynak>, run_id, timeout=slot_timeout, ttl=run_ttl)` ile sarar;
-# run kesin bitince `temizle(run_id)` çağırır. Kuyruk/slot/paralellik bu modülün
-# dışında kalır — burası yalnız kaynak sahipliğini uygular.
+# Wiring: Engine.drive() acquires one lease per workspace before a run starts
+# and releases it (plus stale rows) in the run's finally block. Queueing and
+# parallelism stay outside this module; it only enforces resource ownership.
