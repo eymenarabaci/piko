@@ -1,0 +1,8 @@
+{
+  "profile": "veri-default",
+  "scope": "bridge:veri",
+  "token_limit": 40000,
+  "seconds_limit": 900,
+  "repairs_limit": 2,
+  "note": "Tek bir veri profili/rapor teslimi icin varsayilan ust sinirlar; is ve küresel tavanlar motor tarafinda ayrica uygulanir."
+}

@@ -1,0 +1,56 @@
+{
+  "id": "izleme",
+  "version": "0.1.0",
+  "description": "Salt gozlem koprusu: HTTP durum/gecikme yoklamasi, port kontrolu, jsonl telemetri kuyrugu okuma ve esik asiminda gonderilmeyen olay taslagi.",
+  "levels": [
+    "read",
+    "draft"
+  ],
+  "reason": "Bu paket bilerek apply ve dangerous seviyeleri icermez. Izleme bir gozlem alanidir: hedefe yalnizca okuma yoklamasi yapilir, alarm kurali/olay notu/aksiyon onerisi yalnizca yerel taslak olarak uretilir ve hicbir kanala gonderilmez. Gonderim/otomatik mudahale baska bir paketin onayli apply seviyesine birakilir; boylece yanlis alarmla dis sistemlere yazma riski bu pakette tanim geregi olusamaz.",
+  "idempotency": {
+    "type": "content-hash",
+    "key": "event_key"
+  },
+  "evidence": {
+    "format": "izleme-evidence",
+    "fields": [
+      "target",
+      "status",
+      "latency_samples",
+      "window_start",
+      "window_end",
+      "threshold",
+      "snapshot_sha256"
+    ]
+  },
+  "errors": {
+    "retryable": [
+      "timeout",
+      "network-error",
+      "rate-limited"
+    ],
+    "needs-user": [
+      "missing-target",
+      "ambiguous-target",
+      "missing-thresholds",
+      "telemetry-missing"
+    ],
+    "external-down": [
+      "connection-refused",
+      "service-unavailable"
+    ]
+  },
+  "approval": {},
+  "budget": {
+    "hourly_request_cap": 120,
+    "min_poll_interval_seconds": 10,
+    "note": "read seviyesi proaktif akista serbesttir; draft seviyesi saatlik tavana ve yoklama araligi alt sinirina tabidir."
+  },
+  "proactive": {
+    "levels": [
+      "read"
+    ],
+    "budget": "free"
+  },
+  "adapter": "bridge_packs.izleme.adapter:adapter"
+}

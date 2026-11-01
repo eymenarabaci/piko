@@ -1,0 +1,56 @@
+{
+  "id": "veri",
+  "version": "0.1.0",
+  "description": "Veri/bilim koprusu: CSV/TSV/JSON okuma ve profilleme, analiz raporu taslagi, onayli rapor yazimi ve okunur kanit.",
+  "levels": [
+    "read",
+    "draft",
+    "apply"
+  ],
+  "idempotency": {
+    "type": "keyed",
+    "key": "idempotency_key"
+  },
+  "evidence": {
+    "format": "veri-evidence",
+    "fields": [
+      "files",
+      "sha256",
+      "summary",
+      "report"
+    ]
+  },
+  "errors": {
+    "retryable": [
+      "timeout",
+      "rate-limited",
+      "source-locked",
+      "partial-read"
+    ],
+    "needs-user": [
+      "missing-input",
+      "ambiguous-request",
+      "approval-required",
+      "unsupported-format",
+      "schema-empty",
+      "target-exists",
+      "unsafe-target"
+    ],
+    "external-down": [
+      "source-unavailable",
+      "filesystem-unavailable",
+      "warehouse-unavailable"
+    ]
+  },
+  "approval": {
+    "apply": "per_call_token"
+  },
+  "budget": {
+    "profile": "veri-default",
+    "scope": "bridge:veri",
+    "token_limit": 40000,
+    "seconds_limit": 900,
+    "repairs_limit": 2
+  },
+  "adapter": "bridge_packs.veri.adapter:adapter"
+}

@@ -1,0 +1,50 @@
+{
+  "id": "medya",
+  "version": "0.1.0",
+  "description": "Medya koprusu: video/gorsel/ses envanteri, kurgu plani ve onayli kucuk cikti uretimi (thumbnail, kisa preview, kare seridi).",
+  "levels": [
+    "read",
+    "draft",
+    "apply"
+  ],
+  "idempotency": {
+    "type": "keyed",
+    "key": "idempotency_key"
+  },
+  "evidence": {
+    "format": "medya-evidence",
+    "fields": [
+      "source_sha256",
+      "files",
+      "preview_frame",
+      "summary",
+      "capability_used"
+    ]
+  },
+  "errors": {
+    "retryable": [
+      "timeout",
+      "codec-error",
+      "render-budget-exceeded"
+    ],
+    "needs-user": [
+      "missing-input",
+      "missing-source",
+      "approval-required"
+    ],
+    "external-down": [
+      "ffmpeg-missing",
+      "ffmpeg-crashed",
+      "ffprobe-failed"
+    ]
+  },
+  "approval": {
+    "apply": "per_call_token"
+  },
+  "budget": {
+    "render_seconds_per_minute": 120.0,
+    "max_preview_seconds": 15.0,
+    "max_preview_bytes": 2000000
+  },
+  "adapter": "bridge_packs.medya.adapter:adapter"
+}
