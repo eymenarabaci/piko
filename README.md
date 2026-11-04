@@ -1,5 +1,9 @@
 # Piko
 
+[![Piko — Bir görev. Birlikte ilerleyen ajanlar.](docs/media/piko-banner.png)](https://github.com/eymenarabaci/piko/blob/main/docs/media/piko-demo-28s.mp4)
+
+**[▶ 28 saniyelik tanıtımı izle](https://github.com/eymenarabaci/piko/blob/main/docs/media/piko-demo-28s.mp4)** · [Mimari](agent-manager/docs/ARCHITECTURE.md) · [Paralel çalışma](agent-manager/docs/isolated-parallel.md) · [Doğrulama](agent-manager/docs/VALIDATION.md)
+
 Yerel CLI ajanları için kalıcı görev yönetimi, bağımlılık tabanlı planlama ve kontrollü paralel yürütme.
 
 Piko bir işi planlara ve adımlara ayırır; uygun modeli yönlendirir, sonuçları denetler ve görev geçmişini diskte tutar. Uzun süren işlerde oturumdan devam, kota bekleme ve sınırlı hata toparlama mekanizmaları bulunur. Sürekli insan gözetimini azaltmayı amaçlar; her görevin müdahalesiz tamamlanacağını garanti etmez.
@@ -73,5 +77,9 @@ Birim/entegrasyon testlerindeki sahte sağlayıcılar gerçek LLM başarısı ve
 | `workspace/` | Yerel çalışma alanı; kullanıcı içeriği yayımlanmaz |
 
 Uygulama içi güncelleme yalnız desteklenen, temiz Git klonunda ve aktif iş yokken uygulanır; veri yedeği alınır. Geliştirme kopyasındaki değişiklikleri çalışan servise aktarmak ayrı bir dağıtım işlemidir.
+
+## Katkıda bulunun
+
+Piko'yu farklı iş akışlarında deneyebilir, [issue açarak](https://github.com/eymenarabaci/piko/issues) hata ve senaryo bildirebilir veya pull request gönderebilirsiniz. Tekrarlanabilir hata örnekleri, testler, sağlayıcı uyumluluğu ve dokümantasyon katkıları özellikle değerlidir. Paylaşmadan önce loglardan kimlik bilgilerini ve kişisel görev içeriklerini çıkarın.
 
 [MIT Lisansı](LICENSE).
