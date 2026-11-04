@@ -1,0 +1,572 @@
+/* ==========================================================================
+   Piko Living Multi-Agent Atelier & Split Layout Styles
+   Left: Conversation Stream | Right: Visual Workbench & Plan Tracker
+   ========================================================================== */
+
+:root {
+  --piko-split-bg: #0b0f19;
+  --piko-panel-bg: rgba(15, 23, 42, 0.85);
+  --piko-border: rgba(56, 189, 248, 0.16);
+  --piko-border-glow: rgba(56, 189, 248, 0.35);
+  --piko-azure: #38bdf8;
+  --piko-indigo: #6366f1;
+  --piko-pink: #f472b6;
+  --piko-emerald: #34d399;
+  --piko-amber: #fbbf24;
+  --piko-purple: #c084fc;
+}
+
+/* Split Layout Container */
+.chat-page-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(380px, 0.85fr);
+  height: 100%;
+  min-height: 0;
+  width: 100%;
+  overflow: hidden;
+  background: var(--piko-split-bg);
+}
+
+/* Left Column: Chat & Messages */
+.chat-column {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  border-right: 1px solid var(--piko-border);
+  background: #ffffff;
+  position: relative;
+}
+
+.chat-column .messages {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 24px clamp(16px, 2.5vw, 36px);
+  scrollbar-gutter: stable;
+}
+
+.chat-column .composer-zone {
+  flex-shrink: 0;
+  background: #ffffff;
+  border-top: 1px solid #e2e8f0;
+  padding: 12px clamp(16px, 2.5vw, 36px) 16px;
+}
+
+/* Right Column: Visual Workbench */
+.workbench-column {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: radial-gradient(130% 100% at 50% 0%, #111a2e 0%, #090e17 60%, #060910 100%);
+  overflow-y: auto;
+  padding: 16px;
+  gap: 14px;
+  color: #f1f5f9;
+}
+
+/* Multi-Plan Tabs Row */
+.plan-tabs-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+  scrollbar-width: none;
+}
+
+.plan-tabs-row::-webkit-scrollbar {
+  display: none;
+}
+
+.plan-tab-btn {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #94a3b8;
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-family: inherit;
+}
+
+.plan-tab-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #ffffff;
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.plan-tab-btn.active {
+  background: rgba(56, 189, 248, 0.18);
+  border-color: rgba(56, 189, 248, 0.45);
+  color: #ffffff;
+  font-weight: 600;
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.25);
+}
+
+.plan-tab-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+/* 1. Plan Progress Tracker */
+.workbench-plan-tracker {
+  background: rgba(15, 23, 42, 0.7);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--piko-border);
+  border-radius: 12px;
+  padding: 14px 16px;
+  box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.4);
+}
+
+.tracker-header {
+  margin-bottom: 12px;
+}
+
+.tracker-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.live-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--piko-emerald);
+  box-shadow: 0 0 10px var(--piko-emerald);
+  animation: pikoLiveGlow 2s infinite ease-in-out;
+}
+
+@keyframes pikoLiveGlow {
+  0%, 100% { transform: scale(1); opacity: 0.95; }
+  50% { transform: scale(1.35); opacity: 0.45; }
+}
+
+.tracker-title-row b {
+  font-size: 13px;
+  font-weight: 600;
+  color: #f8fafc;
+  letter-spacing: -0.2px;
+}
+
+.step-pill {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.15);
+  color: var(--piko-azure);
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  font-family: ui-monospace, monospace;
+}
+
+.tracker-goal {
+  margin: 0;
+  font-size: 11px;
+  color: #94a3b8;
+  line-height: 1.4;
+}
+
+/* Stepper Track */
+.plan-step-stepper {
+  position: relative;
+  margin-top: 8px;
+  padding: 4px 0 2px;
+}
+
+.stepper-track {
+  position: absolute;
+  top: 14px;
+  left: 12px;
+  right: 12px;
+  height: 3px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 2px;
+  z-index: 1;
+}
+
+.stepper-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #38bdf8, #818cf8);
+  border-radius: 2px;
+  box-shadow: 0 0 8px rgba(56, 189, 248, 0.6);
+  transition: width 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.stepper-nodes {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  justify-content: space-between;
+}
+
+.step-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+}
+
+.step-bubble {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 10px;
+  font-weight: 700;
+  background: #0f172a;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  color: #94a3b8;
+  transition: all 0.25s ease;
+}
+
+.step-node.completed .step-bubble {
+  background: var(--piko-emerald);
+  border-color: var(--piko-emerald);
+  color: #042f1a;
+  box-shadow: 0 0 10px rgba(52, 211, 153, 0.4);
+}
+
+.step-node.failed .step-bubble {
+  background: #f87171;
+  border-color: #ef4444;
+  color: #ffffff;
+  box-shadow: 0 0 10px rgba(239, 68, 68, 0.5);
+}
+
+.step-node.active .step-bubble {
+  background: var(--piko-azure);
+  border-color: #ffffff;
+  color: #082f49;
+  transform: scale(1.15);
+  box-shadow: 0 0 14px rgba(56, 189, 248, 0.8);
+}
+
+.step-node-label {
+  font-size: 10px;
+  color: #94a3b8;
+  white-space: nowrap;
+  max-width: 76px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: center;
+}
+
+.step-node.completed .step-node-label {
+  color: #34d399;
+}
+
+.step-node.failed .step-node-label {
+  color: #f87171;
+}
+
+.step-node.active .step-node-label {
+  color: #ffffff;
+  font-weight: 600;
+}
+
+/* 2. Visual Stage & Canvas */
+.piko-constellation-stage {
+  background: rgba(15, 23, 42, 0.7);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--piko-border);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 8px 24px -4px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  user-select: none;
+}
+
+.stage-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: rgba(10, 15, 26, 0.6);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.stage-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #f8fafc;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.cluster-badge {
+  font-size: 10px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.12);
+  color: #7dd3fc;
+  border: 1px solid rgba(56, 189, 248, 0.25);
+}
+
+.stage-toggle-btn {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #cbd5e1;
+  font-size: 11px;
+  padding: 4px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.stage-toggle-btn:hover, .stage-toggle-btn.active {
+  background: rgba(56, 189, 248, 0.18);
+  border-color: rgba(56, 189, 248, 0.4);
+  color: #ffffff;
+}
+
+.stage-canvas-wrapper {
+  position: relative;
+  width: 100%;
+  height: 310px;
+  background: radial-gradient(circle at 50% 50%, rgba(30, 41, 59, 0.4) 0%, transparent 70%);
+  overflow: hidden;
+}
+
+#constellation-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.constellation-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.stage-orchestration-ticker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: rgba(8, 12, 22, 0.85);
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  font-size: 11px;
+  color: #cbd5e1;
+}
+
+.ticker-label {
+  font-weight: 700;
+  color: var(--piko-azure);
+  flex-shrink: 0;
+}
+
+.ticker-message {
+  color: #e2e8f0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 3. Active Task & Worker Live Card */
+.workbench-live-card {
+  background: rgba(15, 23, 42, 0.7);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--piko-border);
+  border-radius: 12px;
+  padding: 14px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+}
+
+.live-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.live-card-agent-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.agent-avatar-mini {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: rgba(56, 189, 248, 0.15);
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  display: grid;
+  place-items: center;
+  font-size: 15px;
+}
+
+.live-card-agent-badge b {
+  display: block;
+  font-size: 12px;
+  color: #ffffff;
+}
+
+.live-card-agent-badge small {
+  display: block;
+  font-size: 10px;
+  color: #94a3b8;
+  font-family: ui-monospace, monospace;
+}
+
+.live-task-status {
+  font-size: 10px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(52, 211, 153, 0.15);
+  color: var(--piko-emerald);
+  border: 1px solid rgba(52, 211, 153, 0.3);
+  font-weight: 600;
+}
+
+.live-card-body {
+  font-size: 11px;
+  color: #cbd5e1;
+}
+
+.live-card-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: #64748b;
+  letter-spacing: 0.05em;
+  margin-bottom: 4px;
+}
+
+.live-card-action {
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: #7dd3fc;
+  line-height: 1.4;
+  margin-bottom: 10px;
+  word-break: break-all;
+}
+
+.live-card-metrics {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10px;
+  color: #94a3b8;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding-top: 8px;
+}
+
+.live-card-metrics b {
+  color: #f1f5f9;
+}
+
+/* Tooltip card in Canvas */
+.agent-tooltip-card {
+  position: absolute;
+  background: rgba(15, 23, 42, 0.95);
+  backdrop-filter: blur(14px);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  box-shadow: 0 12px 28px -6px rgba(0, 0, 0, 0.8);
+  border-radius: 10px;
+  padding: 10px 14px;
+  color: #f1f5f9;
+  font-size: 11px;
+  min-width: 200px;
+  max-width: 260px;
+  pointer-events: auto;
+  transform: translate(-50%, -115%);
+  z-index: 20;
+}
+
+.agent-tooltip-card::after {
+  content: "";
+  position: absolute;
+  bottom: -5px;
+  left: 50%;
+  transform: translateX(-50%) rotate(45deg);
+  width: 9px;
+  height: 9px;
+  background: rgba(15, 23, 42, 0.95);
+  border-right: 1px solid rgba(56, 189, 248, 0.35);
+  border-bottom: 1px solid rgba(56, 189, 248, 0.35);
+}
+
+.agent-tooltip-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 5px;
+}
+
+.agent-tooltip-name {
+  font-weight: 700;
+  font-size: 12px;
+  color: #ffffff;
+}
+
+.agent-tooltip-role {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--piko-azure);
+}
+
+/* Chat In-Stream Cluster Cards */
+.chat-demo-stream {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-bottom: 24px;
+}
+
+.chat-cluster-card {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-left: 4px solid var(--piko-azure);
+  border-radius: 10px;
+  padding: 14px 16px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+}
+
+.chat-cluster-card.security {
+  border-left-color: var(--piko-emerald);
+}
+
+.chat-cluster-card.mobile {
+  border-left-color: var(--piko-amber);
+}
+
+/* Responsive adjustments */
+@media (max-width: 1024px) {
+  .chat-page-split {
+    grid-template-columns: 1fr;
+    overflow-y: auto;
+  }
+  .chat-column {
+    border-right: 0;
+    border-bottom: 1px solid var(--piko-border);
+    height: 55vh;
+  }
+  .workbench-column {
+    height: auto;
+    min-height: 480px;
+  }
+}

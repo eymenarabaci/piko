@@ -1,0 +1,6 @@
+{
+  "allowed_providers": [
+    "evren"
+  ],
+  "reason": "Explicit operator provider policy; catalog visibility does not grant execution."
+}

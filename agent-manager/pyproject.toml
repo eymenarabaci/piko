@@ -1,6 +1,6 @@
 [project]
 name = "local-agent-manager"
-version = "1.0.0"
+version = "1.1.0"
 description = "Local CLI agents orchestrated by upstream LangGraph"
 requires-python = ">=3.12"
 dependencies = [
@@ -11,6 +11,7 @@ dependencies = [
   "httpx==0.28.1",
   "psutil==7.2.2",
   "websockets==17.3",
+  "tzdata==2026.6",
 ]
 
 [tool.pytest.ini_options]

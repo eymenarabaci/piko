@@ -14,8 +14,21 @@ Nothing here talks to a pack adapter, so a new pack only needs a rule entry.
 from __future__ import annotations
 
 import re
+import json
+from pathlib import Path
 
-BRIDGE_ORDER = ("office", "github", "communication")
+def _manifests() -> dict[str, dict]:
+    # Read contract metadata only. Never import or instantiate a domain adapter.
+    from .bridges import DEFAULT_REGISTRY, validate_bridge_spec
+    found = {spec['id']: spec for spec in DEFAULT_REGISTRY.list()}
+    root = Path(__file__).resolve().parents[1] / 'bridge_packs'
+    for path in root.glob('*/manifest.json'):
+        try:
+            spec = validate_bridge_spec(json.loads(path.read_text(encoding='utf-8')))
+            found.setdefault(spec['id'], spec)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return found
 
 _SHA256 = re.compile(r"\b[0-9a-f]{12,64}\b", re.IGNORECASE)
 _LINK = re.compile(r"https?://[^\s,;]+", re.IGNORECASE)
@@ -25,8 +38,8 @@ _BRANCH = re.compile(r"branch[:\s]+([^\s·,]+)", re.IGNORECASE)
 def evidence_lines(deliverable: dict | None) -> list[str]:
     if not deliverable:
         return []
-    return [str(line).strip() for line in deliverable.get("evidence") or []
-            if str(line).strip()]
+    return [json.dumps(line, ensure_ascii=False) if isinstance(line, dict) else str(line).strip()
+            for line in deliverable.get("evidence") or [] if str(line).strip()]
 
 
 def bridge_for(deliverable: dict | None) -> str:
@@ -37,7 +50,7 @@ def bridge_for(deliverable: dict | None) -> str:
     if bridge:
         return bridge
     kind = str(deliverable.get("kind") or "").strip().lower()
-    for name in BRIDGE_ORDER:
+    for name in _manifests():
         if kind.startswith(name):
             return name
     return ""
@@ -76,33 +89,55 @@ def _missing(bridge: str, deliverable: dict, lines: list[str]) -> list[str]:
     files = [str(item) for item in deliverable.get("files") or [] if str(item).strip()]
     missing: list[str] = []
 
-    if bridge == "office":
-        if not files:
-            missing.append("files")
-        if "sha256" not in text:
-            missing.append("sha256")
-        if not note and "özet:" not in text and "ozet:" not in text:
-            missing.append("summary")
-    elif bridge == "github":
-        if "branch" not in text:
-            missing.append("branch")
-        if "commit" not in text:
-            missing.append("commit_sha")
-        if not re.search(r"\bpr\b", text):
-            missing.append("pr_url")
-        if "github:" not in text:
-            missing.append("source")
-    elif bridge == "communication":
-        if not re.search(r"\b(mail|meeting|toplantı|toplanti):\s*\S+", text):
-            missing.append("message_id")
-        if "alıcılar" not in text and "alicilar" not in text:
-            missing.append("recipients")
-        if "sha256" not in text:
-            missing.append("preview_sha256")
-        if not re.search(r"\b(mail|meeting|toplantı|toplanti):", text):
-            missing.append("kind")
-    elif not lines:
-        missing.append("evidence")
+    if not lines:
+        missing.append('evidence')
+    if not bridge:
+        return missing
+    manifest = _manifests().get(bridge)
+    if manifest is None:
+        return [*missing, 'bridge_manifest']
+    facts = {}
+    for value in deliverable.get('evidence') or []:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                continue
+        if isinstance(value, dict):
+            if value.get('format') not in {None, manifest['evidence']['format']}:
+                missing.append('evidence_format')
+            if value.get('ok') is False:
+                missing.append('evidence_failed')
+            facts.update(value)
+    # Older packs emit descriptive evidence lines. Keep those explicit facts
+    # readable while deriving the required field set from the manifest.
+    legacy = {
+        'files': bool(files),
+        'sha256': bool(re.search(r'sha256\s+[0-9a-f]{12,64}', text)),
+        'summary': bool(note or re.search(r'(?:özet|ozet|summary):\s*\S', text)),
+        'branch': bool(_branch(lines)),
+        'commit_sha': bool(re.search(r'commit\s+[0-9a-f]{12,40}', text)),
+        'pr_url': bool(re.search(r'\bpr\s+\S', text)),
+        'test_summary': bool(re.search(r'\btest:\s*\S', text)),
+        'source': bool(re.search(r'github:\s*\S', text)),
+        'message_id': bool(re.search(r'\b(?:mail|meeting|toplantı|toplanti):\s*\S+', text)),
+        'recipients': bool(re.search(r'(?:alıcılar|alicilar):\s*\S', text)),
+        'preview_sha256': bool(re.search(r'sha256\(önizleme\):\s*[0-9a-f]{12,64}', text)),
+        'kind': bool(re.search(r'\b(?:mail|meeting|toplantı|toplanti):', text)),
+    }
+    for field in manifest['evidence']['fields']:
+        value = facts.get(field)
+        present = value is not None and value != '' and value != [] and value != {}
+        if present and ('sha256' in field):
+            values = value.values() if isinstance(value, dict) else [value]
+            present = bool(values) and all(re.fullmatch(r'[0-9a-f]{64}', str(v), re.I) for v in values)
+        if not present:
+            present = legacy.get(field, False)
+        if not present and 'sha256' not in field:
+            # New packs may emit field-labelled lines without a JSON object.
+            present = bool(re.search(r'(?m)^' + re.escape(field) + r':\s*\S', text))
+        if not present:
+            missing.append(field)
     return missing
 
 

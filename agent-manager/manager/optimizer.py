@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import asyncio
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,8 +18,13 @@ class TokenOptimizer:
         self.db_path = Path(db_path)
         self.default_run_budget = default_run_budget
         self._initialized = False
+        self._init_lock = asyncio.Lock()
 
     async def init_db(self) -> None:
+        async with self._init_lock:
+            await self._init_db()
+
+    async def _init_db(self) -> None:
         if self._initialized:
             return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -39,6 +45,12 @@ class TokenOptimizer:
             await db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_ledger_run ON token_ledger(run_id);
             """)
+            columns = {row[1] for row in await (await db.execute('PRAGMA table_info(token_ledger)')).fetchall()}
+            for name, definition in [('source', "TEXT NOT NULL DEFAULT 'legacy_unclassified'"),
+                                     ('call_id', 'TEXT')]:
+                if name not in columns:
+                    await db.execute(f'ALTER TABLE token_ledger ADD COLUMN {name} {definition}')
+            await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_call ON token_ledger(call_id)')
             await db.commit()
         self._initialized = True
 
@@ -50,7 +62,8 @@ class TokenOptimizer:
         return max(1, int(len(text) / 3.8))
 
     async def record_usage(
-        self, run_id: str, step_id: str, model_id: str, input_tokens: int, output_tokens: int
+        self, run_id: str, step_id: str, model_id: str, input_tokens: int, output_tokens: int,
+        *, source: str = 'provider_reported', call_id: str | None = None
     ) -> dict[str, Any]:
         await self.init_db()
         total = input_tokens + output_tokens
@@ -58,10 +71,10 @@ class TokenOptimizer:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 """
-                INSERT INTO token_ledger (run_id, step_id, model_id, input_tokens, output_tokens, total_tokens, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?);
+                INSERT OR IGNORE INTO token_ledger (run_id, step_id, model_id, input_tokens, output_tokens, total_tokens, timestamp, source, call_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
-                (run_id, step_id, model_id, input_tokens, output_tokens, total, now_iso),
+                (run_id, step_id, model_id, input_tokens, output_tokens, total, now_iso, source, call_id),
             )
             await db.commit()
 
@@ -70,7 +83,22 @@ class TokenOptimizer:
             "step_tokens": total,
             "run_total_tokens": run_total,
             "within_budget": run_total <= self.default_run_budget,
+            "source": source,
         }
+
+    async def get_run_breakdown(self, run_id: str) -> dict:
+        await self.init_db()
+        async with aiosqlite.connect(self.db_path) as db:
+            rows = await (await db.execute(
+                'SELECT source, SUM(total_tokens), COUNT(*) FROM token_ledger WHERE run_id=? GROUP BY source',
+                (run_id,))).fetchall()
+        totals = {source: int(total) for source, total, count in rows}
+        return {'total_tokens': totals.get('provider_reported', 0),
+                'provider_reported_tokens': totals.get('provider_reported', 0),
+                'unmeasured_records': sum(count for source, total, count in rows if source != 'provider_reported'),
+                'unknown_calls': sum(count for source, total, count in rows if source == 'unknown'),
+                'is_complete': False,
+                'note': 'Yalnız sağlayıcının bildirdiği tokenlar. Bildirilmeyen tüketim bilinmiyor; tahmin üretilmez.'}
 
     async def get_run_total(self, run_id: str) -> int:
         await self.init_db()

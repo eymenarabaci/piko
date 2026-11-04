@@ -44,6 +44,10 @@ if (-not $PythonExe) {
 if ($DaemonCommand.Count -eq 0) { $DaemonCommand = @("-m", $DaemonModule) }
 
 $DaemonErrorLogPath = "$DaemonLogPath.err"
+# The daemon writes data\daemon.log through its own rotating file handler.
+# Start-Process redirection truncates its target on every start, so the raw
+# streams are captured in sibling files instead of wiping the real log.
+$DaemonStartLogPath = "$DaemonLogPath.start"
 $env:PIKO_HEALTH_DB = $DbPath
 
 $reportProbe = @'
@@ -74,7 +78,7 @@ function Invoke-HealthCode {
 
 function Get-DaemonTail {
     $lines = @()
-    foreach ($log in @($DaemonLogPath, $DaemonErrorLogPath)) {
+    foreach ($log in @($DaemonLogPath, $DaemonErrorLogPath, $DaemonStartLogPath)) {
         if (Test-Path -LiteralPath $log) {
             $lines += "--- tail: $log ---"
             $lines += @(Get-Content -LiteralPath $log -Tail 120 -ErrorAction SilentlyContinue)
@@ -161,7 +165,7 @@ try {
             $process = Start-Process -FilePath $PythonExe `
                 -ArgumentList $DaemonCommand `
                 -WorkingDirectory $ProjectRoot `
-                -RedirectStandardOutput $DaemonLogPath `
+                -RedirectStandardOutput $DaemonStartLogPath `
                 -RedirectStandardError $DaemonErrorLogPath `
                 -WindowStyle Hidden `
                 -PassThru

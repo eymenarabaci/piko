@@ -1,0 +1,21 @@
+const fs=require('node:fs'),path=require('node:path'),cp=require('node:child_process');
+const {chromium}=require(path.join(process.env.USERPROFILE,'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'));
+const root=path.resolve(__dirname,'..'),python=path.join(root,'.venv/Scripts/python.exe');let server,browser,entry;
+(async()=>{let page;const errors=[],checks=[];try{
+ server=await chromium.launchServer({headless:true,executablePath:'C:/Program Files/Google/Chrome/Application/chrome.exe'});
+ entry=JSON.parse(cp.execFileSync(python,['-B','-c',`import psutil,json,sys; from pathlib import Path; from manager.processes import _record; p=psutil.Process(int(sys.argv[1])); e={"resource_id":"parallel-ui-"+str(p.pid),"owner_task":"parallel-planning-ui","pid":p.pid,"created_utc":__import__('datetime').datetime.fromtimestamp(p.create_time(),__import__('datetime').timezone.utc).isoformat(),"executable_path":p.exe(),"parent_pid":p.ppid(),"shared":False,"disposable":True,"state":"running"}; _record(Path.cwd(),e);print(json.dumps(e))`,String(server.process().pid)],{cwd:root,encoding:'utf8'}));
+ browser=await chromium.connect(server.wsEndpoint());page=await browser.newPage({viewport:{width:1440,height:1000}});page.on('pageerror',e=>errors.push(e.message));
+ const base='http://127.0.0.1:8765';let capable=false,submitted;
+ await page.route('**/api/bootstrap',async route=>{const res=await route.fetch();const d=await res.json();d.features={...d.features,isolated_parallel_planning:capable};await route.fulfill({json:d});});
+ await page.route('**/api/assist',async route=>{submitted=route.request().postDataJSON();const live=await (await page.request.get(base+'/api/runs/2c256f9cab3d4d2491883b56e1906d12')).json();await route.fulfill({json:{run:{...live,planning_level:'parallel'}}});});
+ await page.goto(base);await page.waitForLoadState('networkidle');
+ if(!await page.locator('#planning-level option[value=parallel]').evaluate(o=>o.disabled))throw Error('old backend must disable option '+await page.locator('#planning-level').evaluate(o=>o.outerHTML));checks.push('unsupported backend guarded');
+ capable=true;await page.reload();await page.waitForLoadState('networkidle');
+ await page.locator('#planning-level').selectOption('parallel');await page.locator('#allow-writes').check();await page.screenshot({path:path.join(root,'work/parallel-planning-ui.png'),fullPage:true});
+ await page.locator('#prompt').fill('İki bağımsız dosya hazırla');await page.locator('#composer').evaluate(f=>f.requestSubmit());
+ await page.waitForTimeout(700);
+ if(submitted?.planning_level!=='parallel'||submitted?.max_parallel!==6||submitted?.allow_writes!==true)throw Error('request mismatch '+JSON.stringify(submitted));
+ checks.push('parallel level submitted with capacity6 and explicit write permission');
+ const saved=await page.evaluate(()=>JSON.parse(localStorage.getItem('agent-manager-settings')));if(saved.planning_level!=='parallel')throw Error('selection not persisted');checks.push('selection persisted');
+ console.log(JSON.stringify({checks,errors,fixture:'Bootstrap capability and POST /api/assist mocked; no Piko task created'}));if(errors.length)process.exitCode=1;
+}catch(e){console.error(e.stack);process.exitCode=1;}finally{if(browser)await browser.close();if(server)await server.close();if(entry){entry.state='completed';cp.execFileSync(python,['-B','-c','import sys,json; from pathlib import Path; from manager.processes import _record; _record(Path.cwd(),json.loads(sys.argv[1]))',JSON.stringify(entry)],{cwd:root});}}})();

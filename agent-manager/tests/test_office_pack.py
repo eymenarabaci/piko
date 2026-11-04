@@ -126,11 +126,12 @@ def test_apply_requires_a_single_use_approval_token():
     gate = BridgeGate(bridge_registry)
     with pytest.raises(PermissionError):
         gate.check(office.APPROVER_PERSONA, "office", "apply", idempotency_key="k1")
+    token = gate.issue_approval("office", "apply")
     gate.check(office.APPROVER_PERSONA, "office", "apply",
-               idempotency_key="k1", approval_token="token-once")
+               idempotency_key="k1", approval_token=token)
     with pytest.raises(PermissionError):
         gate.check(office.APPROVER_PERSONA, "office", "apply",
-                   idempotency_key="k2", approval_token="token-once")
+                   idempotency_key="k2", approval_token=token)
 
 
 # ------------------------------------------------------------------ read level
@@ -206,7 +207,7 @@ async def test_office_delivery_flow_end_to_end(tmp_path):
         assert await ledger.list() == [], "onaysız apply deftere yazmamalı"
 
         # 2. User approves the exact draft; the token is single-use.
-        approval = office_flow.issue_approval(office_flow.draft_payload(request))
+        approval = await office_flow.issue_approval(office_flow.draft_payload(request), gate=engine.bridge_gate, target="raporlar", workspace=str(workspace))
         assert approval["approval_token"].startswith("office-")
         assert "md" in " ".join(approval["files"])
 
@@ -246,7 +247,7 @@ async def test_office_delivery_flow_end_to_end(tmp_path):
         (workspace / deliverable["files"][0]).write_text("elle düzenlendi", encoding="utf-8")
         replay = await office_flow.deliver(
             engine, persona=office.MANAGER_PERSONA, request=request, target="raporlar",
-            approval_token="another-token", idempotency_key="office-delivery-1",
+            approval_token=approval["approval_token"], idempotency_key="office-delivery-1",
             work_id=item["id"], run_id="run-office-1", workspace=str(workspace))
         assert replay["replayed"] is True
         assert (workspace / deliverable["files"][0]).read_text(encoding="utf-8") == "elle düzenlendi"
@@ -264,7 +265,7 @@ async def test_office_refuses_a_target_outside_the_workspace(tmp_path):
     async with stack(tmp_path) as (engine, work, ledger, _root):
         item = await work.create("Sınır testi", workspace=str(workspace))
         request = report_request("Dış hedef")
-        approval = office_flow.issue_approval(office_flow.draft_payload(request))
+        approval = await office_flow.issue_approval(office_flow.draft_payload(request), gate=engine.bridge_gate, target=str(outside), workspace=str(workspace))
         result = await office_flow.deliver(
             engine, persona=office.MANAGER_PERSONA, request=request,
             target=str(outside), approval_token=approval["approval_token"],

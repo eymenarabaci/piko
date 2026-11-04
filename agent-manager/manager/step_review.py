@@ -25,6 +25,23 @@ class Review(BaseModel):
 
 def parse_review(output: str) -> Review:
     data, _ = robust_json_decode(output)
+    # Presentation limits must not discard a reviewer's failure decision.
+    # Keep every finding; bound only its descriptive strings before validation.
+    if isinstance(data, dict):
+        data = dict(data)
+        for key in ("test_result", "question"):
+            if isinstance(data.get(key), str):
+                data[key] = data[key][:1000]
+        if isinstance(data.get("findings"), list):
+            bounded = []
+            for finding in data["findings"]:
+                if isinstance(finding, dict):
+                    finding = dict(finding)
+                    for key, limit in (("path", 300), ("issue", 700), ("evidence", 700)):
+                        if isinstance(finding.get(key), str):
+                            finding[key] = finding[key][:limit]
+                bounded.append(finding)
+            data["findings"] = bounded
     review = Review.model_validate(data)
     if review.status == "fail" and not review.findings:
         raise ValueError("Hata kararı somut bulgu içermiyor.")

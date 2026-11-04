@@ -46,6 +46,25 @@ def _json_list(value) -> list:
     return [str(item).strip()[:4000] for item in value if str(item).strip()]
 
 
+def _evidence_list(value) -> list:
+    if isinstance(value, dict):
+        value = [value]
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        return _json_list(value)
+    result = []
+    for entry in value:
+        if isinstance(entry, dict):
+            encoded = json.dumps(entry, ensure_ascii=False)
+            if len(encoded) > 100_000:
+                raise ValueError('Kanıt nesnesi çok büyük.')
+            result.append(json.loads(encoded))
+        elif str(entry).strip():
+            result.append(str(entry).strip()[:4000])
+    return result
+
+
 class WorkRecordManager:
     """One durable record per job: goal, requirements, priority, deadline, dependencies,
     acceptance, deliverables and user decisions. Survives restarts and chat growth."""
@@ -243,6 +262,21 @@ class WorkRecordManager:
                 rows = await cur.fetchall()
         return [self._row(row) for row in rows]
 
+    async def dependency_index(self) -> dict[str, dict]:
+        """Complete {id: {"status", "dependencies"}} index, not window-bound.
+
+        The driver's dependency gate must know every work id: a dependency
+        completed long ago is still "done", and a missing or cyclic dependency
+        can be told apart from a merely old one.
+        """
+        async with self.lock:
+            async with self.db.execute(
+                    "SELECT id, status, dependencies FROM work_items") as cur:
+                rows = await cur.fetchall()
+        return {row[0]: {"status": row[1],
+                         "dependencies": json.loads(row[2] or "[]")}
+                for row in rows}
+
     async def update(self, work_id: str, **fields) -> dict:
         allowed = {"title", "goal", "priority", "due_at", "status", "next_action",
                    "last_result", "requirements", "acceptance", "dependencies", "run_id",
@@ -367,10 +401,13 @@ class WorkRecordManager:
             raise ValueError("İş kaydı bulunamadı.")
         if status not in DELIVERABLE_STATUSES:
             raise ValueError("Geçersiz teslim durumu.")
+        if status == "accepted":
+            raise ValueError("Kabul yalnız güncel teslim kabul kapısından verilebilir.")
         summary = str(summary or "").strip()
         if not summary:
             raise ValueError("Teslim için kısa sonuç özeti gerekli.")
-        payload = json.dumps([title, kind, summary, list(requirements), list(evidence),
+        evidence = _evidence_list(evidence)
+        payload = json.dumps([title, kind, summary, list(requirements), evidence,
                               list(open_points), list(files)], ensure_ascii=False)
         content_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         idempotency_key = str(idempotency_key or "").strip() or None
@@ -389,17 +426,27 @@ class WorkRecordManager:
             version = int(row[0]) + 1
             if parent_version is None and version > 1:
                 parent_version = version - 1
+            if ((version == 1 and parent_version is not None) or
+                    (version > 1 and (isinstance(parent_version, bool) or parent_version != version - 1))):
+                raise ValueError("Teslim yalnız bu işin en güncel sürümünden türeyebilir.")
+            if run_id and work.get("run_id") and str(run_id) != work["run_id"]:
+                raise ValueError("Teslim güncel iş çalışmasına ait değil.")
             item = {
                 "id": uuid.uuid4().hex, "work_id": work_id, "run_id": str(run_id or ""),
                 "version": version, "parent_version": parent_version,
                 "title": str(title or f"Teslim v{version}")[:200], "kind": str(kind)[:40],
                 "summary": summary[:8000], "requirements": _json_list(requirements),
-                "evidence": _json_list(evidence), "open_points": _json_list(open_points),
+                "evidence": evidence, "open_points": _json_list(open_points),
                 "files": _json_list(files), "status": status,
                 "idempotency_key": idempotency_key, "content_hash": content_hash,
                 "note": str(note)[:2000], "bridge_id": str(bridge_id or "")[:60],
                 "created_at": _now(), "updated_at": _now(),
             }
+            if status in {"delivered", "test_passed"}:
+                from .delivery_evidence import inspect
+                view = inspect(item)
+                if not view["complete"]:
+                    raise ValueError("Kanıt eksik; teslim yayımlanamaz: " + ", ".join(view["missing"]))
             await self.db.execute(
                 "INSERT INTO deliverables VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (item["id"], work_id, item["run_id"], version, parent_version, item["title"],
@@ -415,14 +462,40 @@ class WorkRecordManager:
         await self.update(work_id, status="waiting",
                           next_action="Teslimi incele, kabul et veya düzeltme iste.",
                           last_result=summary[:2000])
-        return item
+        return await self.get_deliverable(item["id"])
 
     async def list_deliverables(self, work_id: str) -> list[dict]:
         async with self.lock:
             async with self.db.execute(
                     "SELECT * FROM deliverables WHERE work_id=? ORDER BY version", (work_id,)) as cur:
                 rows = await cur.fetchall()
-        return [self._deliverable(row) for row in rows]
+        work = await self.get(work_id)
+        records = [self._deliverable(row) for row in rows]
+        latest = max((item["version"] for item in records), default=0)
+        return [self._accept_metadata(item, work or {}, latest) for item in records]
+
+    @staticmethod
+    def _accept_reason(item: dict, work: dict, latest: int) -> str:
+        if item["version"] != latest:
+            return "Yalnız en güncel teslim kabul edilebilir."
+        if item["status"] not in {"delivered", "test_passed", "accepted"}:
+            return "Teslim bu durumdayken kabul edilemez."
+        if work.get("status") not in {"waiting", "done"}:
+            return "İşin güncel çalışması veya düzeltmesi henüz tamamlanmadı."
+        if work.get("run_id") and item.get("run_id") != work["run_id"]:
+            return "Teslim güncel iş çalışmasına ait değil."
+        from .delivery_evidence import inspect
+        view = inspect(item)
+        if not view["complete"]:
+            return "Kanıt eksik; teslim kabul edilemez: " + ", ".join(view["missing"])
+        return ""
+
+    @classmethod
+    def _accept_metadata(cls, item: dict, work: dict, latest: int) -> dict:
+        reason = cls._accept_reason(item, work, latest)
+        return {**item, "is_latest": item["version"] == latest,
+                "can_accept": not reason and item["status"] != "accepted",
+                "accept_block_reason": reason}
 
     async def latest_deliverable(self, kind: str = "", bridge_id: str = "") -> dict | None:
         """Most recent delivery, optionally filtered by kind or bridge."""
@@ -439,7 +512,7 @@ class WorkRecordManager:
                 cursor = await self.db.execute(
                     "SELECT * FROM deliverables ORDER BY created_at DESC LIMIT 1")
             row = await cursor.fetchone()
-        return self._deliverable(row) if row else None
+        return await self.get_deliverable(row[0]) if row else None
 
     async def latest_for_bridge(self, bridge_id: str) -> dict | None:
         """Latest delivery of a pack, matching either bridge_id or the kind prefix.
@@ -456,7 +529,7 @@ class WorkRecordManager:
                     "ORDER BY created_at DESC LIMIT 1",
                     (bridge_id, f"{bridge_id}-%")) as cur:
                 row = await cur.fetchone()
-        return self._deliverable(row) if row else None
+        return await self.get_deliverable(row[0]) if row else None
 
     async def pending_repair(self, work_id: str) -> dict | None:
         """Latest deliverable still waiting for a repair run, if any."""
@@ -474,14 +547,21 @@ class WorkRecordManager:
                     "SELECT * FROM deliverables WHERE work_id=? AND idempotency_key=?",
                     (work_id, idempotency_key)) as cur:
                 row = await cur.fetchone()
-        return self._deliverable(row) if row else None
+        return await self.get_deliverable(row[0]) if row else None
 
     async def get_deliverable(self, deliverable_id: str) -> dict | None:
         async with self.lock:
             async with self.db.execute("SELECT * FROM deliverables WHERE id=?",
                                        (deliverable_id,)) as cur:
                 row = await cur.fetchone()
-        return self._deliverable(row) if row else None
+        if not row:
+            return None
+        item = self._deliverable(row)
+        work = await self.get(item["work_id"])
+        async with self.lock:
+            cursor = await self.db.execute("SELECT MAX(version) FROM deliverables WHERE work_id=?", (item["work_id"],))
+            latest = (await cursor.fetchone())[0]
+        return self._accept_metadata(item, work or {}, latest)
 
     async def set_deliverable_status(self, deliverable_id: str, status: str,
                                      note: str = "") -> dict:
@@ -490,32 +570,49 @@ class WorkRecordManager:
         item = await self.get_deliverable(deliverable_id)
         if item is None:
             raise ValueError("Teslim bulunamadı.")
-        if status == "accepted":
-            from .delivery_evidence import inspect
-            view = inspect(item)
-            if view["bridge"] and not view["complete"]:
-                raise ValueError(
-                    "Kanıt eksik; teslim kabul edilemez: "
-                    + ", ".join(view["missing"]))
         async with self.lock:
-            await self.db.execute(
-                "UPDATE deliverables SET status=?,note=?,updated_at=? WHERE id=?",
-                (status, str(note)[:2000], _now(), deliverable_id))
-            await self.db.commit()
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await self.db.execute("SELECT * FROM deliverables WHERE id=?", (deliverable_id,))
+                row = await cursor.fetchone()
+                if row is None:
+                    raise ValueError("Teslim bulunamadı.")
+                item = self._deliverable(row)
+                cursor = await self.db.execute("SELECT MAX(version) FROM deliverables WHERE work_id=?", (item["work_id"],))
+                latest = (await cursor.fetchone())[0]
+                cursor = await self.db.execute(f"SELECT {self._select()} FROM work_items WHERE id=?", (item["work_id"],))
+                work = self._row(await cursor.fetchone())
+                if item["version"] != latest:
+                    raise ValueError("Yalnız en güncel teslimin durumu değiştirilebilir.")
+                if status == "accepted":
+                    reason = self._accept_reason(item, work, latest)
+                    if reason:
+                        raise ValueError(reason)
+                elif status in {"delivered", "test_passed"}:
+                    from .delivery_evidence import inspect
+                    view = inspect(item)
+                    if not view["complete"]:
+                        raise ValueError("Kanıt eksik; teslim durumu değiştirilemez: " + ", ".join(view["missing"]))
+                await self.db.execute(
+                    "UPDATE deliverables SET status=?,note=?,updated_at=? WHERE id=?",
+                    (status, str(note)[:2000], _now(), deliverable_id))
+                if status == "accepted":
+                    await self.db.execute("UPDATE work_items SET status='done',next_action='',updated_at=? WHERE id=?",
+                                          (_now(), item["work_id"]))
+                elif status == "repair_requested":
+                    await self.db.execute("UPDATE work_items SET status='open',run_id='',next_action=?,updated_at=? WHERE id=?",
+                                          (f"Teslim v{item['version']} için düzeltme isteği: {str(note)[:400]}", _now(), item["work_id"]))
+                elif status == "test_pending":
+                    await self.db.execute("UPDATE work_items SET status='waiting',next_action=?,updated_at=? WHERE id=?",
+                                          ("Kullanıcı testi bekleniyor.", _now(), item["work_id"]))
+                elif status == "test_failed":
+                    await self.db.execute("UPDATE work_items SET status='active',next_action=?,updated_at=? WHERE id=?",
+                                          ("Kullanıcı testi başarısız; düzeltme gerekiyor.", _now(), item["work_id"]))
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
         updated = await self.get_deliverable(deliverable_id)
-        if status == "accepted":
-            await self.update(item["work_id"], status="done", next_action="")
-        elif status == "repair_requested":
-            # The driver owns the repair run: re-open the work and drop the old
-            # run link so the next tick starts a fresh, parent-linked version.
-            # The user is not blocked meanwhile; the queue keeps moving.
-            await self.update(
-                item["work_id"], status="open", run_id="",
-                next_action=(f"Teslim v{item['version']} için düzeltme isteği: "
-                             f"{str(note)[:400]}"))
-        elif status == "test_pending":
-            await self.update(item["work_id"], status="waiting",
-                              next_action="Kullanıcı testi bekleniyor.")
         return updated
 
     async def accept(self, deliverable_id: str, note: str = "") -> dict:
@@ -541,6 +638,4 @@ class WorkRecordManager:
             await self.set_deliverable_status(deliverable_id, status, note)
         else:
             await self.set_deliverable_status(deliverable_id, status, note)
-            await self.update(current["work_id"], status="active",
-                              next_action="Kullanıcı testi başarısız; düzeltme gerekiyor.")
         return await self.get_deliverable(deliverable_id)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+from pathlib import Path
 
 from . import github
 
@@ -15,12 +16,23 @@ def draft_payload(request: dict) -> dict:
         key: value for key, value in request.items() if key != "workspace"})
 
 
-def issue_approval(draft: dict) -> dict:
+def approval_payload(draft: dict, workspace: str, create_pr: bool = True) -> dict:
+    root = Path(workspace).resolve()
+    try:
+        remote = github._run(["git", "remote", "get-url", "origin"], cwd=root, action="git remote").strip()
+    except github.GithubError:
+        remote = ""
+    return {"workspace": str(root), "remote": remote, "branch": draft["branch"],
+            "commit_sha": draft["commit_sha"], "pr_title": draft["pr_title"],
+            "pr_body": draft["pr_body"], "create_pr": bool(create_pr)}
+
+
+async def issue_approval(draft: dict, *, gate, workspace: str, create_pr: bool = True) -> dict:
     """Local approval bound to the exact branch + commit the user reviewed."""
     material = f"{draft['branch']}|{draft['commit_sha']}|{draft['pr_title']}"
     digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
     return {
-        "approval_token": f"github-{secrets.token_hex(16)}",
+        "approval_token": await gate.issue_approval_async(github.BRIDGE_ID, "apply", payload=approval_payload(draft, workspace, create_pr)),
         "draft_hash": digest,
         "branch": draft["branch"],
         "commit_sha": draft["commit_sha"],
@@ -33,8 +45,7 @@ def evidence_lines(evidence: dict) -> list[str]:
     lines = [f"github: {evidence['source']} · branch {evidence['branch']}",
              f"commit {evidence['commit_sha'][:12] or '—'}",
              f"PR {evidence['pr_url'] or evidence['pr_error'] or 'yok'}"]
-    if evidence.get("test_summary"):
-        lines.append(f"test: {evidence['test_summary']}")
+    lines.append(f"test_summary: {evidence.get('test_summary') or 'Çalıştırılmadı'}")
     return lines
 
 
@@ -52,7 +63,7 @@ async def deliver(engine, *, persona, request: dict, approval_token: str = "",
 
     if draft_only:
         return {"ok": True, "draft_only": True, "draft": draft,
-                "approval": issue_approval(draft)}
+                "approval": await issue_approval(draft, gate=engine.bridge_gate, workspace=workspace or str(engine.default_workspace), create_pr=create_pr)}
     levels = ((persona or {}).get("bridges", {}).get(github.BRIDGE_ID, {})
               if isinstance(persona, dict) else {})
     granted = levels.get("levels") if isinstance(levels, dict) else levels
@@ -62,8 +73,7 @@ async def deliver(engine, *, persona, request: dict, approval_token: str = "",
         apply_persona, github.BRIDGE_ID, "apply",
         approval_token=approval_token,
         idempotency_key=idempotency_key or f"github:{draft['commit_sha']}",
-        payload={"branch": draft["branch"], "commit_sha": draft["commit_sha"],
-                 "pr_title": draft["pr_title"]})
+        payload=approval_payload(draft, workspace or str(engine.default_workspace), create_pr))
 
     if decision.get("replayed") or decision.get("should_execute") is False:
         existing = None

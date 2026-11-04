@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -15,19 +16,24 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from .engine import Engine
+from . import live_output
+from .execution_policy import model_allowed
 from .ao import AOClient
 from .attachments import AttachmentStore, MAX_REQUEST_BYTES, attachment_prompt, validate_for_model
 from .bridge_gate import BridgeGate
-from .daemon import DriverDaemon
+from .daemon import DriverDaemon, configure_logging
+from .delivery_evidence import inspect as inspect_evidence
+from .single_instance import InstanceLock
 from .driver_hooks import EngineDriverHooks as DriverHooks
 from .integrations import IntegrationGate
 from .metrics import MetricsStore
 from .model_router import NoEligibleModel, infer_role
+from . import model_discovery, model_profiler
 from .notifications import NotificationManager
 from .operations import OperationLedger
 from .resource_locks import ResourceLocks
@@ -50,6 +56,15 @@ from .worker_catalog import list_workers
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _with_evidence_view(deliverable: dict | None) -> dict | None:
+    """Attach the pack-independent evidence view used by every delivery card."""
+    if deliverable is None:
+        return None
+    item = dict(deliverable)
+    item["evidence_view"] = inspect_evidence(item)
+    return item
+
+
 def ollama_model_profile(name: str, tag: dict) -> tuple[list[str], dict, list[str]]:
     """Avoid treating image understanding specialists as coding agents."""
     details = tag.get("details") if isinstance(tag.get("details"), dict) else {}
@@ -63,47 +78,47 @@ def ollama_model_profile(name: str, tag: dict) -> tuple[list[str], dict, list[st
             {"development": 30, "reviewer": 30, "architect": 20, "general": 15}, ["text"])
 
 
-async def load_and_discover_models(root_dir: Path) -> list[dict]:
+async def discover_runtime_models(root_dir: Path) -> list[dict]:
+    """Return freshly discovered rows without touching persistent user state."""
     models_file = root_dir / "config" / "models.json"
-    models = []
-    if models_file.exists():
-        try:
-            models = json.loads(models_file.read_text(encoding="utf-8-sig")).get("models", [])
-        except Exception:
-            pass
+    existing = model_discovery.load_models_file(models_file)
+    existing_ids = {m["id"] for m in existing}
+    discovered = await asyncio.to_thread(model_discovery.discover_models, root_dir)
 
-    existing_ids = {m["id"] for m in models}
-
-    # Dynamically query Ollama tags if active
+    # Dynamically query Ollama tags if active. Ollama is a local runtime, so a
+    # tag is a direct-runtime triple rather than a provider-only alias.
     try:
         async with httpx.AsyncClient(trust_env=False, timeout=2.0) as client:
             resp = await client.get("http://127.0.0.1:11434/api/tags")
             if resp.status_code == 200:
-                ollama_tags = resp.json().get("models", [])
-                for tag in ollama_tags:
+                for tag in resp.json().get("models", []):
                     name = tag.get("name")
-                    if name and name not in existing_ids:
-                        size_bytes = tag.get("size", 0)
-                        param_size = f"{round(size_bytes / (1024**3), 1)}GB" if size_bytes else "Local"
-                        capabilities, priority, modalities = ollama_model_profile(name, tag)
-                        models.append({
-                            "id": name,
-                            "provider": "ollama",
-                            "cli": None,
-                            "capabilities": capabilities,
-                            "effort_levels": [],
-                            "priority": priority,
-                            "availability": {"status": "unknown", "quota_status": "unknown", "checked_at": None, "source": None, "verified": False},
-                            "provenance": {"identity": "local_catalog", "capabilities": "user_configured", "effort_levels": "user_configured", "provider_catalog_verified": True, "note": f"Ollama'dan otomatik çekilen model ({param_size})."},
-                            "base_model": name,
-                            "default_effort": "",
-                            "hidden": False,
-                            "execution_supported": True,
-                            "catalog_source": "ollama /api/tags",
-                            "parameter_size": param_size,
-                            "input_modalities": modalities
-                        })
-                        existing_ids.add(name)
+                    if not name or name in existing_ids:
+                        continue
+                    size_bytes = tag.get("size", 0)
+                    param_size = f"{round(size_bytes / (1024**3), 1)}GB" if size_bytes else "Local"
+                    capabilities, priority, modalities = ollama_model_profile(name, tag)
+                    discovered.append({
+                        "id": name,
+                        "model": name,
+                        "provider": "ollama",
+                        "runtime": "direct",
+                        "account": "default",
+                        "cli": None,
+                        "capabilities": capabilities,
+                        "effort_levels": [],
+                        "priority": priority,
+                        "availability": {"status": "unknown", "quota_status": "unknown", "checked_at": None, "source": None, "verified": False},
+                        "provenance": {"identity": "local_catalog", "capabilities": "user_configured", "effort_levels": "user_configured", "provider_catalog_verified": True, "note": f"Ollama'dan otomatik çekilen model ({param_size})."},
+                        "base_model": name,
+                        "default_effort": "",
+                        "hidden": False,
+                        "execution_supported": True,
+                        "catalog_source": "ollama /api/tags",
+                        "parameter_size": param_size,
+                        "input_modalities": modalities
+                    })
+                    existing_ids.add(name)
     except Exception:
         pass
 
@@ -114,12 +129,18 @@ async def load_and_discover_models(root_dir: Path) -> list[dict]:
             cli_data = json.loads(cli_cfg_file.read_text(encoding="utf-8"))
             for custom_m in cli_data.get("models", []):
                 if custom_m.get("id") and custom_m["id"] not in existing_ids:
-                    models.append(custom_m)
+                    discovered.append(custom_m)
                     existing_ids.add(custom_m["id"])
         except Exception:
             pass
+    return discovered
 
-    return models
+
+async def load_and_discover_models(root_dir: Path) -> list[dict]:
+    models_file = root_dir / "config" / "models.json"
+    existing = model_discovery.load_models_file(models_file)
+    discovered = await discover_runtime_models(root_dir)
+    return model_discovery.merge_models(existing, discovered)
 
 def create_app(data_dir=None, providers=None):
     data_dir = Path(data_dir or os.environ.get("AGENT_MANAGER_DATA", ROOT / "data"))
@@ -127,6 +148,7 @@ def create_app(data_dir=None, providers=None):
     @asynccontextmanager
     async def lifespan(app):
         data_dir.mkdir(parents=True, exist_ok=True)
+        configure_logging(data_dir, filename="piko.log")
         token_file = data_dir / "remote_token.txt"
         if token_file.exists():
             remote_token = token_file.read_text(encoding="utf-8").strip()
@@ -135,6 +157,7 @@ def create_app(data_dir=None, providers=None):
             token_file.write_text(remote_token, encoding="utf-8")
         app.state.remote_token = remote_token
         app.state.data_dir = data_dir
+        app.state.calibrations = {}
         app.state.server_started_at = now()
         app.state.updater = Updater(ROOT.parent, data_dir)
         app.state.update_in_progress = False
@@ -186,15 +209,29 @@ def create_app(data_dir=None, providers=None):
                 triggers = TriggerManager(data_dir, engine)
                 app.state.triggers = triggers
                 daemon_task = asyncio.create_task(triggers.run_daemon())
-                driver_task = asyncio.create_task(driver.run_daemon())
-                await engine.recover()
+                # Exactly one driver may tick per data dir. When the scheduled
+                # watchdog already owns the lock this process leaves driving to
+                # it and stays a pure API/UI surface.
+                driver_lock = InstanceLock(data_dir / "daemon.lock")
+                if driver_lock.acquire():
+                    driver_task = asyncio.create_task(driver.run_daemon())
+                else:
+                    driver_task = None
+                    app.state.driver_lock_held = False
+                app.state.driver_lock = driver_lock
+                # A UI-only process must not mark another driver's live tasks interrupted.
+                if driver_task is not None:
+                    await engine.recover()
                 try:
                     yield
                 finally:
                     await triggers.stop_daemon()
                     driver.stop()
-                    for task in (daemon_task, driver_task):
-                        task.cancel()
+                    if driver_task is not None:
+                        driver_task.cancel()
+                    if daemon_task is not None:
+                        daemon_task.cancel()
+                    driver_lock.release()
                     await engine.close()
                     for manager in (resource_locks, integrations, metrics, ledger,
                                     notifications, work):
@@ -205,7 +242,7 @@ def create_app(data_dir=None, providers=None):
         finally:
             await store.close()
 
-    app = FastAPI(title="Piko", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="Piko", version="1.1.0", lifespan=lifespan)
 
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception):
@@ -343,8 +380,9 @@ def create_app(data_dir=None, providers=None):
     @app.get("/api/bootstrap")
     async def bootstrap():
         engine = app.state.engine
-        return {"service_id": "agent-manager", "engine": "LangGraph", "version": "1.0.0",
+        return {"service_id": "agent-manager", "engine": "LangGraph", "version": "1.1.0",
                 "models": list(engine.models.values()), "providers": engine.providers.available(),
+                "execution_policy": {"allowed_providers": sorted({m.get("provider") for m in engine.models.values() if m.get("provider") and model_allowed(m)})},
                 "model_cooldowns": await engine.router.get_cooldowns(),
                 "ao": await engine.ao.health(),
                 "cao": await engine.cao.health(),
@@ -355,7 +393,7 @@ def create_app(data_dir=None, providers=None):
                 "workspace_default": str(ROOT),
                 "max_concurrent_runs": engine.max_concurrent_runs,
                 "features": {"work_records": True, "notifications": True,
-                             "deliverables": True, "developer_view": True}}
+                             "deliverables": True, "developer_view": True, "cli_live_output": True, "isolated_parallel_planning": True}}
 
     @app.get("/api/work")
     async def list_work(status: str = "", conversation_id: str = "", limit: int = 100):
@@ -394,8 +432,10 @@ def create_app(data_dir=None, providers=None):
         item = await app.state.work.get(work_id)
         if item is None:
             raise HTTPException(404, "İş kaydı bulunamadı.")
+        deliverables = [_with_evidence_view(deliverable)
+                        for deliverable in await app.state.work.list_deliverables(work_id)]
         return {"work": item,
-                "deliverables": await app.state.work.list_deliverables(work_id),
+                "deliverables": deliverables,
                 "summary": await app.state.work.summary(work_id)}
 
     @app.put("/api/work/{work_id}")
@@ -434,16 +474,20 @@ def create_app(data_dir=None, providers=None):
     async def add_deliverable(work_id: str, request: Request):
         body = await request.json()
         try:
-            return await app.state.work.add_deliverable(
+            deliverable = await app.state.work.add_deliverable(
                 work_id, run_id=body.get("run_id", ""), title=body.get("title", ""),
                 kind=body.get("kind", "report"), summary=body.get("summary", ""),
                 requirements=body.get("requirements", ()),
                 evidence=body.get("evidence", ()),
                 open_points=body.get("open_points", ()),
                 files=body.get("files", ()),
+                bridge_id=body.get("bridge_id", ""),
+                note=body.get("note", ""),
+                parent_version=body.get("parent_version"),
                 idempotency_key=body.get("idempotency_key", ""))
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        return _with_evidence_view(deliverable)
 
     @app.post("/api/deliverables/{deliverable_id}/accept")
     async def accept_deliverable(deliverable_id: str, request: Request):
@@ -453,10 +497,13 @@ def create_app(data_dir=None, providers=None):
                                                       str((body or {}).get("note", "")))
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        repairs = sum(1 for item in await app.state.work.list_deliverables(
+            deliverable["work_id"]) if item["status"] == "repair_requested")
         await app.state.metrics.record(
             work_id=deliverable["work_id"], run_id=deliverable["run_id"],
-            task_kind="delivery", success=True, user_acceptance="accepted")
-        return deliverable
+            task_kind="delivery", success=True, repairs=repairs,
+            user_acceptance="accepted")
+        return _with_evidence_view(deliverable)
 
     @app.post("/api/deliverables/{deliverable_id}/repair")
     async def repair_deliverable(deliverable_id: str, request: Request):
@@ -468,8 +515,27 @@ def create_app(data_dir=None, providers=None):
             raise HTTPException(400, str(exc)) from exc
         await app.state.metrics.record(
             work_id=deliverable["work_id"], run_id=deliverable["run_id"],
-            task_kind="delivery", success=False, repairs=1, user_acceptance="rejected")
-        return deliverable
+            task_kind="delivery", success=False, repairs=1,
+            reviewer_verdict="repair", user_acceptance="rejected")
+        return _with_evidence_view(deliverable)
+
+    @app.post("/api/deliverables/{deliverable_id}/try")
+    async def try_deliverable(deliverable_id: str, request: Request):
+        """'Şunu dene: …' — a repair request phrased as a concrete suggestion."""
+        body = await request.json()
+        note = str((body or {}).get("note", "")).strip()
+        if not note:
+            raise HTTPException(400, "Denenecek öneri için açıklama gerekli.")
+        try:
+            deliverable = await app.state.work.request_repair(
+                deliverable_id, f"Şunu dene: {note}")
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        await app.state.metrics.record(
+            work_id=deliverable["work_id"], run_id=deliverable["run_id"],
+            task_kind="delivery", success=False, repairs=1,
+            reviewer_verdict="suggestion", user_acceptance="rejected")
+        return _with_evidence_view(deliverable)
 
     @app.post("/api/deliverables/{deliverable_id}/test")
     async def test_deliverable(deliverable_id: str, request: Request):
@@ -485,7 +551,7 @@ def create_app(data_dir=None, providers=None):
             work_id=deliverable["work_id"], run_id=deliverable["run_id"],
             task_kind="delivery", success=body["passed"],
             executed_test="pass" if body["passed"] else "fail")
-        return deliverable
+        return _with_evidence_view(deliverable)
 
     @app.get("/api/notifications")
     async def list_notifications(unread: int = 0, include_suppressed: int = 0):
@@ -557,6 +623,7 @@ def create_app(data_dir=None, providers=None):
 
     def _bridge_card(bridge_id: str, latest) -> dict:
         spec = app.state.bridge_gate.registry.get(bridge_id)
+        latest = _with_evidence_view(latest)
         return {
             "bridge": {"id": spec["id"], "version": spec["version"],
                        "levels": spec["levels"],
@@ -569,9 +636,11 @@ def create_app(data_dir=None, providers=None):
             "personas": packs.PERSONAS.get(bridge_id, {}),
             "last_delivery": None if latest is None else {
                 "id": latest["id"], "work_id": latest["work_id"],
-                "version": latest["version"], "status": latest["status"],
+                "version": latest["version"], "parent_version": latest["parent_version"],
+                "status": latest["status"],
                 "title": latest["title"], "summary": latest["summary"],
                 "files": latest["files"], "evidence": latest["evidence"],
+                "evidence_view": latest["evidence_view"],
                 "created_at": latest["created_at"]},
         }
 
@@ -581,23 +650,23 @@ def create_app(data_dir=None, providers=None):
         cards = []
         for entry in packs.shipped_catalog():
             bridge_id = entry["bridge"]["id"]
-            latest = await app.state.work.latest_deliverable(bridge_id=bridge_id)
+            latest = await app.state.work.latest_for_bridge(bridge_id)
             cards.append(_bridge_card(bridge_id, latest))
         return {"packs": cards}
 
     @app.get("/api/bridges/office/status")
     async def office_status():
-        latest = await app.state.work.latest_deliverable(bridge_id="office")
+        latest = await app.state.work.latest_for_bridge("office")
         return _bridge_card("office", latest)
 
     @app.get("/api/bridges/github/status")
     async def github_status():
-        latest = await app.state.work.latest_deliverable(bridge_id="github")
+        latest = await app.state.work.latest_for_bridge("github")
         return _bridge_card("github", latest)
 
     @app.get("/api/bridges/communication/status")
     async def communication_status():
-        latest = await app.state.work.latest_deliverable(bridge_id="communication")
+        latest = await app.state.work.latest_for_bridge("communication")
         return _bridge_card("communication", latest)
 
     @app.get("/api/bridges/communication/read")
@@ -655,7 +724,9 @@ def create_app(data_dir=None, providers=None):
         if not isinstance(body, dict):
             raise HTTPException(400, "JSON nesnesi gerekli.")
         try:
-            return communication_flow.issue_approval(body.get("request") or {})
+            return await communication_flow.issue_approval(body.get("request") or {},
+                gate=app.state.engine.bridge_gate, workspace=body.get("workspace") or str(ROOT),
+                fixture_db=str(body.get("fixture_db") or ""))
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 
@@ -716,7 +787,8 @@ def create_app(data_dir=None, providers=None):
                  "workspace": body.get("workspace") or str(ROOT)})
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-        return github_flow.issue_approval(draft)
+        return await github_flow.issue_approval(draft, gate=app.state.engine.bridge_gate,
+            workspace=body.get("workspace") or str(ROOT), create_pr=body.get("create_pr", True))
 
     @app.post("/api/bridges/github/deliver")
     async def github_deliver(request: Request):
@@ -764,11 +836,14 @@ def create_app(data_dir=None, providers=None):
     async def office_approve(request: Request):
         """Local user approval: a single-use token bound to the draft hash."""
         body = await request.json()
+        if not isinstance(body, dict) or not str(body.get("target") or "").strip():
+            raise HTTPException(400, "Onay için hedef klasör gerekli.")
         try:
             draft = office_flow.draft_payload((body or {}).get("request") or {})
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-        return office_flow.issue_approval(draft)
+        return await office_flow.issue_approval(draft, gate=app.state.engine.bridge_gate,
+            workspace=body.get("workspace") or str(ROOT), target=str(body.get("target") or ""))
 
     @app.post("/api/bridges/office/deliver")
     async def office_deliver(request: Request):
@@ -979,8 +1054,12 @@ def create_app(data_dir=None, providers=None):
     async def get_project_stats(project_id: str):
         engine = app.state.engine
         runs = await engine.store.list()
-        proj_runs = [r for r in runs if r.get("project_id") == project_id or not project_id]
-        
+        project = app.state.projects.get(project_id)
+        project_path = str(Path(project['path']).resolve()).casefold() if project and project.get('path') else None
+        proj_runs = [r for r in runs if r.get("project_id") == project_id or not project_id
+                     or (not r.get('project_id') and project_path and r.get('workspace')
+                         and str(Path(r['workspace']).resolve()).casefold() == project_path)]
+
         total_steps = 0
         for r in proj_runs:
             plan = r.get("plan") or {}
@@ -991,7 +1070,7 @@ def create_app(data_dir=None, providers=None):
         total_tokens = 0
         try:
             for r in proj_runs:
-                total_tokens += await engine.optimizer.get_run_total(r["id"])
+                total_tokens += (await engine.optimizer.get_run_breakdown(r["id"]))['total_tokens']
         except Exception:
             pass
 
@@ -1009,23 +1088,160 @@ def create_app(data_dir=None, providers=None):
             "total_runs": len(proj_runs),
             "total_steps": total_steps,
             "total_tokens": total_tokens,
+            "provider_reported_tokens": total_tokens,
             "active_triggers": active_triggers,
         }
 
     @app.post("/api/models/refresh")
     async def refresh_models():
         engine = app.state.engine
-        discovered = await load_and_discover_models(ROOT)
-        for m in discovered:
-            if m["id"] not in engine.models:
-                engine.models[m["id"]] = m
+        discovered = await discover_runtime_models(ROOT)
+        models_file = ROOT / "config" / "models.json"
+        merged, new_count = await asyncio.to_thread(
+            model_discovery.refresh_models_file, models_file, discovered)
+        engine.models = {row["id"]: row for row in merged}
         if hasattr(engine.providers, "models"):
-            engine.providers.models = [dict(row) for row in discovered]
-            engine.providers.by_id = {row['id']: row for row in discovered}
+            engine.providers.models = [dict(row) for row in merged]
+            engine.providers.by_id = {row["id"]: row for row in merged}
         if hasattr(engine.router, "models"):
             engine.router.models = engine.models
         available = await engine.model_availability()
-        return {"models": list(engine.models.values()), "availability": available}
+        return {"models": merged, "availability": available,
+                "scanned": len(discovered), "new": new_count,
+                "visible": sum(1 for row in merged if not row.get("hidden"))}
+
+    def _find_model(engine, body: dict) -> dict | None:
+        wanted_id = str(body.get("id") or "").strip()
+        wanted_model = str(body.get("model") or "").strip()
+        wanted_runtime = str(body.get("runtime") or "").strip()
+        for row in engine.models.values():
+            if wanted_id and row.get("id") == wanted_id:
+                return row
+            if (wanted_model and (row.get("model") == wanted_model
+                                  or row.get("base_model") == wanted_model)
+                    and (not wanted_runtime or row.get("runtime") == wanted_runtime)):
+                return row
+        return None
+
+    def _sync_model_catalog(engine, rows: list[dict]) -> None:
+        engine.models = {row["id"]: row for row in rows}
+        if hasattr(engine.providers, "models"):
+            engine.providers.models = [dict(row) for row in rows]
+            engine.providers.by_id = {row["id"]: row for row in rows}
+        if hasattr(engine.router, "models"):
+            engine.router.models = engine.models
+
+    @app.post("/api/models/hide")
+    async def hide_model(request: Request):
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, "JSON nesnesi gerekli.")
+        engine = app.state.engine
+        row = _find_model(engine, body)
+        if row is None:
+            raise HTTPException(404, "Model üçlüsü bulunamadı.")
+        row["hidden"] = bool(body.get("hidden", True))
+        models_file = ROOT / "config" / "models.json"
+        await asyncio.to_thread(model_discovery.save_models_file, models_file,
+                                list(engine.models.values()))
+        return {"model": row, "hidden": row["hidden"],
+                "models": list(engine.models.values())}
+
+    def _calibration_image(data_dir: Path) -> str:
+        folder = data_dir / "calibration"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / "white-pixel-v2.png"
+        if not path.exists():
+            path.write_bytes(base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"))
+        return str(path)
+
+    async def _calibration_runner(record: dict, task, budget: dict) -> dict:
+        engine = app.state.engine
+        model = engine.models.get(record.get("id")) or record
+        runtime = str(model.get("runtime") or "")
+        provider = str(model.get("provider") or "")
+        if runtime != "direct" and provider not in {"codex", "antigravity", "ollama", "evren"}:
+            raise RuntimeError(f"{runtime or provider} için çağrı adaptörü bağlı değil")
+        if provider not in {"codex", "antigravity", "ollama", "evren"}:
+            raise RuntimeError(f"{provider} bu makinede doğrudan çalıştırılamıyor")
+
+        async def noop(*args, **kwargs):
+            return None
+
+        images = []
+        if "image" in task.required_modalities:
+            images = [_calibration_image(data_dir)]
+        started = asyncio.get_running_loop().time()
+        result = await engine.providers.run(
+            model["id"], task.prompt, workspace=str(_resolve_workspace(None)),
+            allow_writes=False, timeout=float(budget.get("timeout_seconds", 45)),
+            on_event=noop, images=images)
+        duration = asyncio.get_running_loop().time() - started
+        output = result.get("output", "") if isinstance(result, dict) else ""
+        return {"passed": model_profiler.evaluate_micro_task(task, output),
+                "duration_seconds": duration, "output": output[:1000]}
+
+    @app.post("/api/models/calibrate")
+    async def calibrate_models(request: Request):
+        body = await request.json()
+        triples = body.get("triples") if isinstance(body, dict) else None
+        if not isinstance(triples, list) or not triples:
+            raise HTTPException(400, "Kalibrasyon için açık bir triples listesi gerekli.")
+        engine = app.state.engine
+        token = uuid.uuid4().hex
+        cancel = asyncio.Event()
+        app.state.calibrations[token] = cancel
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def progress(event: dict) -> None:
+            await queue.put(event)
+
+        async def stream():
+            try:
+                yield json.dumps({"type": "start", "token": token,
+                                  "requested": len(triples)}, ensure_ascii=False) + "\n"
+                records = list(engine.models.values())
+                job = asyncio.create_task(model_profiler.calibrate_triples(
+                    records, triples, _calibration_runner, progress=progress, cancel=cancel))
+                while not job.done():
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=0.1)
+                    except asyncio.TimeoutError:
+                        continue
+                    yield json.dumps(event, ensure_ascii=False) + "\n"
+                updated, report = await job
+                while not queue.empty():
+                    yield json.dumps(queue.get_nowait(), ensure_ascii=False) + "\n"
+                if report.get("calibrated"):
+                    _sync_model_catalog(engine, updated)
+                    models_file = ROOT / "config" / "models.json"
+                    await asyncio.to_thread(model_discovery.save_models_file,
+                                            models_file, updated)
+                yield json.dumps({"type": "done", "report": report,
+                                  "models": list(engine.models.values())},
+                                 ensure_ascii=False) + "\n"
+            except asyncio.CancelledError:
+                cancel.set()
+                raise
+            except Exception as exc:  # noqa: BLE001 - stream a readable failure
+                yield json.dumps({"type": "error", "error": f"{type(exc).__name__}: {exc}"},
+                                 ensure_ascii=False) + "\n"
+            finally:
+                cancel.set()
+                app.state.calibrations.pop(token, None)
+
+        return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+    @app.post("/api/models/calibrate/cancel")
+    async def cancel_calibration(request: Request):
+        body = await request.json()
+        token = str((body or {}).get("token") or "")
+        event = getattr(app.state, "calibrations", {}).get(token)
+        if event is None:
+            raise HTTPException(404, "Kalibrasyon bulunamadı.")
+        event.set()
+        return {"ok": True, "token": token}
 
     @app.get("/api/remote-info")
     async def remote_info():
@@ -1060,8 +1276,7 @@ def create_app(data_dir=None, providers=None):
     @app.get("/api/runs/{run_id}/tokens")
     async def get_tokens(run_id: str):
         await require(run_id)
-        total = await app.state.engine.optimizer.get_run_total(run_id)
-        return {"run_id": run_id, "total_tokens": total}
+        return {"run_id": run_id, **await app.state.engine.optimizer.get_run_breakdown(run_id)}
 
     @app.get("/api/projects")
     async def list_projects():
@@ -1239,7 +1454,7 @@ def create_app(data_dir=None, providers=None):
         message = str(body.get("message") or "").strip()
         attachments = app.state.attachments.resolve_many(body.get("attachments"))
         planning_level = body.get("planning_level", "fast")
-        if not isinstance(planning_level, str) or planning_level not in {"fast", "balanced", "detailed"}:
+        if not isinstance(planning_level, str) or planning_level not in {"fast", "balanced", "detailed", "parallel"}:
             raise HTTPException(400, "Geçersiz planlama düzeyi.")
         if (not message and not attachments) or len(message) > 8000:
             raise HTTPException(400, "Mesaj 1–8000 karakter arasında olmalı.")
@@ -1283,12 +1498,12 @@ def create_app(data_dir=None, providers=None):
         if previous:
             payload.setdefault("workspace", previous["workspace"])
             payload.setdefault("project_id", previous.get("project_id", ""))
-        payload.update(prompt=prompt, mode="plan", planner_model=model_id,
+        payload.update(prompt=prompt, mode=str(body.get("mode") or "plan").strip() if str(body.get("mode") or "plan").strip() in {"plan", "orchestrate"} else "plan", planner_model=model_id,
                        executor_model="auto", conversation_run_id=conversation_run_id,
                        planning_level=planning_level)
         run = await app.state.engine.create(RunRequest.model_validate(payload))
         await app.state.engine.store.event(run["id"], "request_routed", f"Plan seçildi: {routing_reason}")
-        return {"kind": "plan", "run": run, "requires_approval": True, "routing_reason": routing_reason}
+        return {"kind": "plan", "run": run, "requires_approval": payload.get("mode") == "plan", "routing_reason": routing_reason}
 
     @app.post("/api/chat")
     async def direct_chat(request: Request):
@@ -1392,7 +1607,7 @@ def create_app(data_dir=None, providers=None):
                         if model.get("provider") == "ollama" and model.get("execution_supported", True)]
         available = await engine.model_availability()
         local = next((model for model in local_models if available.get(model["id"])), None)
-        
+
         # If local Ollama is not active, gracefully use the run's planner model or available cloud model
         active_model_id = None
         if requested_model:
@@ -1580,6 +1795,29 @@ def create_app(data_dir=None, providers=None):
             except (RuntimeError, WebSocketDisconnect):
                 pass
 
+    @app.get("/api/runs/{run_id}/steps/{step_id}/live-output")
+    async def cli_live_output(run_id: str, step_id: str):
+        run = await require(run_id)
+        if not re.fullmatch(r"[a-zA-Z0-9_:.-]{1,100}", step_id):
+            raise HTTPException(400, "Gecersiz adim kimligi.")
+        metadata = await app.state.engine.store.latest_provider_output(run_id, step_id)
+        started = metadata['provider_started']
+        activity = metadata['provider_activity']
+        if metadata.get('step_started', {}).get('_event_id', 0) > started.get('_event_id', 0):
+            started, activity = {}, {}
+        current = live_output.snapshot(started.get('live_output_id'))
+        if current is not None:
+            return {**current, 'run_state': run.get('status'), 'source_step_id': started.get('step_id', step_id)}
+        result = (run.get('results') or {}).get(step_id) or {}
+        output = str(result.get('output') or '')[-live_output.LIMIT:]
+        terminal = run.get('status') in {'completed', 'failed', 'cancelled'}
+        return {'kind': 'cli', 'read_only': True, 'run_state': run.get('status'), 'state': 'completed' if terminal else 'waiting',
+                'output': output or ('Bu adım için CLI süreci henüz başlamadı; çalışma sırasını veya kaynak kilidini bekliyor.'
+                                     if not started else 'Bu çağrının canlı çıktı kaydı mevcut değil. Kaydedilen son süreç etkinliği gösteriliyor.'),
+                'pid': started.get('pid'), 'elapsed_seconds': activity.get('elapsed_seconds'),
+                'idle_seconds': activity.get('idle_seconds'), 'received_bytes': activity.get('received_bytes', 0),
+                'source_step_id': activity.get('step_id') or started.get('step_id') or step_id}
+
     @app.get("/api/terminals/{terminal_id}/output")
     async def terminal_output(terminal_id: str):
         engine = app.state.engine
@@ -1619,7 +1857,7 @@ def create_app(data_dir=None, providers=None):
         user_response = body.get("response", "").strip()
         if not user_response:
             raise HTTPException(400, "Yanıt metni boş olamaz.")
-        
+
         plan = run.get("plan")
         if plan and "steps" in plan:
             for s in plan["steps"]:
@@ -1737,7 +1975,7 @@ def create_app(data_dir=None, providers=None):
             capabilities = {str(item).casefold() for item in model.get("capabilities", [])}
             if (model.get("execution_supported", True) is not True
                     or (run.get("execution_backend") == "ao" and provider != "codex")
-                    or (run.get("execution_backend") == "cao" and provider not in {"codex", "antigravity", "ollama"})
+                    or (run.get("execution_backend") == "cao" and provider not in {"codex", "antigravity", "ollama", "evren"})
                     or (role not in capabilities and not (role == "architect" and "master" in capabilities))):
                 raise HTTPException(400, "Seçilen model bu adımı yürütemez.")
         cooldowns = await app.state.engine.router.get_cooldowns()

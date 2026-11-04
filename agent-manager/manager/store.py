@@ -124,6 +124,20 @@ class Store:
                 await self.db.rollback()
                 raise
 
+    async def latest_provider_output(self, run_id, step_id):
+        targets = ["planner", "program"] if step_id in {"planner", "program"} else [step_id]
+        conditions = " OR ".join(["(json_extract(data,'$.step_id')=? OR substr(json_extract(data,'$.step_id'),1,length(?)+1)=?||':')"] * len(targets))
+        params = [value for target in targets for value in [target, target, target]]
+        found = {}
+        async with self.lock:
+            for kind in ["provider_started", "provider_activity", "step_started"]:
+                async with self.db.execute(
+                        "SELECT data,id FROM events WHERE run_id=? AND kind=? AND (" + conditions + ") ORDER BY id DESC LIMIT 1",
+                        [run_id, kind, *params]) as cur:
+                    row = await cur.fetchone()
+                found[kind] = {**json.loads(row[0]), '_event_id': row[1]} if row else {}
+        return found
+
     async def events(self, run_id, after=0):
         async with self.lock:
             async with self.db.execute("SELECT id,kind,message,created_at,data FROM events WHERE run_id=? AND id>? ORDER BY id LIMIT 150",

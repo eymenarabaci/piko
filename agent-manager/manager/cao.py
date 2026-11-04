@@ -16,6 +16,7 @@ from uuid import uuid4
 import httpx
 import psutil
 
+from .execution_policy import model_allowed
 from .processes import _WindowsJob, _record
 from .local_media import create_media, media_scene_instructions
 from .local_edits import apply_local_edits, local_write_prompt
@@ -30,6 +31,83 @@ class CAONoResponse(CAOError):
     """The terminal settled without a publishable agent message."""
 
     pass
+
+
+_ECHO_MIN_OUTPUT = 400
+_ECHO_MIN_LINE = 40
+_ECHO_LINE_RATIO = 0.55
+# Text we inject into every CAO prompt. A genuine answer never reproduces it,
+# so its presence is a positive echo signal even when the terminal only hands
+# back the first slice of the prompt (which defeats line-overlap scoring).
+_INTERNAL_MARKERS = (
+    "Varsayılan olarak işi kendin tamamla",
+    "=== İŞİN DİLİMİ ===",
+    "Kalıcı Proje Not Defteri",
+    "yalnız <cao_workers>",
+)
+
+
+def _normalize_echo(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip().casefold()
+
+
+def looks_like_internal_echo(output: str) -> bool:
+    """True when the output reproduces our own injected instruction blocks."""
+    if not output or len(output) < _ECHO_MIN_OUTPUT:
+        return False
+    folded = _normalize_echo(output)
+    hits = sum(1 for marker in _INTERNAL_MARKERS if _normalize_echo(marker) in folded)
+    return hits >= 2
+
+
+def looks_like_prompt_echo(output: str, prompt: str) -> bool:
+    """Detect a terminal that echoed the prompt instead of answering it.
+
+    Some CLIs return the last user message (or a long slice of it) as the
+    assistant message. The old check only compared the whole strings, so a
+    partial echo of the instruction block was accepted as a real answer and
+    every downstream step built on it. Here any output that mostly reproduces
+    long prompt lines is treated as an echo.
+    """
+    if looks_like_internal_echo(output):
+        return True
+    text = _normalize_echo(output)
+    source = _normalize_echo(prompt)
+    if not text or not source:
+        return False
+    if text == source:
+        return True
+    if len(text) < _ECHO_MIN_OUTPUT:
+        return False
+    if text in source:
+        return True
+    lines = [line.strip() for line in (output or "").splitlines()
+             if len(line.strip()) >= _ECHO_MIN_LINE]
+    if not lines:
+        return False
+    hits = sum(1 for line in lines if _normalize_echo(line) in source)
+    return hits / len(lines) >= _ECHO_LINE_RATIO
+
+
+CAO_PROMPT_LIMIT = 6500
+_PROMPT_CLIP = "\n\n[...bağlamın orta bölümü kısaltıldı...]\n\n"
+
+
+def bound_cao_prompt(prompt: str, limit: int = CAO_PROMPT_LIMIT) -> str:
+    """Keep a CAO prompt short enough for the terminal to actually accept.
+
+    A multi-kilobyte paste is never submitted: the TUI keeps the text in its
+    composer, the runner sees "idle, never working", and the prompt comes back
+    as the model's answer. The instructions are at the head and the current
+    step at the tail, so the middle — reused context — is what gets clipped.
+    """
+    text = prompt or ""
+    if len(text) <= limit:
+        return text
+    budget = max(500, limit - len(_PROMPT_CLIP))
+    head = int(budget * 0.55)
+    tail = budget - head
+    return text[:head].rstrip() + _PROMPT_CLIP + text[-tail:].lstrip()
 
 
 def _pre_trust_workspace(workspace: str | Path) -> None:
@@ -265,6 +343,13 @@ class CAOClient:
 
     async def run(self, model: dict, prompt: str, *, workspace: str, allow_writes: bool,
                   timeout: float, on_event, persona: str = "") -> dict:
+        if not model_allowed(model):
+            raise CAOError("Model operator execution policy tarafindan engellendi.")
+        if model.get("provider") == "evren":
+            from .providers import Providers
+            return await Providers([model], Path(__file__).resolve().parents[1]).run(
+                model["id"], prompt, workspace=workspace, allow_writes=allow_writes,
+                timeout=timeout, on_event=on_event)
         provider = {"codex": "codex", "antigravity": "antigravity_cli", "ollama": "ollama_local"}.get(model.get("provider"))
         if provider is None:
             raise CAOError("CAO seçeneğinde bu modelin CLI sağlayıcısı desteklenmiyor.")
@@ -276,8 +361,12 @@ class CAOClient:
             prompt = local_write_prompt(workspace, prompt)
         await on_event("cao_starting", "CAO Windows işçisi hazırlanıyor.", {"provider": provider})
         job_id = uuid4().hex
-        
-        agent_role = persona.strip() if persona.strip() else ("developer" if allow_writes else "reviewer")
+
+        clean_role = persona.strip().lower() if persona else ""
+        if clean_role in {"developer", "reviewer"}:
+            agent_role = clean_role
+        else:
+            agent_role = "developer" if allow_writes else "reviewer"
         # Respect the per-step limit chosen by the caller. A silently extended
         # one-hour limit made an undelivered prompt look like a running worker.
         effective_timeout = float(timeout)
@@ -366,7 +455,7 @@ class CAOClient:
             raise CAONoResponse("CAO işçisi kullanılabilir bir yanıt döndürmedi.")
         if output.startswith("[NO RESPONSE - agent completed without producing a text response"):
             raise CAONoResponse("CAO işçisi metin yanıtı üretmedi; terminal çıktısı yanıt olarak kabul edilmedi.")
-        if re.search(r"\[Pasted Content \d+ chars\]", output) or output.strip() == prompt.strip():
+        if re.search(r"\[Pasted Content \d+ chars\]", output) or looks_like_prompt_echo(output, prompt):
             raise CAONoResponse("CAO terminali ajan yanıtı yerine gönderilen promptun yankısını döndürdü; adım tamamlanmadı.")
         output_lower = output.lower()
         if any(term in output_lower for term in ("you’ve hit your usage limit", "you've hit your usage limit", "usage limit", "quota_exceeded", "insufficient_quota", "too many requests", "rate limit reached")):

@@ -7,9 +7,12 @@ import json
 import os
 from pathlib import Path
 import shutil
+import re
+from uuid import uuid4
 
 import httpx
 
+from .execution_policy import model_allowed
 from .processes import MAX_OUTPUT_BYTES, ProcessError, run_command
 from .outcomes import ensure_usable_result
 from .local_edits import apply_local_edits, local_write_prompt
@@ -52,6 +55,27 @@ def resolve_codex() -> list[str]:
     raise ProviderError('Codex CLI bulunamadı; PATH veya npm kurulumunu kontrol edin.')
 
 
+def resolve_claude() -> list[str]:
+    found = shutil.which('claude.exe') or shutil.which('claude')
+    if not found:
+        candidate = Path.home() / '.local' / 'bin' / 'claude.exe'
+        found = str(candidate) if candidate.is_file() else None
+    if not found:
+        raise ProviderError('Claude Code CLI bulunamadı; claude.exe kurulumunu kontrol edin.')
+    return [found]
+
+
+def resolve_opencode() -> list[str]:
+    found = shutil.which('opencode.exe') or shutil.which('opencode.cmd') or shutil.which('opencode')
+    if not found:
+        candidate = Path.home() / '.opencode' / 'bin' / 'opencode.exe'
+        found = str(candidate) if candidate.is_file() else None
+    if not found:
+        raise ProviderError('OpenCode CLI bulunamadı; opencode kurulumunu kontrol edin.')
+    if os.name == 'nt' and Path(found).suffix.lower() in {'.cmd', '.bat'}:
+        return ['cmd', '/c', found]
+    return [found]
+
 def resolve_agy() -> list[str]:
     found = shutil.which('agy.exe') or shutil.which('agy')
     if not found:
@@ -76,6 +100,28 @@ def _failure(text: str) -> str:
     return 'Sağlayıcı işlemi başarısız oldu. CLI erişimini ve model kimliğini kontrol edin.'
 
 
+def opencode_exit_diagnostic(process):
+    code = int(process.get('returncode', -1))
+    raw = str(process.get('stderr', '')) + str(process.get('stdout', ''))
+    value = raw.lower()
+    category = 'cli_exit'
+    reason = _failure(raw)
+    for signals, label, message in [
+        (('econnreset', 'socket connection was closed', 'enotfound', 'etimedout'), 'transport', 'Sağlayıcı ağ bağlantısı kesildi.'),
+        (('sağlıklı endpoint yok', 'no healthy endpoint', 'model şu anda dolu'), 'provider_unavailable', 'Sağlayıcı model endpointi geçici olarak kullanılamıyor.'),
+        (('context_length_exceeded', 'maximum context length', 'context window'), 'context_limit', 'Model bağlam sınırı aşıldı.'),
+    ]:
+        if any(signal in value for signal in signals):
+            category, reason = label, message
+            break
+    if code & 0xffffffff == 0xc000013a:
+        category, reason = 'process_interrupted', 'CLI işlemi dışarıdan kapatıldı (Windows CTRL/CLOSE).'
+    return {'returncode': code, 'exit_hex': hex(code & 0xffffffff), 'category': category,
+            'stdout_bytes': len(str(process.get('stdout', '')).encode('utf-8')),
+            'stderr_bytes': len(str(process.get('stderr', '')).encode('utf-8')),
+            'reason': reason + f' [exit={code}; {category}]'}
+
+
 class Providers:
     def __init__(self, models: list[dict], root: Path):
         self.models = [dict(row) for row in models]
@@ -84,26 +130,84 @@ class Providers:
 
     def available(self) -> list[dict]:
         resolved = {}
-        for provider, resolver in [('codex', resolve_codex), ('antigravity', resolve_agy)]:
+        for provider, resolver in [('codex', resolve_codex), ('antigravity', resolve_agy),
+                                   ('claude-code', resolve_claude), ('opencode', resolve_opencode)]:
             try:
-                resolved[provider] = resolver()[0]
+                resolved[provider] = resolver()[-1]
             except ProviderError:
                 resolved[provider] = None
-        # This is executable discovery, not a network/authentication/model readiness check.
         resolved['ollama'] = shutil.which('ollama') or shutil.which('ollama.exe')
-        resolved['opencode'] = shutil.which('opencode.exe') or shutil.which('opencode.cmd') or shutil.which('opencode')
         return [{'id': provider, 'available': bool(executable), 'executable': executable}
                 for provider, executable in resolved.items()]
 
     async def run(self, model_id, prompt, *, workspace: str, allow_writes: bool,
                   timeout: float, on_event, effort: str = '', images: list[str] | None = None) -> dict:
+        model = self.by_id.get(model_id, {})
+        if model.get('provider') not in {'opencode', 'evren'}:
+            return await self._run(model_id, prompt, workspace=workspace, allow_writes=allow_writes,
+                                   timeout=timeout, on_event=on_event, effort=effort, images=images)
+        timeout = 0  # Operator request: no fixed wall-clock limit on Evren CLI calls.
+        session_id = await on_event('provider_session_lookup', '', {'model_id': model_id})
+        resuming_session = isinstance(session_id, str) and bool(re.fullmatch(r'ses_[A-Za-z0-9]+', session_id))
+        if not resuming_session:
+            session_id = 'ses_' + uuid4().hex
+            # Persist identity before spawn: even a zero-output network failure
+            # must retry the same session rather than creating another one.
+            await on_event('provider_session', 'CLI oturum checkpointi çağrıdan önce kaydedildi.',
+                           {'session_id': session_id, 'model_id': model_id, 'created_before_spawn': True})
+        call_id, seen = uuid4().hex, set()
+        totals = {'input_tokens': 0, 'output_tokens': 0}
+        accounted = True
+        started = False
+
+        async def capture(kind, message, data=None):
+            nonlocal accounted, started
+            if kind == 'provider_session':
+                return await on_event(kind, message, {**(data or {}), 'model_id': model_id})
+            if kind == 'provider_started':
+                started = True
+            if kind == 'provider_usage':
+                key = (data or {}).get('event_id')
+                if key in seen:
+                    return
+                seen.add(key)
+                for name in totals:
+                    totals[name] += data[name]
+                ack = await on_event(kind, message, {**data, 'model_id': model_id,
+                                                     'call_id': call_id + ':' + key})
+                accounted = accounted and ack is True
+                return ack
+            return await on_event(kind, message, data)
+
+        try:
+            result = await self._run(model_id, prompt, workspace=workspace, allow_writes=allow_writes,
+                                     timeout=timeout, on_event=capture, effort=effort, images=images, session_id=session_id, session_is_resume=resuming_session)
+        except BaseException:
+            # A failed call may have consumed tokens without a completed turn report.
+            if started:
+                await on_event('provider_usage', 'Başarısız çağrının kalan tüketimi bilinmiyor.',
+                               {'model_id': model_id, 'call_id': call_id + ':incomplete',
+                                'input_tokens': 0, 'output_tokens': 0, 'source': 'unknown'})
+            raise
+        if seen:
+            result['usage'] = {**totals, 'source': 'provider_reported', 'accounted': accounted}
+        else:
+            missing = {'input_tokens': 0, 'output_tokens': 0}
+            ack = await on_event('provider_usage', 'Sağlayıcı kullanım bildirmedi; tüketim bilinmiyor.',
+                                {**missing, 'source': 'unknown', 'model_id': model_id,
+                                 'call_id': call_id + ':unreported'})
+            result['usage'] = {**missing, 'source': 'unknown', 'accounted': ack is True}
+        return result
+
+    async def _run(self, model_id, prompt, *, workspace: str, allow_writes: bool,
+                   timeout: float, on_event, effort: str = '', images: list[str] | None = None, session_id: str | None = None, session_is_resume: bool = False) -> dict:
         model = self.by_id.get(model_id)
-        if not model or model.get('execution_supported', True) is not True:
+        if not model or not model_allowed(model) or model.get('execution_supported', True) is not True:
             raise ProviderError('Model yürütmeye açık değil veya katalogda bulunamadı.')
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode('utf-8')) > 200000:
             raise ProviderError('Prompt boş veya 200 KB sınırından büyük.')
-        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not 1 <= timeout <= 1800:
-            raise ProviderError('Sağlayıcı süresi 1–1800 saniye arasında olmalı.')
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not 0 <= timeout <= 1800:
+            raise ProviderError('Sağlayıcı süresi 0 (sınırsız) veya 1–1800 saniye olmalı.')
         try:
             directory = Path(workspace).resolve(strict=True)
         except OSError as exc:
@@ -160,11 +264,80 @@ class Providers:
                 process = await run_command(command, root=self.root, workspace=directory,
                                              timeout=timeout, on_event=on_event)
                 return self._agy(model_id, process)
+            if provider == 'claude-code':
+                actual_model = model.get('base_model') or model_id
+                if actual_model.startswith('claude-code:'):
+                    actual_model = actual_model.split(':', 1)[1]
+                command = resolve_claude() + ['--print', prompt]
+                if actual_model:
+                    command += ['--model', actual_model]
+                if allow_writes:
+                    command += ['--dangerously-skip-permissions']
+                await on_event('provider_policy', 'Claude Code yerel CLI ile çalıştırılıyor.', {})
+                process = await run_command(command, root=self.root, workspace=directory,
+                                             timeout=timeout, on_event=on_event)
+                output = process.get('stdout', '') or process.get('stderr', '')
+                return {'output': output.strip(), 'model_id': model_id, 'status': 'completed',
+                        'usage': {}, 'local_patch_applied': []}
+            if provider in {'opencode', 'evren'}:
+                actual_model = model.get('base_model') or model_id
+                if actual_model.startswith('opencode:'):
+                    actual_model = actual_model.split(':', 1)[1]
+                call_prompt = ('Ağ kesintisinden sonra aynı atanmış adıma devam et. Önce mevcut dosyaları ve tamamladığın işlemleri kontrol et; aynı etkiyi tekrarlama. Yeni kapsam ekleme, yarım kalan işi tamamla ve gerçek sonucu bildir.' if session_is_resume else prompt)
+                command = resolve_opencode() + ['run', call_prompt, '--format', 'json']
+                if session_id:
+                    command += ['--session', session_id]
+                    await on_event('provider_session_resumed' if session_is_resume else 'provider_session_opened', 'Aynı CLI oturumundan devam ediliyor.' if session_is_resume else 'Kalıcı CLI oturumu açılıyor.', {'session_id': session_id, 'model_id': model_id})
+                if actual_model and actual_model != 'auto':
+                    command += ['--model', actual_model]
+                if allow_writes:
+                    command += ['--agent', 'build', '--auto']
+                else:
+                    command += ['--agent', 'plan']
+                await on_event('provider_policy', 'OpenCode CLI ile çalıştırılıyor.', {})
+                process = await run_command(command, root=self.root, workspace=directory,
+                                             timeout=timeout, on_event=on_event, live_format="opencode_jsonl")
+                if process.get('returncode', 0) != 0:
+                    diagnostic = opencode_exit_diagnostic(process)
+                    await on_event('provider_exit_error', 'OpenCode CLI başarısız çıkış kaydı.', diagnostic)
+                    raise ProviderError(diagnostic['reason'])
+                return self._opencode(model_id, process)
             raise ProviderError('Desteklenmeyen sağlayıcı.')
         except ProcessError as exc:
             raise ProviderError(str(exc)) from exc
         except OSError as exc:
             raise ProviderError('CLI başlatılamadı; çalışma klasörü ve yürütülebilir dosyayı kontrol edin.') from exc
+
+    @staticmethod
+    def _opencode(model_id, process):
+        """Extract only the last assistant message from OpenCode JSONL transport."""
+        message_id = None
+        parts = {}
+        for line in process.get('stdout', '').splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get('type') == 'error':
+                raise ProviderError('OpenCode hata olayi dondurdu; islem tamamlanmadi.')
+            part = event.get('part')
+            if event.get('type') != 'text' or not isinstance(part, dict):
+                continue
+            text = part.get('text')
+            if not isinstance(text, str):
+                continue
+            current = part.get('messageID')
+            if current != message_id:
+                parts = {}
+                message_id = current
+            parts[part.get('id') or str(len(parts))] = text
+        output = '\n'.join(parts.values()).strip()
+        if not output:
+            raise ProviderError('OpenCode gecerli son mesaj dondurmedi.')
+        return {'output': output, 'model_id': model_id, 'status': 'completed',
+                'usage': {}, 'local_patch_applied': []}
 
     @staticmethod
     def _codex(model_id, process):

@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="tr">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light"><link rel="icon" href="data:,"><title>Piko · Çalışma alanı</title><link rel="stylesheet" href="/ui/styles.css?v=compact-clean-20261029"></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light"><link rel="icon" href="data:,"><title>Piko · Çalışma alanı</title><link rel="stylesheet" href="/ui/styles.css?v=compact-clean-20261029"><link rel="stylesheet" href="/ui/mascot.css"><link rel="stylesheet" href="/ui/constellation.css"></head>
 <body>
 <div class="app-shell inspector-collapsed">
  <aside class="sidebar">
@@ -52,7 +52,7 @@
       <span class="project-pill-arrow">▾</span>
      </button>
      <h1 id="page-title">Görev Orkestrasyonu</h1>
-    </div><div id="piko-mascot" class="piko-mascot" data-state="idle" role="img" aria-label="Piko durumu: hazır"><span class="mascot-face" aria-hidden="true">^</span><span id="mascot-label">Hazır</span></div><div class="top-actions"><div class="view-switch" role="group" aria-label="Görünüm seçimi"><button type="button" id="view-piko" class="active" aria-pressed="true" title="Sohbet ve sade ilerleme">Piko</button><button type="button" id="view-dev" aria-pressed="false" title="Planlar, ajanlar, terminal ve test kayıtları">Geliştirici</button></div><button type="button" id="notification-button" class="notification-button" aria-label="Bildirimleri aç">Bildirim<span id="notification-count" class="notification-count" hidden>0</span></button><span id="connection" class="connection"><i></i><span>Bağlanıyor</span></span><button id="toggle-inspector" class="icon-button" aria-label="Çalışma ayrıntılarını aç" aria-expanded="false" title="Çalışma ayrıntıları">◧</button></div></header>
+    </div><div id="piko-mascot-stage" class="piko-mascot-stage"></div><div class="top-actions"><div class="view-switch" role="group" aria-label="Görünüm seçimi"><button type="button" id="view-piko" class="active" aria-pressed="true" title="Sohbet ve sade ilerleme">Piko</button><button type="button" id="view-dev" aria-pressed="false" title="Planlar, ajanlar, terminal ve test kayıtları">Geliştirici</button></div><button type="button" id="notification-button" class="notification-button" aria-label="Bildirimleri aç">Bildirim<span id="notification-count" class="notification-count" hidden>0</span></button><span id="connection" class="connection"><i></i><span>Bağlanıyor</span></span><button id="toggle-inspector" class="icon-button" aria-label="Çalışma ayrıntılarını aç" aria-expanded="false" title="Çalışma ayrıntıları">◧</button></div></header>
    <div class="project-metrics-bar" id="project-metrics-bar">
     <div class="metrics-bar-left">
       <div class="metric-item" id="metric-proj-badge" title="Aktif Projeyi Değiştir">
@@ -66,7 +66,7 @@
       <div class="metric-item" title="Bu projede harcanan toplam token">
         <span class="metric-icon">🔥</span>
         <div class="metric-info">
-          <span class="metric-label">Harcanan Token</span>
+          <span class="metric-label" title="Yalnız sağlayıcının bildirdiği kullanım. Bildirilmeyen tüketim bilinmiyor; kesin kota bakiyesi değildir.">Ölçülen Token</span>
           <strong id="metric-total-tokens">0</strong>
         </div>
       </div>
@@ -93,6 +93,8 @@
    </div>
   <main>
    <section id="chat-page" class="chat-page">
+    <div class="chat-page-split">
+     <div class="chat-column">
     <div id="messages" class="messages">
      <div id="welcome" class="welcome">
       <div class="welcome-emblem">◈</div><p class="welcome-kicker">Ajanlarınız, tek bir çalışma alanında.</p>
@@ -122,7 +124,7 @@
        <small id="instruction-delivery-hint">Seçilen zaman ile teslim durumu sohbet içinde gösterilir.</small>
       </label>
       <div id="attachment-list" class="attachment-list" aria-live="polite" hidden></div>
-      <div class="composer-bottom"><div class="model-controls"><label id="planner-model-control" hidden>Planlayıcı<select id="planner-model" aria-label="Planlayıcı model"><option value="">Yükleniyor…</option></select></label><label id="chat-model-control">Ajan<select id="chat-model" aria-label="Ajan"><option value="">Yükleniyor…</option></select></label><label class="planning-level-control" title="Planın kapsam ve ayrıntısını belirler; otomatik olarak daha fazla ajan çağırmaz.">Planlama<select id="planning-level" aria-label="Planlama düzeyi"><option value="fast">Hızlı</option><option value="balanced">Dengeli</option><option value="detailed">Ayrıntılı</option></select></label></div><div class="composer-submit-actions"><input id="attachment-input" type="file" multiple hidden><button type="button" id="attach-button" class="attach-button" title="Resim veya dosya ekle" aria-label="Resim veya dosya ekle">📎</button><button id="send-button" class="send-button" title="Görevi gönder" aria-label="Görevi gönder">↑</button></div></div>
+      <div class="composer-bottom"><div class="model-controls"><label id="planner-model-control" hidden>Planlayıcı<select id="planner-model" aria-label="Planlayıcı model"><option value="">Yükleniyor…</option></select></label><label id="chat-model-control">Ajan<select id="chat-model" aria-label="Ajan"><option value="">Yükleniyor…</option></select></label><label class="planning-level-control" title="Planın kapsamını belirler. Paralel, bağımsız işleri gerekirse ayrı kopyalarda ortak en fazla 6 çalışanla yürütür.">Planlama<select id="planning-level" aria-label="Planlama düzeyi"><option value="fast">Hızlı</option><option value="balanced">Dengeli</option><option value="detailed">Ayrıntılı</option><option value="parallel" disabled>Paralel</option></select></label></div><div class="composer-submit-actions"><input id="attachment-input" type="file" multiple hidden><button type="button" id="attach-button" class="attach-button" title="Resim veya dosya ekle" aria-label="Resim veya dosya ekle">📎</button><button id="send-button" class="send-button" title="Görevi gönder" aria-label="Görevi gönder">↑</button></div></div>
       <div class="composer-permission">
         <label><input id="allow-writes" type="checkbox"> Dosya yazma izni</label>
         <div class="composer-context-tags">
@@ -131,6 +133,70 @@
        </div>
      </form>
      <div class="composer-hint"><span>Enter gönderir, Shift + Enter yeni satır açar.</span><span id="mode-hint">Sorunuzu veya yapmak istediğiniz işi yazın. Gerektiğinde planı inceleyip onaylayabilirsiniz.</span></div>
+    </div>
+    </div>
+    <aside class="workbench-column" id="workbench-column">
+      <!-- 1. Plan Progress Tracker -->
+      <div class="workbench-plan-tracker">
+        <div class="tracker-header">
+          <div class="tracker-title-row">
+            <span class="live-status-dot"></span>
+            <b id="plan-tracker-title">Piko Hazır • Yeni Sohbet</b>
+            <span id="plan-step-pill" class="step-pill">Dinlemede</span>
+          </div>
+          <p id="plan-current-goal" class="tracker-goal">Sohbet alanından talimatınızı yazın; Piko iş akışını planlayacaktır.</p>
+        </div>
+        <div class="plan-step-stepper" id="plan-step-stepper">
+          <div class="stepper-track">
+            <div class="stepper-fill" id="stepper-progress-fill" style="width: 0%;"></div>
+          </div>
+          <div class="stepper-nodes" id="stepper-nodes"></div>
+        </div>
+      </div>
+
+      <!-- 2. Cute Living Multi-Agent Stage (Canvas) -->
+      <div id="piko-constellation-stage" class="piko-constellation-stage" aria-label="Canlı Ajan ve Plan Kümeleri Sahnesi">
+        <div class="stage-header">
+          <div class="stage-title-group">
+            <span class="stage-title">Canlı Ajan Tezgâhı</span>
+            <span id="stage-cluster-badge" class="cluster-badge">Piko & Ajan Ekibi</span>
+          </div>
+          <div class="stage-mode-toggles">
+            <button type="button" id="stage-toggle-cluster-btn" class="stage-toggle-btn active" title="Ajan Dizilimi Düzeni">👥 Piko & Ajanlar</button>
+          </div>
+        </div>
+        <div class="stage-canvas-wrapper">
+          <canvas id="constellation-canvas" width="460" height="290"></canvas>
+          <div id="constellation-overlay" class="constellation-overlay"></div>
+        </div>
+        <div id="stage-orchestration-ticker" class="stage-orchestration-ticker">
+          <span class="ticker-label">◈ Piko:</span>
+          <span id="ticker-message" class="ticker-message">Tüm ajanlar hazır ve dinlemede.</span>
+        </div>
+      </div>
+
+      <!-- 3. Active Task & Worker Live Card -->
+      <div class="workbench-live-card" id="workbench-live-card">
+        <div class="live-card-head">
+          <div class="live-card-agent-badge" id="live-card-agent-badge">
+            <span class="agent-avatar-mini" id="live-card-avatar">🔵</span>
+            <div>
+              <b id="live-card-agent-name">Geliştirici (Coder)</b>
+              <small id="live-card-agent-model">Model bekleniyor</small>
+            </div>
+          </div>
+          <span class="live-task-status" id="live-card-status">Çalışıyor</span>
+        </div>
+        <div class="live-card-body">
+          <div class="live-card-label">Şu Anki İşlem:</div>
+          <div class="live-card-action" id="live-card-action">Henüz aktif görev yok.</div>
+          <div class="live-card-metrics">
+            <span>Durum, etkin görev kaydından gösterilir.</span>
+
+          </div>
+        </div>
+      </div>
+     </aside>
     </div>
    </section>
    <section id="data-page" class="data-page" hidden></section>
@@ -191,10 +257,128 @@
   <dialog id="model-switch-dialog"><form id="model-switch-form"><header class="dialog-header"><div><h2 id="model-switch-title">Ajanı / Modeli Değiştir</h2><p id="model-switch-subtitle">Kotanın dolmasını beklemeden bu adım için alternatif bir model seçin.</p></div><button type="button" class="icon-button dialog-close" id="close-model-switch">×</button></header><div class="dialog-body"><label>Seçilecek Model<select id="switch-model-select" required></select><small>Seçilen model bu adım için derhal devreye alınacak ve adım yeniden başlatılacaktır.</small></label></div><footer class="dialog-footer"><button type="button" class="outline-button dialog-close" id="cancel-model-switch">Vazgeç</button><button class="primary-button" id="confirm-model-switch-btn" type="submit">Modeli Değiştir ve Devam Et</button></footer></form></dialog>
   <dialog id="notifications-dialog"><div class="dialog-header"><div><h2>Bildirimler</h2><p>Teslim, engel, gerekli karar ve önemli gecikmeler burada görünür.</p></div><button type="button" class="icon-button dialog-close" id="close-notifications" aria-label="Bildirimleri kapat">×</button></div><div class="dialog-body"><div style="display:flex;gap:8px;justify-content:space-between;align-items:center"><span id="notification-empty" class="empty-note" hidden>Yeni bildirim yok.</span><button type="button" id="notification-read-all" class="outline-button">Tümünü okundu say</button></div><div id="notification-list" class="notification-list"></div><form id="notification-preferences-form" class="notification-preferences"><label>Bildirimler<select id="notif-enabled"><option value="1">Açık</option><option value="0">Kapalı</option></select></label><label>En düşük önem<select id="notif-severity"><option value="low">Düşük ve üzeri</option><option value="normal">Normal ve üzeri</option><option value="high">Yalnız yüksek</option></select></label><label>Sessiz başlangıç<input id="notif-quiet-start" type="time" value="22:00"></label><label>Sessiz bitiş<input id="notif-quiet-end" type="time" value="08:00"></label><label>Saat dilimi<input id="notif-timezone" type="text" placeholder="Europe/Istanbul"></label><label>&nbsp;<button type="submit" class="primary-button">Tercihleri kaydet</button></label></form></div></dialog>
   <dialog id="choice-dialog"><div class="dialog-header"><div><h2>Bu istek mevcut işe mi ait?</h2><p>Çalışan bir iş varken yeni isteği ayırt etmem gerekiyor.</p></div></div><div class="dialog-body"><p class="empty-note">Gönderdiğiniz mesaj yeni bir iş gibi görünüyor. Mevcut işe düzeltme olarak mı eklensin, yoksa ayrı bir iş olarak mı açılsın?</p></div><footer class="dialog-footer choice-dialog-actions"><button type="button" class="outline-button" id="choice-cancel">Vazgeç</button><button type="button" class="outline-button" id="choice-new">Yeni iş olarak aç</button><button type="button" class="primary-button" id="choice-amend">Mevcut işe ekle</button></footer></dialog>
-<div id="toast" class="toast" role="status" hidden></div>
+<div id="toast" class="toast" role="status" hidden>    </div>
+<svg class="piko-sprite-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false" width="0" height="0" style="position:absolute;overflow:hidden">
+  <symbol id="piko-idle" data-state="idle" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="55" rx="15" ry="2.6" fill="#1b2c48" opacity=".10"/>
+    <line x1="32" y1="14" x2="32" y2="8" stroke="#a9c2ff" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="7" r="3.2" fill="#4d7cfe"/>
+    <circle cx="32" cy="33" r="19" fill="#eaf0fc" stroke="#cfdcf5" stroke-width="2"/>
+    <circle cx="25" cy="31" r="2.6" fill="#33455f"/>
+    <circle cx="39" cy="31" r="2.6" fill="#33455f"/>
+    <path d="M27.5 39 q4.5 3.4 9 0" fill="none" stroke="#33455f" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="20" cy="37" r="2.4" fill="#f7b7c2" opacity=".65"/>
+    <circle cx="44" cy="37" r="2.4" fill="#f7b7c2" opacity=".65"/>
+  </symbol>
+  <symbol id="piko-konusuyor" data-state="konusuyor" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="55" rx="15" ry="2.6" fill="#1b2c48" opacity=".10"/>
+    <line x1="32" y1="14" x2="32" y2="8" stroke="#a9c2ff" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="7" r="3.2" fill="#4d7cfe"/>
+    <circle cx="32" cy="33" r="19" fill="#eaf0fc" stroke="#cfdcf5" stroke-width="2"/>
+    <circle cx="25" cy="30" r="2.6" fill="#33455f"/>
+    <circle cx="39" cy="30" r="2.6" fill="#33455f"/>
+    <ellipse cx="32" cy="40" rx="4.6" ry="3.4" fill="#33455f"/>
+    <circle cx="20" cy="37" r="2.4" fill="#f7b7c2" opacity=".7"/>
+    <circle cx="44" cy="37" r="2.4" fill="#f7b7c2" opacity=".7"/>
+    <path d="M50 26 q4 6 0 12" fill="none" stroke="#4d7cfe" stroke-width="2" stroke-linecap="round" opacity=".7"/>
+    <path d="M54 22 q6 10 0 20" fill="none" stroke="#4d7cfe" stroke-width="2" stroke-linecap="round" opacity=".45"/>
+  </symbol>
+  <symbol id="piko-yuruyor" data-state="yuruyor" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="57" rx="14" ry="2.4" fill="#1b2c48" opacity=".10"/>
+    <line x1="32" y1="12" x2="32" y2="6" stroke="#a9c2ff" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="5" r="3.2" fill="#4d7cfe"/>
+    <circle cx="32" cy="31" r="19" fill="#eaf0fc" stroke="#cfdcf5" stroke-width="2"/>
+    <circle cx="25" cy="29" r="2.6" fill="#33455f"/>
+    <circle cx="39" cy="29" r="2.6" fill="#33455f"/>
+    <path d="M28 37 q4 2.6 8 0" fill="none" stroke="#33455f" stroke-width="2" stroke-linecap="round"/>
+    <ellipse cx="26" cy="52" rx="4.2" ry="2.4" fill="#a9c2ff" transform="rotate(-14 26 52)"/>
+    <ellipse cx="38" cy="53" rx="4.2" ry="2.4" fill="#a9c2ff" transform="rotate(14 38 53)"/>
+    <path d="M6 28 h11" stroke="#cfdcf5" stroke-width="2.4" stroke-linecap="round"/>
+    <path d="M9 34 h8" stroke="#cfdcf5" stroke-width="2.4" stroke-linecap="round" opacity=".7"/>
+  </symbol>
+  <symbol id="piko-calisiyor" data-state="calisiyor" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="55" rx="15" ry="2.6" fill="#1b2c48" opacity=".10"/>
+    <line x1="32" y1="14" x2="32" y2="8" stroke="#a9c2ff" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="7" r="3.2" fill="#4d7cfe"/>
+    <circle cx="32" cy="33" r="19" fill="#eaf0fc" stroke="#cfdcf5" stroke-width="2"/>
+    <path d="M22 30 h6" stroke="#33455f" stroke-width="2.6" stroke-linecap="round"/>
+    <path d="M36 30 h6" stroke="#33455f" stroke-width="2.6" stroke-linecap="round"/>
+    <path d="M29 40 h6" stroke="#33455f" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="50" cy="43" r="7" fill="none" stroke="#4d7cfe" stroke-width="2.4" stroke-dasharray="2.6 2.6"/>
+    <circle cx="50" cy="43" r="2.2" fill="#4d7cfe"/>
+    <path d="M41 40 l5 4" stroke="#a9c2ff" stroke-width="2.4" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="piko-dagitiyor" data-state="dagitiyor" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="55" rx="15" ry="2.6" fill="#1b2c48" opacity=".10"/>
+    <line x1="32" y1="14" x2="32" y2="8" stroke="#a9c2ff" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="7" r="3.2" fill="#4d7cfe"/>
+    <circle cx="32" cy="33" r="19" fill="#eaf0fc" stroke="#cfdcf5" stroke-width="2"/>
+    <circle cx="25" cy="31" r="2.6" fill="#33455f"/>
+    <circle cx="39" cy="31" r="2.6" fill="#33455f"/>
+    <path d="M28 39 q4 3 8 0" fill="none" stroke="#33455f" stroke-width="2" stroke-linecap="round"/>
+    <rect x="3" y="17" width="10" height="8" rx="2" fill="#fff" stroke="#a9c2ff" stroke-width="1.8"/>
+    <rect x="51" y="13" width="10" height="8" rx="2" fill="#fff" stroke="#a9c2ff" stroke-width="1.8"/>
+    <rect x="52" y="35" width="10" height="8" rx="2" fill="#fff" stroke="#a9c2ff" stroke-width="1.8"/>
+    <path d="M16 22 q5 3 8 6" fill="none" stroke="#4d7cfe" stroke-width="2" stroke-linecap="round"/>
+    <path d="M49 18 q-5 3 -8 6" fill="none" stroke="#4d7cfe" stroke-width="2" stroke-linecap="round"/>
+    <path d="M50 39 q-4 1 -8 2" fill="none" stroke="#4d7cfe" stroke-width="2" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="piko-teslim" data-state="teslim" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="57" rx="17" ry="2.8" fill="#1b2c48" opacity=".10"/>
+    <line x1="32" y1="14" x2="32" y2="8" stroke="#a9c2ff" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="7" r="3.2" fill="#4d7cfe"/>
+    <circle cx="32" cy="32" r="19" fill="#eaf0fc" stroke="#cfdcf5" stroke-width="2"/>
+    <path d="M22 29 q3 -3 6 0" fill="none" stroke="#33455f" stroke-width="2.2" stroke-linecap="round"/>
+    <path d="M36 29 q3 -3 6 0" fill="none" stroke="#33455f" stroke-width="2.2" stroke-linecap="round"/>
+    <path d="M28 37 q4 3 8 0" fill="none" stroke="#33455f" stroke-width="2" stroke-linecap="round"/>
+    <rect x="21" y="41" width="22" height="12" rx="2.4" fill="#fff" stroke="#a9c2ff" stroke-width="2"/>
+    <path d="M27 47 l3.4 3.4 l7 -7" fill="none" stroke="#2f9e6f" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M21 45 q-5 -1 -7 -5" fill="none" stroke="#a9c2ff" stroke-width="2.4" stroke-linecap="round"/>
+    <path d="M43 45 q5 -1 7 -5" fill="none" stroke="#a9c2ff" stroke-width="2.4" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="piko-bekliyor" data-state="bekliyor" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="55" rx="15" ry="2.6" fill="#1b2c48" opacity=".10"/>
+    <line x1="32" y1="14" x2="32" y2="8" stroke="#e2c58f" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="7" r="3.2" fill="#e0b866"/>
+    <circle cx="32" cy="33" r="19" fill="#fff7e3" stroke="#f0d9a6" stroke-width="2"/>
+    <circle cx="25" cy="31" r="2.6" fill="#6b5a34"/>
+    <circle cx="39" cy="31" r="2.6" fill="#6b5a34"/>
+    <path d="M28.5 39 h7" stroke="#6b5a34" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="50" cy="19" r="7" fill="#fff" stroke="#e0b866" stroke-width="2"/>
+    <path d="M50 15 v4 h3" fill="none" stroke="#c49a45" stroke-width="2" stroke-linecap="round"/>
+    <path d="M41 46 q5 2 8 -1" fill="none" stroke="#e2c58f" stroke-width="2.2" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="piko-takildi" data-state="takildi" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="55" rx="15" ry="2.6" fill="#1b2c48" opacity=".10"/>
+    <line x1="32" y1="14" x2="32" y2="8" stroke="#f0c3ca" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="7" r="3.2" fill="#d9534f"/>
+    <circle cx="32" cy="33" r="19" fill="#fdeef0" stroke="#f0c3ca" stroke-width="2"/>
+    <path d="M21 26 l7 3" stroke="#8a3b3b" stroke-width="2.2" stroke-linecap="round"/>
+    <path d="M43 26 l-7 3" stroke="#8a3b3b" stroke-width="2.2" stroke-linecap="round"/>
+    <circle cx="25" cy="32" r="2.2" fill="#8a3b3b"/>
+    <circle cx="39" cy="32" r="2.2" fill="#8a3b3b"/>
+    <path d="M27 41 q2.5 -2.5 5 0 q2.5 2.5 5 0" fill="none" stroke="#8a3b3b" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="52" cy="15" r="8" fill="#fdeef0" stroke="#f0c3ca" stroke-width="2"/>
+    <path d="M52 10 v6" stroke="#d9534f" stroke-width="2.6" stroke-linecap="round"/>
+    <circle cx="52" cy="19.5" r="1.5" fill="#d9534f"/>
+  </symbol>
+  <symbol id="piko-uyuyor" data-state="uyuyor" viewBox="0 0 64 64">
+    <ellipse cx="32" cy="55" rx="15" ry="2.6" fill="#1b2c48" opacity=".08"/>
+    <line x1="32" y1="15" x2="32" y2="10" stroke="#cfdcf5" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="32" cy="9" r="3" fill="#a9c2ff"/>
+    <circle cx="32" cy="34" r="19" fill="#f0f4fb" stroke="#dbe6f7" stroke-width="2"/>
+    <path d="M22 32 q3 2.4 6 0" fill="none" stroke="#7d8fa8" stroke-width="2.2" stroke-linecap="round"/>
+    <path d="M36 32 q3 2.4 6 0" fill="none" stroke="#7d8fa8" stroke-width="2.2" stroke-linecap="round"/>
+    <ellipse cx="32" cy="41" rx="2.2" ry="1.6" fill="#7d8fa8"/>
+    <text x="48" y="16" font-family="Verdana, sans-serif" font-size="11" fill="#8aa2c8">z</text>
+    <text x="54" y="10" font-family="Verdana, sans-serif" font-size="8" fill="#a9bcd8">z</text>
+  </symbol>
+</svg>
 <link rel="stylesheet" href="/ui/vendor/xterm/xterm.css">
 <dialog id="live-terminal-modal" class="live-terminal-modal"><header class="dialog-header"><div><h2 id="live-terminal-title">Canlı terminal</h2><p id="live-terminal-status" role="status">Bağlanıyor…</p></div><button type="button" class="icon-button" id="close-live-terminal" aria-label="Canlı terminali kapat">×</button></header><div id="live-terminal-host" class="live-terminal-host" aria-label="Çalışan ajan terminali"></div><footer class="dialog-footer"><span class="live-terminal-hint">Klavye girişleri çalışan ajana iletilir. Bu pencereyi kapatmak görevi durdurmaz.</span><button type="button" class="outline-button" id="reconnect-live-terminal">Yeniden bağlan</button></footer></dialog>
 <script src="/ui/vendor/xterm/xterm.js"></script>
 <script src="/ui/vendor/xterm/addon-fit.js"></script>
-<script type="module" src="/ui/app.js?v=compact-clean-20261029"></script>
+<script src="/ui/mascot.js" type="module"></script>
+<script src="/ui/constellation.js"></script>
+<script type="module" src="/ui/app.js?v=parallel-planning-20261104"></script>
 </body></html>

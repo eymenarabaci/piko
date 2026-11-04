@@ -109,5 +109,42 @@ def test_compounding_memory_auto_reflection(tmp_path):
     stats = memory.refresh(workspace, run_payload)
     assert stats['facts_count'] >= 1
     facts = memory.list_facts(workspace)
-    assert any('Doğrulama başarılı' in f['content'] for f in facts)
+    assert any('Ajan doğrulama raporu (doğrulanmadı)' in f['content'] for f in facts)
+    assert all(f['verification'] == 'unverified' and f['confidence'] <= 0.35 for f in facts)
 
+
+
+def test_failed_verification_is_never_promoted_to_success(tmp_path):
+    workspace=tmp_path/'project'; workspace.mkdir()
+    memory=ProjectMemory(tmp_path/'data')
+    memory.refresh(workspace, {'id':'run','status':'completed','plan':{'steps':[{'id':'test','title':'Test build'}]},'results':{'test':{'status':'failed','output':'Tests failed'}}})
+    assert not memory.list_facts(workspace)
+
+
+def test_phase_history_is_preserved_with_goals_and_unverified_evidence(tmp_path):
+    workspace=tmp_path/'project'; workspace.mkdir()
+    memory=ProjectMemory(tmp_path/'data')
+    first={'execution_id':'first','status':'completed','prompt':'Implement scheduler','plan':{'steps':[{'id':'a','title':'Scheduler'}]},'results':{'a':{'status':'completed','output':'report only'}},'audit':'repair: no executable proof'}
+    stats=memory.refresh(workspace,{'id':'run','execution_id':'second','status':'running','active_goal':'Add executable proof','plan_history':[first],'plan':{'steps':[]},'results':{}})
+    notes=json.loads(Path(stats['graph_path']).read_text(encoding='utf-8'))['plan_notes']
+    assert {n['execution_id'] for n in notes} == {'first','second'}
+    assert notes[0]['steps'][0]['summary']=='report only'
+    assert 'repair' in notes[0]['audit']
+    assert 'Implement scheduler' in memory.context(workspace,'scheduler',max_chars=4000)
+
+
+def test_user_rule_survives_automatic_fact_retention_and_context_ranking(tmp_path):
+    workspace=tmp_path/'project'; workspace.mkdir()
+    memory=ProjectMemory(tmp_path/'data')
+    rule={'id':'rule','source':'user','category':'rule','content':'Canlı servisi değiştirme','tags':[]}
+    automatic=[{'id':str(i),'source':'auto_reflection','category':'insight','content':f'pytest scheduler measurement baseline {i}','tags':['pytest']} for i in range(45)]
+    retained=memory._auto_reflect_internal({'status':'running'},[rule,*automatic])
+    assert rule in retained
+    assert len([f for f in retained if f['source']=='auto_reflection'])==40
+    stats=memory.refresh(workspace)
+    path=Path(stats['graph_path']);data=json.loads(path.read_text(encoding='utf-8'));data['facts']=retained;path.write_text(json.dumps(data),encoding='utf-8')
+    context=memory.context(workspace,'pytest scheduler measurement baseline',max_chars=4000)
+    assert 'Canlı servisi değiştirme' in context
+    assert 'kaynak=user' in context
+    assert 'doğrulama=unverified' in context
+    assert 'Doğrulama başarılı' not in context

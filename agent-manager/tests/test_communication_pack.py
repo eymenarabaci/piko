@@ -155,11 +155,12 @@ def test_apply_needs_a_single_use_token():
     with pytest.raises(PermissionError):
         gate.check(communication.APPROVER_PERSONA, "communication", "apply",
                    idempotency_key="k1")
+    token = gate.issue_approval("communication", "apply")
     gate.check(communication.APPROVER_PERSONA, "communication", "apply",
-               idempotency_key="k1", approval_token="tok-once")
+               idempotency_key="k1", approval_token=token)
     with pytest.raises(PermissionError):
         gate.check(communication.APPROVER_PERSONA, "communication", "apply",
-                   idempotency_key="k2", approval_token="tok-once")
+                   idempotency_key="k2", approval_token=token)
 
 
 def test_dangerous_level_is_not_defined():
@@ -290,7 +291,7 @@ async def test_communication_delivery_flow_end_to_end(tmp_path, seeded):
         assert await server.outbox() == []
 
         # 3. Approval binds the exact preview.
-        approval = communication_flow.issue_approval(request)
+        approval = await communication_flow.issue_approval(request, gate=engine.bridge_gate, workspace=str(tmp_path), fixture_db=str(seeded))
         assert approval["approval_token"].startswith("communication-")
         assert approval["draft_hash"] == drafted["preview_sha256"]
         assert approval["recipients"] == request["to"]
@@ -328,7 +329,7 @@ async def test_communication_delivery_flow_end_to_end(tmp_path, seeded):
         # 5. Duplicate send is impossible: same key, no second outbox row.
         replay = await communication_flow.deliver(
             engine, persona=communication.MANAGER_PERSONA, request=request,
-            approval_token="unused", idempotency_key="comm-1",
+            approval_token=approval["approval_token"], idempotency_key="comm-1",
             work_id=item["id"], run_id="run-comm-1", workspace=str(tmp_path),
             fixture_db=str(seeded))
         assert replay["replayed"] is True
@@ -371,7 +372,7 @@ async def test_meeting_delivery_end_to_end(tmp_path, seeded):
                "agenda": "Backlog önceliklendirme"}
     async with stack(tmp_path) as (engine, work, ledger):
         item = await work.create("Toplantı öner", workspace=str(tmp_path))
-        approval = communication_flow.issue_approval(request)
+        approval = await communication_flow.issue_approval(request, gate=engine.bridge_gate, workspace=str(tmp_path), fixture_db=str(seeded))
         delivered = await communication_flow.deliver(
             engine, persona=communication.MANAGER_PERSONA, request=request,
             approval_token=approval["approval_token"], idempotency_key="meet-1",
@@ -421,6 +422,7 @@ def test_api_lists_three_bridge_cards_and_blocks_proactive_writes(tmp_path):
         assert proactive.json()["level"] == "read"
 
         drafts = client.post("/api/bridges/communication/draft", json={
+            "workspace": str(tmp_path),
             "request": {"kind": "mail", "to": ["a@example.test"],
                         "subject": "Deneme", "body": "govde"},
             "workspace": str(tmp_path)})
@@ -434,6 +436,7 @@ def test_api_lists_three_bridge_cards_and_blocks_proactive_writes(tmp_path):
         assert without_token.status_code == 403
 
         approval = client.post("/api/bridges/communication/approve", json={
+            "workspace": str(tmp_path),
             "request": {"kind": "mail", "to": ["a@example.test"],
                         "subject": "Deneme", "body": "govde"}}).json()
         delivered = client.post("/api/bridges/communication/deliver", json={

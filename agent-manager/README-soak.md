@@ -15,7 +15,7 @@ fixture'larını kullanır. `work/` git tarafından yok sayılır.
 ## Elle çalıştırma
 
 ```powershell
-cd 'C:\Users\eymen\Desktop\AI-Orchestrator\agent-manager'
+cd agent-manager
 .\.venv\Scripts\python.exe tools\soak_run.py --hours 24 --jobs 48 --seed 9
 ```
 
@@ -35,8 +35,8 @@ Aşağıdaki komut her gece 02:00'de 24 saatlik soak koşusunu başlatır. Sunuc
 başlatmaz, 8767/8765 portlarına dokunmaz; yalnız betiği çalıştırır.
 
 ```powershell
-$python = 'C:\Users\eymen\Desktop\AI-Orchestrator\agent-manager\.venv\Scripts\python.exe'
-$script = 'C:\Users\eymen\Desktop\AI-Orchestrator\agent-manager\tools\soak_run.py'
+$python = '.\.venv\Scripts\python.exe'
+$script = '.\tools\soak_run.py'
 $action = "`"$python`" `"$script`" --hours 24 --jobs 48 --seed 9"
 schtasks /Create /TN "PikoSoak" /TR $action /SC DAILY /ST 02:00 /F /RL HIGHEST
 ```

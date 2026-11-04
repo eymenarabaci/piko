@@ -158,6 +158,94 @@ async def test_all_compatible_models_cooling_wait_instead_of_running_early(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_account_quota_cools_the_whole_codex_family_not_other_providers(tmp_path):
+    models = [
+        {"id": "codex", "provider": "codex", "base_model": "gpt-6.1-sol", "shared_quota_account": True,
+         "capabilities": ["development"], "priority": {"development": 3}},
+        {"id": "gpt-6-sol", "provider": "codex", "base_model": "gpt-6-sol", "shared_quota_account": True,
+         "capabilities": ["development"], "priority": {"development": 4}},
+        {"id": "gpt-5.6-terra", "provider": "codex", "base_model": "gpt-5.6-terra", "shared_quota_account": True,
+         "capabilities": ["development"], "priority": {"development": 5}},
+        {"id": "opus", "provider": "claude-code", "base_model": "claude-opus", "shared_quota_account": True,
+         "capabilities": ["development"], "priority": {"development": 6}},
+        {"id": "flash", "provider": "antigravity", "base_model": "gemini-flash",
+         "capabilities": ["development"], "priority": {"development": 7}},
+    ]
+    router = ModelRouter(models, tmp_path / "ledger.sqlite")
+    assert await router.record_failure("gpt-5.6-terra", "You've hit your usage limit") == "quota"
+    ranked = await router.rank("development", "direct", allow_writes=True)
+    assert {choice.model_id for choice in ranked} == {"flash", "opus"}
+    cooled = set(await router.get_cooldowns())
+    assert {"codex", "gpt-6-sol", "gpt-5.6-terra"} <= cooled
+    assert "flash" not in cooled and "opus" not in cooled
+
+    # A different subscription account cools only its own family.
+    assert await router.record_failure("opus", "You've hit your usage limit") == "quota"
+    assert [choice.model_id for choice in await router.rank("development", "direct", allow_writes=True)] == ["flash"]
+    # A healthy cross-provider alternative remains usable; do not wait for quota.
+    assert await router.next_cooldown("development", "direct", allow_writes=True) is None
+
+    # A success on one codex model proves the shared account is live again.
+    await router.record_success("codex")
+    assert not ({"codex", "gpt-6-sol", "gpt-5.6-terra"} & set(await router.get_cooldowns()))
+    assert "opus" in await router.get_cooldowns()
+
+
+@pytest.mark.asyncio
+async def test_codex_rate_limit_cools_only_the_hit_model(tmp_path):
+    models = [
+        {"id": "gpt-6-sol", "provider": "codex", "base_model": "gpt-6-sol", "shared_quota_account": True,
+         "capabilities": ["development"], "priority": {"development": 3}},
+        {"id": "gpt-6-luna", "provider": "codex", "base_model": "gpt-6-luna", "shared_quota_account": True,
+         "capabilities": ["development"], "priority": {"development": 4}},
+    ]
+    router = ModelRouter(models, tmp_path / "ledger.sqlite")
+    assert await router.record_failure("gpt-6-sol", "429 Too Many Requests") == "rate_limit"
+    assert [choice.model_id for choice in await router.rank("development", "direct", allow_writes=True)] == ["gpt-6-luna"]
+
+
+@pytest.mark.asyncio
+async def test_writer_holds_for_cooling_remote_instead_of_weak_local(tmp_path):
+    models = [
+        {"id": "codex_a", "provider": "codex", "capabilities": ["development"],
+         "priority": {"development": 1}},
+        {"id": "local_writer", "provider": "ollama", "capabilities": ["development"],
+         "priority": {"development": 5}},
+    ]
+    router = ModelRouter(models, tmp_path / "ledger.sqlite")
+    # Fresh: the capable remote is chosen even with the hold policy.
+    assert (await router.choose("development", "direct", allow_writes=True,
+                                hold_for_cooling_capable=True)).model_id == "codex_a"
+
+    assert await router.record_failure("codex_a", "You've hit your usage limit") == "quota"
+    # Without the policy the engine would fall back to the weak local writer.
+    assert [c.model_id for c in await router.rank("development", "direct", allow_writes=True)] == ["local_writer"]
+    # With the policy the writer waits for the cooling remote instead of failing.
+    assert await router.rank("development", "direct", allow_writes=True,
+                             hold_for_cooling_capable=True) == []
+    with pytest.raises(NoEligibleModel):
+        await router.choose("development", "direct", allow_writes=True, hold_for_cooling_capable=True)
+    # Waiting uses the same explicit hold policy as ranking. Default still permits local fallback.
+    assert await router.next_cooldown("development", "direct", allow_writes=True) is None
+    assert await router.next_cooldown("development", "direct", allow_writes=True,
+                                      hold_for_cooling_capable=True)
+
+
+@pytest.mark.asyncio
+async def test_hold_for_cooling_capable_lets_local_run_when_nothing_cools(tmp_path):
+    models = [
+        {"id": "local_writer", "provider": "ollama", "capabilities": ["development"],
+         "priority": {"development": 5}},
+        {"id": "codex_a", "provider": "codex", "capabilities": ["development"],
+         "priority": {"development": 1}, "hidden": True},
+    ]
+    router = ModelRouter(models, tmp_path / "ledger.sqlite")
+    # Only a local model is eligible and no remote is cooling -> local must run.
+    assert (await router.choose("development", "direct", allow_writes=True,
+                                hold_for_cooling_capable=True)).model_id == "local_writer"
+
+
+@pytest.mark.asyncio
 async def test_verified_zero_quota_waits_until_reset_or_manual_clear(tmp_path):
     router = ModelRouter(MODELS, tmp_path / "ledger.sqlite")
     reset = datetime.now(timezone.utc) + timedelta(hours=2)
@@ -227,3 +315,42 @@ async def test_latency_only_compares_models_with_measured_outcomes(tmp_path):
         await router.record_outcome("slow", "review", True, 120, 100, verified=True)
         await router.record_outcome("fast", "review", True, 10, 100, verified=True)
     assert (await router.choose("reviewer", task_kind="review")).model_id == "fast"
+
+
+@pytest.mark.asyncio
+async def test_calibration_utility_orders_strong_unknown_weak_on_one_scale(tmp_path):
+    models = []
+    for name, weight in [('strong', 0.9), ('unknown', None), ('weak', 0.2)]:
+        model = {'id': name, 'provider': 'codex', 'capabilities': ['development'],
+                 'priority': {'development': 7}}
+        if weight is not None:
+            model.update(role_weights={'development': weight}, provenance={'calibrated': True})
+        models.append(model)
+    router = ModelRouter(models, tmp_path / 'calibration.sqlite')
+    ranked = await router.rank('development')
+    assert [choice.model_id for choice in ranked] == ['strong', 'unknown', 'weak']
+    # Hard quota exclusion remains authoritative even for the best calibrated model.
+    await router.record_failure('strong', 'Individual quota reached')
+    assert [choice.model_id for choice in await router.rank('development')] == ['unknown', 'weak']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remote_overrides, availability", [
+    ({}, {"codex": False, "ollama": True}),
+    ({"hidden": True}, None),
+    ({"supports_writes": False}, None),
+])
+async def test_hold_does_not_wait_for_unavailable_or_incompatible_remote(tmp_path, remote_overrides, availability):
+    models = [
+        {"id": "remote", "provider": "codex", "capabilities": ["development"],
+         "priority": {"development": 1}, **remote_overrides},
+        {"id": "local", "provider": "ollama", "capabilities": ["development"],
+         "priority": {"development": 5}},
+    ]
+    router = ModelRouter(models, tmp_path / "hold-suitability.sqlite")
+    await router.record_failure("remote", "You've hit your usage limit")
+    ranked = await router.rank("development", "direct", allow_writes=True,
+                               availability=availability, hold_for_cooling_capable=True)
+    assert [choice.model_id for choice in ranked] == ["local"]
+    assert await router.next_cooldown("development", "direct", allow_writes=True,
+                                      availability=availability, hold_for_cooling_capable=True) is None

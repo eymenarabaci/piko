@@ -356,7 +356,7 @@ async def _process_job(stack: SoakStack, row: dict, rng: random.Random, *,
     round_counts["approved"] += 1
     if kind == "office":
         request = _office_request(index)
-        approval = office_flow.issue_approval(office_flow.draft_payload(request))
+        approval = await office_flow.issue_approval(office_flow.draft_payload(request), gate=stack.engine.bridge_gate, target="raporlar", workspace=workspace)
         result = await office_flow.deliver(
             stack.engine, persona=office.MANAGER_PERSONA, request=request,
             target="raporlar", approval_token=approval["approval_token"],
@@ -364,7 +364,7 @@ async def _process_job(stack: SoakStack, row: dict, rng: random.Random, *,
             run_id=f"soak-run-{work_id}", workspace=workspace)
     elif kind == "communication_mail":
         request = _mail_request(index)
-        approval = communication_flow.issue_approval(request)
+        approval = await communication_flow.issue_approval(request, gate=stack.engine.bridge_gate, workspace=workspace, fixture_db=str(fixture_db))
         result = await communication_flow.deliver(
             stack.engine, persona=communication.MANAGER_PERSONA, request=request,
             approval_token=approval["approval_token"],
@@ -373,7 +373,7 @@ async def _process_job(stack: SoakStack, row: dict, rng: random.Random, *,
             fixture_db=str(fixture_db))
     else:
         request = _meeting_request(index, clock)
-        approval = communication_flow.issue_approval(request)
+        approval = await communication_flow.issue_approval(request, gate=stack.engine.bridge_gate, workspace=workspace, fixture_db=str(fixture_db))
         result = await communication_flow.deliver(
             stack.engine, persona=communication.MANAGER_PERSONA, request=request,
             approval_token=approval["approval_token"],

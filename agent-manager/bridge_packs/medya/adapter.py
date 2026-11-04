@@ -872,8 +872,15 @@ def apply_media(workspace, source, *, output_dir: str = "medya-cikti",
                 continue
         except RetryableMediaError as exc:
             _safe_unlink(destination)
-            entries.append(_failed_entry(output_kind, key, str(exc)))
+            entries.append(_failed_entry(output_kind, key, str(exc), "retryable"))
+        except ExternalMediaError as exc:
+            _safe_unlink(destination)
+            entries.append(_failed_entry(output_kind, key, str(exc),
+                                         "external-down"))
 
+    requested_entries = [item for item in entries if item["kind"] in requested]
+    succeeded = [item for item in requested_entries
+                 if item["status"] in {"ok", "fallback", "replayed"}]
     png_entries = [item for item in entries
                    if item.get("path") and str(item["path"]).endswith(".png")]
     if png_entries:
@@ -893,7 +900,7 @@ def apply_media(workspace, source, *, output_dir: str = "medya-cikti",
     failed = [item for item in entries if item["status"] == "failed"]
     capability_used = sorted({item["capability"] for item in files
                               if item.get("capability")})
-    ok = bool(files)
+    ok = bool(files) and bool(succeeded)
     result = {
         "bridge": BRIDGE_ID,
         "action": "apply",
@@ -917,7 +924,10 @@ def apply_media(workspace, source, *, output_dir: str = "medya-cikti",
     }
     if not ok:
         reason = failed[0]["note"] if failed else "Hiçbir çıktı üretilemedi."
-        result["error"] = error_payload(ExternalMediaError(reason))
+        error_class = failed[0].get("error_class", "external-down") if failed else "external-down"
+        exc_class = (RetryableMediaError if error_class == "retryable"
+                     else ExternalMediaError)
+        result["error"] = error_payload(exc_class(reason))
     return result
 
 

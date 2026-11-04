@@ -186,17 +186,30 @@ class ProjectMemory:
                 if len(files) >= MAX_FILES:
                     break
             removed = sorted(set(old_files) - set(files)) if not truncated else []
-            notes = previous.get('plan_notes', [])[-11:]
-            facts = previous.get('facts', [])
+            notes = previous.get('plan_notes', [])[-23:]
+            facts = [dict(f) for f in previous.get('facts', [])]
+            for fact in facts:
+                if fact.get('source') == 'auto_reflection':
+                    fact['verification'] = 'unverified'
+                    fact['confidence'] = min(fact.get('confidence', 0.35), 0.35)
+                    if not fact.get('content', '').startswith('Ajan'):
+                        fact['content'] = _safe_label('Ajan beyanı (doğrulanmadı): ' + fact.get('content', ''), 300)
             if run is not None:
-                note = {'execution_id': run.get('execution_id') or run.get('id'),
-                        'status': _safe_label(run.get('status', 'unknown'), 30), 'recorded_at': _now(),
-                        'evidence': 'Ajan/orkestratör raporu; bağımsız doğrulanmadı.',
-                        'steps': [{'title': _safe_label(step.get('title', step.get('id', ''))),
-                                   'status': _safe_label(run.get('results', {}).get(step.get('id'), {}).get('status', 'pending'), 30)}
-                                  for step in (run.get('plan') or {}).get('steps', [])[:12]]}
-                notes = [item for item in notes if item.get('execution_id') != note['execution_id']]
-                notes.append(note)
+                for record in list(run.get('plan_history', []))[-20:] + [run]:
+                    execution = record.get('execution_id') or record.get('id') or run.get('id')
+                    note = {'execution_id': execution, 'run_id': run.get('id'),
+                            'status': _safe_label(record.get('status', 'unknown'), 30), 'recorded_at': _now(),
+                            'goal': _safe_label(record.get('active_goal') or record.get('prompt') or record.get('title') or '', 400),
+                            'audit': _safe_label(record.get('audit') or record.get('last_phase_audit') or '', 500),
+                            'evidence': 'Ajan/orkestratör raporu; bağımsız doğrulanmadı.',
+                            'steps': [{'title': _safe_label(step.get('title', step.get('id', ''))),
+                                       'status': _safe_label(record.get('results', {}).get(step.get('id'), {}).get('status', 'pending'), 30),
+                                       'summary': _safe_label(record.get('results', {}).get(step.get('id'), {}).get('output', ''), 400),
+                                       'error': _safe_label(record.get('results', {}).get(step.get('id'), {}).get('error', ''), 200)}
+                                      for step in (record.get('plan') or {}).get('steps', [])[:12]]}
+                    notes = [item for item in notes if item.get('execution_id') != execution]
+                    notes.append(note)
+                notes = notes[-24:]
                 facts = self._auto_reflect_internal(run, facts)
             data = {'schema': SCHEMA, 'workspace': str(workspace), 'updated_at': _now(),
                     'files': files, 'graph': self._graph(files), 'plan_notes': notes,
@@ -226,12 +239,12 @@ class ProjectMemory:
                 res = results.get(s_id, {})
                 out = res.get('output', '')
                 title = s.get('title', s_id)
-                if any(w in title.lower() for w in {'test', 'doğrulama', 'verify', 'build', 'lint'}):
-                    content = f"Doğrulama başarılı ({title}): {out[:120].strip()}" if out else f"Doğrulama adımı tamamlandı: {title}"
+                if res.get('status') in {'completed', 'success'} and any(w in title.lower() for w in {'test', 'doğrulama', 'verify', 'build', 'lint'}):
+                    content = f"Ajan doğrulama raporu (doğrulanmadı) ({title}): {out[:120].strip()}" if out else f"Ajan doğrulama kaydı (doğrulanmadı): {title}"
                     self._append_fact_if_new(facts_list, content, category='insight', source='auto_reflection', tags=['test', 'verification'])
             if len(steps) >= 3 and prompt:
                 p_words = [w for w in prompt.split() if len(w) > 3][:6]
-                summary_content = f"Başarıyla tamamlanan iş akışı: {' '.join(p_words)} ({len(steps)} adım)"
+                summary_content = f"Ajanın tamamlandı kaydı (doğrulanmadı): {' '.join(p_words)} ({len(steps)} adım)"
                 self._append_fact_if_new(facts_list, summary_content, category='architecture', source='auto_reflection', tags=['workflow', 'success'])
 
         # 2. Recovered or observed errors
@@ -246,7 +259,9 @@ class ProjectMemory:
                     content = f"Hata tecrübesi ({title}): {reason}"
                     self._append_fact_if_new(facts_list, content, category='insight', source='auto_reflection', tags=['error', 'lesson'])
 
-        return facts_list[-40:]
+        protected = [f for f in facts_list if f.get('source') != 'auto_reflection']
+        automatic = [f for f in facts_list if f.get('source') == 'auto_reflection']
+        return protected + automatic[-40:]
 
     @staticmethod
     def _append_fact_if_new(facts: list[dict], content: str, category: str = 'insight', source: str = 'auto_reflection', tags: list[str] | None = None):
@@ -263,7 +278,8 @@ class ProjectMemory:
             'content': content,
             'tags': [t.lower() for t in (tags or [])][:6],
             'source': source,
-            'confidence': 0.85 if source == 'auto_reflection' else 1.0,
+            'confidence': 0.35 if source == 'auto_reflection' else 1.0,
+            'verification': 'unverified' if source == 'auto_reflection' else 'user_provided',
             'created_at': _now(),
             'updated_at': _now()
         })
@@ -435,7 +451,8 @@ class ProjectMemory:
                 score += 3
             scored_facts.append((score, f))
         scored_facts.sort(key=lambda item: -item[0])
-        relevant_facts = [f for score, f in scored_facts if score > 0][:6]
+        protected = [f for f in facts if f.get('source') != 'auto_reflection' and f.get('category') in {'rule', 'preference'}][:12]
+        relevant_facts = protected + [f for score, f in scored_facts if score > 0 and f not in protected][:6]
         if not relevant_facts and facts:
             relevant_facts = [f for f in facts if f.get('category') in {'rule', 'preference'}][:4]
 
@@ -447,7 +464,7 @@ class ProjectMemory:
             lines.append('[Öğrenilen Proje Kuralları ve Hafızası]:')
             for f in relevant_facts:
                 cat_label = {'rule': 'Kural', 'preference': 'Tercih', 'architecture': 'Mimari', 'insight': 'Ders'}.get(f.get('category'), 'Not')
-                lines.append(f"- [{cat_label}]: {f.get('content')}")
+                lines.append(f"- [{cat_label}; kaynak={f.get('source', 'unknown')}; doğrulama={f.get('verification', 'unverified')}]: {f.get('content')}")
 
         for name, item in data['files'].items():
             if item.get('package'):
@@ -457,5 +474,8 @@ class ProjectMemory:
             item = data['files'][name]
             lines.append(f"{name} | semboller: {', '.join(item['symbols'][:12])} | yerel bağlantılar: {', '.join(data['graph'].get(name, [])[:8])}")
         for note in data['plan_notes'][-3:]:
-            lines.append(f"Önceki plan raporu ({note['status']}, bağımsız doğrulanmadı): " + '; '.join(f"{step['title']}={step['status']}" for step in note['steps'])[:1000])
+            lines.append(f"Önceki plan raporu ({note['status']}, bağımsız doğrulanmadı): " + note.get('goal', '')[:250])
+            if note.get('audit'):
+                lines.append('Denetim kararı: ' + note['audit'][:400])
+            lines.append('; '.join(f"{step['title']}={step['status']}; {step.get('summary', '')[:180]}; {step.get('error', '')[:100]}" for step in note['steps'])[:1600])
         return '\n'.join(lines)[:max_chars]

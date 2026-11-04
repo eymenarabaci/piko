@@ -331,7 +331,8 @@ def draft(workspace, *, branch: str, commit_message: str, files=None,
             return {
                 "bridge": BRIDGE_ID, "action": "draft", "branch": branch,
                 "base_branch": base_branch, "commit_sha": sha, "files": written,
-                "pr_title": title[:200], "pr_body": str(pr_body or "").strip()[:8000],
+                "pr_title": title[:200], "pr_body": (str(pr_body or "").strip() or
+                    _default_pr_body(written, commit_message, test_summary))[:8000],
                 "test_summary": _summary_line(test_summary) or str(test_summary or "").strip()[:300],
                 "source": "git-only", "reused": True,
                 "summary": _three_line(

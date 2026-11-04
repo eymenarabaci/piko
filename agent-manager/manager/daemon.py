@@ -30,6 +30,7 @@ import aiosqlite
 
 from .health import DAEMON_KIND, DAEMON_SOURCE_ID
 from .recovery import collect_proposals, proposal_for, summarize as summarize_recovery
+from .single_instance import InstanceLock
 
 log = logging.getLogger("manager.daemon")
 
@@ -174,10 +175,11 @@ class DriverDaemon:
                  tick_seconds: int = TICK_SECONDS,
                  reminder_seconds=REMINDER_SECONDS,
                  block_after_seconds: int = BLOCK_AFTER_SECONDS,
-                 clock=_utcnow):
+                 clock=_utcnow, lock_path=None):
         self.work = work
         self.hooks = hooks
         self.state = DriverState(state_path)
+        self.lock_path = Path(lock_path) if lock_path else Path(state_path).with_name("daemon.lock")
         self.ledger = ledger
         self.tick_seconds = max(1, int(tick_seconds))
         self.reminder_seconds = tuple(max(1, int(value)) for value in reminder_seconds)
@@ -188,8 +190,10 @@ class DriverDaemon:
         self._opened = False
         self._resumed: set[str] = set()
         self._started: set[str] = set()
+        self._dependency_flagged: set[str] = set()
         self.stats = {"tick": 0, "resumed": 0, "started": 0, "reminders": 0,
-                      "blocked": 0, "skipped": 0, "errors": 0, "repairs": 0}
+                      "blocked": 0, "skipped": 0, "errors": 0, "repairs": 0,
+                      "dependency_errors": 0}
 
     async def open(self):
         if self._opened:
@@ -227,8 +231,15 @@ class DriverDaemon:
         await self.run()
 
     async def run(self):
-        await self.open()
+        lock = InstanceLock(self.lock_path)
+        if not lock.acquire():
+            log.warning("Başka bir sürücü zaten çalışıyor (%s); bu süreç çalışmadan çıkıyor.",
+                        self.lock_path)
+            self.stats["duplicate"] = self.stats.get("duplicate", 0) + 1
+            return
         try:
+            await self.open()
+            log.info("Sürücü kilidi alındı: %s", self.lock_path)
             while not self._stop.is_set():
                 try:
                     await self.tick()
@@ -243,6 +254,7 @@ class DriverDaemon:
                     pass
         finally:
             await self.close()
+            lock.release()
 
     async def tick(self, now: datetime | None = None) -> dict:
         if not self._opened:
@@ -254,14 +266,20 @@ class DriverDaemon:
         self.stats["tick"] += 1
         await self._beat("tick")
 
+        # Dependencies are global: completed work outside the display window
+        # must still unblock current work.
+        index = await self.work.dependency_index()
+        done_ids = {work_id for work_id, entry in index.items()
+                    if entry["status"] == "done"}
         works = await self.work.list(limit=WORK_LIMIT)
-        done_ids = {item["id"] for item in works if item["status"] == "done"}
         works = [await self._resolve_blocked(item, done_ids) for item in works]
-        done_ids = {item["id"] for item in works if item["status"] == "done"}
 
         for item in works:
             if item["status"] == "active":
                 await self._resume(item)
+
+        for item, reason in self._dependency_errors(works, index, done_ids):
+            await self._flag_dependency_error(item, reason)
 
         ready = [item for item in works if item["status"] == "open"]
         ready.sort(key=lambda item: (
@@ -319,6 +337,78 @@ class DriverDaemon:
         return set(dependencies) <= done_ids
 
     @staticmethod
+    def _dependency_errors(works: list[dict], index: dict, done_ids: set[str]):
+        """Jobs whose dependencies can never complete (gap I-02).
+
+        Missing, cancelled and cyclic dependencies are surfaced as explicit
+        errors instead of being skipped silently forever. The peel treats every
+        unresolved dependency as blocking; what remains after the fixpoint
+        cannot resolve: its unmet dependency is unknown, is cancelled, or sits
+        in the same stuck (cyclic) closure.
+        """
+        known = set(index)
+        cancelled = {work_id for work_id, entry in index.items()
+                     if entry["status"] == "cancelled"}
+        pending = {
+            work_id: {str(dep) for dep in entry.get("dependencies") or []
+                      if str(dep) not in done_ids}
+            for work_id, entry in index.items() if entry["status"] != "done"
+        }
+        remaining = set(pending)
+        changed = True
+        while changed:
+            changed = False
+            for work_id in list(remaining):
+                deps = pending[work_id]
+                if (deps & remaining) or (deps & cancelled) or (deps - known):
+                    continue
+                remaining.discard(work_id)
+                changed = True
+        reasons: dict[str, str] = {}
+        for work_id in remaining:
+            deps = pending[work_id]
+            missing = sorted(deps - known)
+            stopped = sorted(deps & cancelled)
+            cyclic = sorted(deps & remaining)
+            if missing:
+                reasons[work_id] = f"eksik bağımlılık: {', '.join(missing[:3])}"
+            elif stopped:
+                reasons[work_id] = f"iptal edilmiş bağımlılık: {', '.join(stopped[:3])}"
+            else:
+                reasons[work_id] = f"çözülemeyen bağımlılık döngüsü: {', '.join(cyclic[:3])}"
+        flagged = []
+        for item in works:
+            work_id = str(item.get("id") or "")
+            if item.get("status") in {"open", "blocked"} and work_id in reasons:
+                flagged.append((item, reasons[work_id]))
+        return flagged
+
+    async def _flag_dependency_error(self, item: dict, reason: str) -> None:
+        """Surface a dependency defect once per job: log, notification, record."""
+        work_id = str(item.get("id") or "")
+        if not work_id or work_id in self._dependency_flagged:
+            return
+        self._dependency_flagged.add(work_id)
+        self.stats["dependency_errors"] += 1
+        log.error("İş bağımlılık hatası: %s (%s)", work_id, reason)
+        try:
+            await self.work.update(work_id, next_action=f"Bağımlılık hatası: {reason}")
+        except Exception:
+            self.stats["errors"] += 1
+            log.exception("Bağımlılık hatası iş kaydına yazılamadı: %s", work_id)
+        callback = getattr(self.hooks, "notify", None)
+        if callback is None:
+            return
+        try:
+            await callback("dependency_error",
+                           f"Bağımlılık hatası: {item.get('title') or work_id}",
+                           reason, work_id=work_id, dedupe_key=f"dep:{work_id}",
+                           severity="high")
+        except Exception:
+            self.stats["errors"] += 1
+            log.exception("Bağımlılık hatası bildirilemedi: %s", work_id)
+
+    @staticmethod
     def _is_due(item: dict, moment: datetime) -> bool:
         due = _parse_aware(item.get("due_at"))
         return due is None or due <= moment
@@ -349,6 +439,18 @@ class DriverDaemon:
     async def _start(self, item: dict) -> None:
         if item["id"] in self._started:
             return
+        self._started.add(item["id"])
+        try:
+            current = await self.work.get(item["id"])
+            if current is None or current.get("status") != "open" or current.get("run_id"):
+                return
+            await self._start_pending(current)
+        finally:
+            # This is an in-flight guard only. Persistent run linkage protects
+            # retries; a later repair generation must be allowed to start.
+            self._started.discard(item["id"])
+
+    async def _start_pending(self, item: dict) -> None:
         repair = None
         try:
             repair = await self.work.pending_repair(item["id"])
@@ -373,17 +475,18 @@ class DriverDaemon:
             log.info("İş için henüz run açılmadı; sonraki tick yeniden denenecek: %s",
                      item["id"])
             return
-        self._started.add(item["id"])
         self.stats["started"] += 1
         if repair is not None and start_repair is not None:
             self.stats["repairs"] += 1
             log.info("Onarım run'ı başlatıldı: %s (v%s) -> %s",
                      item["id"], repair.get("version"), run_id)
         try:
-            await self.work.create_for_run(
-                {"id": str(run_id), "conversation_id": item.get("conversation_id", ""),
-                 "prompt": item.get("goal", "")},
-                work_id=item["id"])
+            linked = await self.work.get(item["id"])
+            if not linked or linked.get("run_id") != str(run_id):
+                await self.work.create_for_run(
+                    {"id": str(run_id), "conversation_id": item.get("conversation_id", ""),
+                     "prompt": item.get("goal", "")},
+                    work_id=item["id"])
         except Exception:
             self.stats["errors"] += 1
             log.exception("Run açıldı ama iş kaydına bağlanamadı: %s -> %s",
@@ -547,6 +650,34 @@ def dry_run(data_dir) -> dict:
     return report
 
 
+def configure_logging(data_dir, *, filename: str = "daemon.log", level=logging.INFO) -> None:
+    """Attach a rotating file handler so crashes are readable after a restart.
+
+    Stdout/stderr redirection alone lost the log whenever the watchdog
+    truncated it on the next start, so the daemon owns its own log file.
+    """
+    from logging.handlers import TimedRotatingFileHandler
+
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    root = logging.getLogger()
+    root.setLevel(level)
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    try:
+        file_handler = TimedRotatingFileHandler(
+            data_dir / filename, when="midnight", backupCount=7, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+    except OSError:
+        pass
+    stream = logging.StreamHandler(sys.stderr)
+    stream.setFormatter(formatter)
+    root.addHandler(stream)
+    logging.captureWarnings(True)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Piko unattended sürücü çekirdeği")
     parser.add_argument("--dry-run", action="store_true",
@@ -556,8 +687,8 @@ def main(argv=None) -> int:
     parser.add_argument("--tick-seconds", type=int, default=TICK_SECONDS,
                         help="Tick aralığı (varsayılan 10 sn).")
     args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     data_dir = Path(args.data_dir) if args.data_dir else _default_data_dir()
+    configure_logging(data_dir)
 
     if args.dry_run:
         report = dry_run(data_dir)
@@ -597,6 +728,7 @@ async def build_driver(data_dir, *, tick_seconds: int = TICK_SECONDS,
     store = Store(data_dir / "runs.sqlite")
     await store.open()
     stack = contextlib.AsyncExitStack()
+    stack.push_async_callback(store.close)
     try:
         saver = await stack.enter_async_context(
             AsyncSqliteSaver.from_conn_string(str(data_dir / "checkpoints.sqlite")))
@@ -614,13 +746,15 @@ async def build_driver(data_dir, *, tick_seconds: int = TICK_SECONDS,
             work=work, notifications=notifications, ledger=ledger, metrics=metrics,
             integrations=integrations, resource_locks=locks,
             heartbeat=health.beat, heartbeat_retire=health.retire)
+        stack.push_async_callback(engine.close)
+        # Headless/watchdog boot uses the same recovery contract as UI boot.
+        await engine.recover()
         hooks = EngineDriverHooks(engine, default_mode=default_mode,
                                   allow_writes=allow_writes)
         daemon = DriverDaemon(work, hooks, state_path=data_dir / "driver.sqlite",
                               ledger=ledger, tick_seconds=tick_seconds)
     except BaseException:
         await stack.aclose()
-        await store.close()
         raise
     return daemon, hooks, stack
 

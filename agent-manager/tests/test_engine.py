@@ -30,6 +30,7 @@ class FakeProviders:
         {"id": "planner", "provider": "test", "execution_supported": True},
         {"id": "worker", "provider": "test", "execution_supported": True},
         {"id": "disabled", "provider": "test", "execution_supported": False},
+        {"id": "reviewer", "provider": "test", "execution_supported": True, "capabilities": ["reviewer"]},
     ]
 
     def __init__(self, steps=None):
@@ -54,6 +55,10 @@ class FakeProviders:
                     "model_id": model_id, "status": "completed", "usage": {}}
         if "Sen bağımsız ve salt okunur iş denetçisisin" in prompt:
             return {"output": json.dumps({"action": "accept", "reason": "Hedef karşılandı."}),
+                    "model_id": model_id, "status": "completed", "usage": {}}
+        if "Sen bağımsız, salt okunur QA denetçisisin" in prompt:
+            return {"output": json.dumps({"status": "pass", "findings": [],
+                                           "test_result": "Explicit test fixture review result"}),
                     "model_id": model_id, "status": "completed", "usage": {}}
         if model_id == "planner":
             assert not allow_writes, "Planning must never inherit write permission"
@@ -290,7 +295,7 @@ def test_api_work_delivery_notifications_and_integrations(tmp_path):
         assert detail["summary"]["next_action"]
 
         deliverable = client.post(f"/api/work/{work_id}/deliverables", json={
-            "summary": "Rapor hazır.", "evidence": ["pytest: 3 passed"],
+            "summary": "Rapor hazır.", "status": "delivered", "evidence": ["pytest: 3 passed"],
             "requirements": ["Rapor dosyası hazır"]})
         assert deliverable.status_code == 201
         assert deliverable.json()["version"] == 1

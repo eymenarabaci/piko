@@ -60,5 +60,5 @@ def test_gate_returns_ledger_key_for_allowed_level():
     gate = BridgeGate(_registry())
     result = gate.check(_persona(), BRIDGE_ID, 'draft',
                         idempotency_key="smoke-key",
-                        approval_token="smoke-approval-token")
+                        approval_token=token)
     assert result["ledger_key"].startswith(BRIDGE_ID + ":" + 'draft' + ":")

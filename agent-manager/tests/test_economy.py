@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from manager.outcomes import InfrastructureError, ensure_usable_result, is_infrastructure_error
+from manager.outcomes import InfrastructureError, ensure_usable_result, is_infrastructure_error, is_timeout_error
+from manager.execution_policy import model_allowed
 from manager.worker_catalog import WorkerRequestError, extract_worker_calls, worker_request_instructions
 
 
@@ -34,7 +35,7 @@ def isolated_executor():
     source = ast.parse((Path(__file__).parents[1] / 'manager/engine.py').read_text(encoding='utf-8'))
     cls = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == 'Engine')
     fn = next(node for node in cls.body if isinstance(node, ast.AsyncFunctionDef) and node.name == 'run_executor')
-    namespace = {'asyncio': asyncio, 'json': __import__('json'), 'NoEligibleModel': NoEligibleModel,
+    namespace = {'model_allowed': model_allowed, 'is_timeout_error': is_timeout_error, 'asyncio': asyncio, 'json': __import__('json'), 'NoEligibleModel': NoEligibleModel,
                  'infer_role': lambda *args: 'general', 'is_infrastructure_error': is_infrastructure_error,
                  'ensure_usable_result': ensure_usable_result}
     exec(compile(ast.Module(body=[fn], type_ignores=[]), '<isolated executor>', 'exec'), namespace)
@@ -86,3 +87,14 @@ def test_infrastructure_error_does_not_try_other_models():
     state.route.assert_not_awaited()
     state.router.record_failure.assert_not_awaited()
 
+
+
+
+def test_two_timeouts_stop_model_churn_without_resetting_quota():
+    state, run, step = executor_state(TimeoutError('CLI toplam süre sınırını aştı.'))
+    with pytest.raises(RuntimeError, match='zaman aşımına'):
+        complete_immediate(isolated_executor()(state, run, step, 'Original task'))
+    assert state.providers.run.await_count == 2
+    assert state.set_step_model.await_count == 1
+    state.clear_cooldown.assert_not_awaited()
+    assert any(call.args[1] == 'step_retry_budget_exhausted' for call in state.store.event.call_args_list)

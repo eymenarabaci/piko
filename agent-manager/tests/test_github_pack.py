@@ -174,11 +174,12 @@ def test_apply_needs_a_single_use_token():
     gate = BridgeGate(bridge_registry)
     with pytest.raises(PermissionError):
         gate.check(github.APPROVER_PERSONA, "github", "apply", idempotency_key="k1")
+    token = gate.issue_approval("github", "apply")
     gate.check(github.APPROVER_PERSONA, "github", "apply",
-               idempotency_key="k1", approval_token="tok-once")
+               idempotency_key="k1", approval_token=token)
     with pytest.raises(PermissionError):
         gate.check(github.APPROVER_PERSONA, "github", "apply",
-                   idempotency_key="k2", approval_token="tok-once")
+                   idempotency_key="k2", approval_token=token)
 
 
 def test_dangerous_level_is_not_defined():
@@ -300,7 +301,7 @@ async def test_github_delivery_flow_end_to_end(tmp_path, repo):
         assert await ledger.list() == [], "taslak deftere yazmamalı"
 
         # 2. Approval is bound to the reviewed branch and commit.
-        approval = github_flow.issue_approval(committed)
+        approval = await github_flow.issue_approval(committed, gate=engine.bridge_gate, workspace=str(workspace), create_pr=False)
         assert approval["approval_token"].startswith("github-")
         assert approval["commit_sha"] == committed["commit_sha"]
 
@@ -347,7 +348,7 @@ async def test_github_delivery_flow_end_to_end(tmp_path, repo):
         before = git(bare, "rev-parse", "piko/ozellik").stdout.strip()
         replay = await github_flow.deliver(
             engine, persona=github.MANAGER_PERSONA, request=request,
-            approval_token="unused-token", idempotency_key="gh-2",
+            approval_token=approval["approval_token"], idempotency_key="gh-2",
             work_id=item["id"], run_id="run-gh-1", workspace=str(workspace),
             create_pr=False)
         assert replay["replayed"] is True
@@ -391,7 +392,7 @@ async def test_github_apply_reports_a_missing_remote_as_external_down(tmp_path):
         request = {"branch": "piko/uzak-yok", "commit_message": "Deneme",
                    "files": [{"path": "b.txt", "content": "b"}],
                    "pr_title": "Deneme", "test_summary": "1 passed"}
-        approval = github_flow.issue_approval(github.draft(workspace, **request))
+        approval = await github_flow.issue_approval(github.draft(workspace, **request), gate=engine.bridge_gate, workspace=str(workspace), create_pr=False)
         result = await github_flow.deliver(
             engine, persona=github.MANAGER_PERSONA, request=request,
             approval_token=approval["approval_token"], idempotency_key="gh-noremote",

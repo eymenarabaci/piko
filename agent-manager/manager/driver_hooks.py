@@ -20,7 +20,7 @@ from .schema import RunRequest, workspace_path
 
 log = logging.getLogger("manager.driver_hooks")
 
-LIVE_STATUSES = {"queued", "planning", "running", "waiting_quota", "awaiting_review",
+LIVE_STATUSES = {"queued", "planning", "running", "waiting_quota", "waiting_retry", "awaiting_review",
                  "awaiting_user_test", "planned"}
 RESUMABLE_STATUSES = {"interrupted", "failed"}
 
@@ -55,8 +55,13 @@ class EngineDriverHooks:
         if task is not None and not task.done():
             # Already executing in this process; nothing to do.
             return run_id
-        if run.get("status") in LIVE_STATUSES:
-            return run_id
+        if run.get("status") in {"queued", "planning", "running"}:
+            # Persistent status is not proof that an in-memory task survived.
+            await self.engine.change(run_id, status="interrupted", current_steps=[],
+                                     error="Çalışma görevi bulunamadı; otomatik kurtarılıyor.")
+            run = await self.engine.store.get(run_id)
+        elif run.get("status") in LIVE_STATUSES:
+            return run_id  # user/quota waits remain waits, not new executions
         if run.get("status") not in RESUMABLE_STATUSES:
             # Completed or cancelled runs are never restarted by the driver.
             return run_id

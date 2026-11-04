@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
+import time
 
 from .bridges import (
     DEFAULT_REGISTRY,
@@ -46,6 +48,23 @@ class BridgeGate:
         self.registry = registry if registry is not None else DEFAULT_REGISTRY
         self.token_store = token_store
         self._used_tokens: set[str] = set()
+        self._issued_tokens: dict[str, tuple] = {}
+
+    def issue_approval(self, bridge: str, level: str, *, payload=None, ttl_seconds=600) -> str:
+        if self.token_store is not None:
+            raise ValueError("Kalıcı kapıda issue_approval_async kullanılmalı.")
+        self._resolve_spec(bridge)
+        if level not in {"apply", "dangerous"} or not 0 < ttl_seconds <= 3600:
+            raise ValueError("Geçersiz onay kapsamı veya süresi.")
+        token = f"{bridge}-{secrets.token_urlsafe(32)}"
+        self._issued_tokens[token] = (bridge, level, _payload_hash(payload), time.time() + ttl_seconds)
+        return token
+
+    async def issue_approval_async(self, bridge: str, level: str, *, payload=None, ttl_seconds=600) -> str:
+        self._resolve_spec(bridge)
+        if self.token_store is None:
+            return self.issue_approval(bridge, level, payload=payload, ttl_seconds=ttl_seconds)
+        return await self.token_store.issue_approval(bridge=bridge, level=level, payload=payload, ttl_seconds=ttl_seconds)
 
     def _resolve_spec(self, bridge) -> dict:
         if isinstance(bridge, str):
@@ -133,7 +152,7 @@ class BridgeGate:
         """Synchronous authorization with in-process single-use tokens."""
         return self._evaluate(persona, bridge, level, approval_token=approval_token,
                               idempotency_key=idempotency_key, payload=payload,
-                              consume=self._consume_token)
+                              consume=lambda token, bridge_id, level_name: self._consume_token(token, bridge_id, level_name, payload=payload))
 
     async def authorize(self, persona, bridge, level: str, *, approval_token=None,
                         idempotency_key=None, payload=None) -> dict:
@@ -143,7 +162,7 @@ class BridgeGate:
                               idempotency_key=idempotency_key, payload=payload)
 
         # Dry evaluation first: a denied call must not consume the token.
-        self._evaluate(persona, bridge, level, approval_token="dry-run-token",
+        preview = self._evaluate(persona, bridge, level, approval_token="dry-run-token",
                        idempotency_key=idempotency_key, payload=payload,
                        consume=lambda *_: True)
 
@@ -154,9 +173,10 @@ class BridgeGate:
                     f"'{bridge_id}' köprüsünde '{level_name}' seviyesi tekil onay token'ı gerektirir."
                 )
             accepted = await self.token_store.consume_approval(
-                token, bridge=bridge_id, level=level_name)
+                token, bridge=bridge_id, level=level_name, payload=payload,
+                operation_key=preview["ledger_key"])
             if not accepted:
-                raise ApprovalRequired(f"Onay token'ı daha önce kullanıldı: '{token}'.")
+                raise ApprovalRequired("Onay geçersiz, kullanılmış, süresi dolmuş veya kapsamı değişmiş.")
             return True
 
         spec = self._resolve_spec(bridge)
@@ -170,7 +190,7 @@ class BridgeGate:
                               idempotency_key=idempotency_key, payload=payload,
                               consume=lambda *_: True)
 
-    def _consume_token(self, approval_token, bridge_id: str, level: str) -> bool:
+    def _consume_token(self, approval_token, bridge_id: str, level: str, *, payload=None) -> bool:
         token = str(approval_token or "").strip()
         if not token:
             raise ApprovalRequired(
@@ -178,7 +198,10 @@ class BridgeGate:
             )
         if token in self._used_tokens:
             raise ApprovalRequired(
-                f"Onay token'ı daha önce kullanıldı: '{token}'."
+                "Onay token'ı daha önce kullanıldı."
             )
+        issued = self._issued_tokens.get(token)
+        if issued is None or issued[:3] != (bridge_id, level, _payload_hash(payload)) or issued[3] <= time.time():
+            raise ApprovalRequired("Onay üretilmemiş, süresi dolmuş veya işlem kapsamı değişmiş.")
         self._used_tokens.add(token)
         return True

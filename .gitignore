@@ -71,3 +71,30 @@ agent-remote-android/bin/
 agent-remote-android/gen/
 agent-remote-android/build_temp/
 *.idsig
+
+# Private runtime and disposable environments
+agent-manager/data/
+agent-manager/.piko/
+.graphify-venv/
+agent-manager/.graphify-venv/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local operator maintenance helpers (not product launchers)
+agent-manager/tools/piko_cutover.ps1
+agent-manager/tools/piko_cutover.py
+agent-manager/tools/piko_inspect_steps.py
+agent-manager/tools/piko_purge_echo.py
+agent-manager/tools/piko_requeue.py
+agent-manager/tools/piko_restart_run.py
+agent-manager/tools/piko_set_run.py
+agent-manager/tools/piko_status.py
+agent-manager/tools/piko_terminal_lines.py
+agent-manager/tools/piko_terminal_scan.py
+agent-manager/tools/piko_watch.py
+agent-manager/tools/start_policy_server.ps1
+agent-manager/tools/watchdog.ps1
+agent-manager/tools/runtime_probe.py

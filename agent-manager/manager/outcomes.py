@@ -40,3 +40,15 @@ def ensure_usable_result(result):
     if _ERROR.match(output) and len(output) < 2000:
         raise RuntimeError('Sağlayıcı hata çıktısı döndürdü: ' + output)
     return result
+
+
+def is_timeout_error(error):
+    """Classify nested adapter timeouts without confusing them with quota."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        text = str(error).casefold()
+        if isinstance(error, TimeoutError) or "timeout" in type(error).__name__.casefold() or any(marker in text for marker in ("timed out", "did not complete within", "cli toplam süre sınırını aştı", "504")):
+            return True
+        error = error.__cause__ or error.__context__
+    return False

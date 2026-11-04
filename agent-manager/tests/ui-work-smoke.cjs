@@ -88,6 +88,15 @@ const chromePath = process.env.CHROME_PATH
     await page.locator('#notification-button').click();
     await page.locator('#notifications-dialog').waitFor({ state: 'visible' });
     await page.locator('.notification-item').first().waitFor();
+    await page.locator('.notification-actions button').first().waitFor({ timeout: 10000 });
+    const notificationActions = await page.locator('.notification-actions button').allInnerTexts();
+    if (!notificationActions.includes('Kabul et')) {
+      throw new Error('Notification card missing one-click accept: ' + notificationActions);
+    }
+    if (!notificationActions.includes('Şunu dene')) {
+      throw new Error('Notification card missing "Şunu dene": ' + notificationActions);
+    }
+    checks.push('notification-one-click:' + notificationActions.length);
     checks.push('notifications-dialog');
     await page.locator('#notif-quiet-start').fill('23:00');
     await page.locator('#notif-quiet-start').dispatchEvent('input');
@@ -97,11 +106,62 @@ const chromePath = process.env.CHROME_PATH
     checks.push('notification-preferences');
     await page.screenshot({ path: path.join(out, 'notifications.png'), fullPage: true });
 
-    const mascot = page.locator('#piko-mascot');
+    const mascot = page.locator('#piko-mascot-stage [data-state]');
     await mascot.waitFor();
     const mascotState = await mascot.getAttribute('data-state');
     if (!mascotState) throw new Error('Mascot state missing');
-    checks.push('mascot-' + mascotState);
+    if (mascotState !== 'idle') {
+      throw new Error('Mascot should start idle, got ' + mascotState);
+    }
+    checks.push('mascot-initial-' + mascotState);
+
+    const mascotSprite = page.locator('#piko-mascot-stage use');
+    if (await mascotSprite.count() === 0) throw new Error('Mascot sprite <use> missing');
+    const spriteHref = await mascotSprite.first().getAttribute('href');
+    if (spriteHref !== '#piko-idle') throw new Error('Mascot sprite href unexpected: ' + spriteHref);
+    checks.push('mascot-sprite-use');
+
+    await page.locator('#prompt').fill('maske denemesi');
+    await page.waitForFunction(() =>
+      document.querySelector('#piko-mascot-stage [data-state]')?.dataset.state === 'konusuyor');
+    checks.push('mascot-typing-konusuyor');
+    await page.locator('#prompt').fill('');
+    await page.waitForFunction(() =>
+      document.querySelector('#piko-mascot-stage [data-state]')?.dataset.state === 'idle');
+
+    const transitions = await page.evaluate(() => {
+      const host = document.createElement('div');
+      document.body.append(host);
+      const mascot = window.initMascot(host, { spriteUrl: '#' });
+      const read = () => host.querySelector('[data-state]').dataset.state;
+      const initial = read();
+      mascot.dispatch({ event: 'run.running', work_id: 'smoke-run' });
+      const running = read();
+      mascot.dispatch({ event: 'deliverable.updated', work_id: 'smoke-run',
+                        deliverable_status: 'delivered', reason: 'Rapor hazır' });
+      const delivered = read();
+      mascot.dispatch({ event: 'work.blocked', work_id: 'smoke-run',
+                        reason: 'Sahte engel' });
+      const blocked = read();
+      const workId = host.querySelector('[data-state]').dataset.workId;
+      const reason = host.querySelector('.piko-mascot-reason').textContent;
+      mascot.destroy();
+      host.remove();
+      return { initial, running, delivered, blocked, workId, reason };
+    });
+    if (transitions.initial !== 'idle') throw new Error('dispatch fixture did not start idle');
+    if (transitions.running !== 'calisiyor') throw new Error('run.running did not map to calisiyor: ' + transitions.running);
+    if (transitions.delivered !== 'teslim') throw new Error('delivered did not map to teslim: ' + transitions.delivered);
+    if (transitions.blocked !== 'takildi') throw new Error('blocked did not map to takildi: ' + transitions.blocked);
+    if (transitions.workId !== 'smoke-run') throw new Error('work id missing on mascot root');
+    if (transitions.reason !== 'Sahte engel') throw new Error('blocked reason missing: ' + transitions.reason);
+    checks.push('mascot-dispatch-transitions');
+
+    const healthResponse = await fetch(base + '/api/health');
+    if (!healthResponse.ok) throw new Error('health endpoint failed: ' + healthResponse.status);
+    const health = await healthResponse.json();
+    if (!('daemon_alive' in health)) throw new Error('health payload missing daemon_alive');
+    checks.push('mascot-health-api');
 
     const workTab = page.locator('[data-tab="work"]');
     if (await workTab.count() === 0) throw new Error('İş kaydı sekmesi bulunamadı');
@@ -149,7 +209,7 @@ const chromePath = process.env.CHROME_PATH
 
     const approval = await (await fetch(base + '/api/bridges/office/approve', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ request: officeRequest }),
+      body: JSON.stringify({ request: officeRequest, target: 'work/office-smoke' }),
     })).json();
 
     const delivered = await (await fetch(base + '/api/bridges/office/deliver', {
@@ -193,6 +253,13 @@ const chromePath = process.env.CHROME_PATH
         throw new Error('Bridge card missing last delivery section');
       }
     }
+    if (!/kanıt tam|eksik kanıt/.test(officeText)) {
+      throw new Error('Office card missing the evidence badge');
+    }
+    if (!/sha256/.test(officeText)) {
+      throw new Error('Office card missing the short sha256 evidence');
+    }
+    checks.push('bridge-evidence-badge');
     if (cardCount < 3) throw new Error('expected one card per shipped pack, got ' + cardCount);
     checks.push('bridge-cards-developer-view:' + cardCount);
     await page.screenshot({ path: path.join(out, 'bridge-card.png'), fullPage: true });
@@ -204,6 +271,96 @@ const chromePath = process.env.CHROME_PATH
     });
     if (!accepted.ok) throw new Error('Accept failed: ' + accepted.status);
     checks.push('delivery-accept-api');
+
+    // Repair loop: red -> v+1 (parent-linked) -> accept, without a model call.
+    const redWork = await (await fetch(base + '/api/work', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        goal: 'Onarım döngüsü smoke',
+        title: 'Onarım döngüsü',
+        due_at: new Date(Date.now() + 7 * 86_400_000).toISOString(),
+      }),
+    })).json();
+    const redV1 = await (await fetch(base + `/api/work/${redWork.id}/deliverables`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        summary: 'İlk sürüm',
+        kind: 'office-report',
+        bridge_id: 'office',
+        files: ['rapor.md'],
+        evidence: ['rapor.md · sha256 ' + 'a'.repeat(16) + '… (5 bayt)'],
+        note: 'özet: ilk sürüm',
+        idempotency_key: 'ui-smoke-repair-v1',
+      }),
+    })).json();
+    if (redV1.evidence_view?.complete !== true) {
+      throw new Error('Complete evidence was not recognized');
+    }
+    const rejected = await (await fetch(base + `/api/deliverables/${redV1.id}/repair`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ note: 'Başlık eksik' }),
+    })).json();
+    if (rejected.status !== 'repair_requested') {
+      throw new Error('Repair request not recorded: ' + rejected.status);
+    }
+    const redV2 = await (await fetch(base + `/api/work/${redWork.id}/deliverables`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        summary: 'Düzeltilmiş sürüm',
+        kind: 'office-report',
+        bridge_id: 'office',
+        files: ['rapor.md'],
+        evidence: ['rapor.md · sha256 ' + 'b'.repeat(16) + '… (6 bayt)'],
+        note: 'özet: başlık eklendi',
+        parent_version: 1,
+        idempotency_key: 'ui-smoke-repair-v2',
+      }),
+    })).json();
+    if (redV2.version !== 2 || redV2.parent_version !== 1) {
+      throw new Error('Repair version lineage broken: ' + JSON.stringify(redV2));
+    }
+    const redAccepted = await fetch(base + `/api/deliverables/${redV2.id}/accept`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ note: 'ui smoke kabul' }),
+    });
+    if (!redAccepted.ok) throw new Error('Repair accept failed: ' + redAccepted.status);
+    const redState = await (await fetch(base + `/api/work/${redWork.id}`)).json();
+    if (redState.work.status !== 'done') {
+      throw new Error('Work not done after accepting repair: ' + redState.work.status);
+    }
+    const deliveryMetrics = await (await fetch(base + '/api/metrics?task_kind=delivery')).json();
+    const rejectedCount = (deliveryMetrics.models || [])
+      .reduce((sum, model) => sum + (model.user_rejected || 0), 0);
+    if (rejectedCount < 1) throw new Error('Rejection count missing from metrics');
+    checks.push('repair-loop-red-v2-accept');
+
+    // Evidence gate: a delivery without evidence cannot be accepted.
+    const bareWork = await (await fetch(base + '/api/work', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ goal: 'Kanıtsız teslim smoke' }),
+    })).json();
+    const bare = await (await fetch(base + `/api/work/${bareWork.id}/deliverables`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ summary: 'Kanıtsız', kind: 'office-report',
+                             bridge_id: 'office', files: [], evidence: [] }),
+    })).json();
+    if (bare.evidence_view?.complete !== false) {
+      throw new Error('Missing evidence was not flagged');
+    }
+    const refused = await fetch(base + `/api/deliverables/${bare.id}/accept`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ note: 'yok' }),
+    });
+    if (refused.status !== 400) throw new Error('Evidence gate did not refuse accept');
+    checks.push('evidence-gate-refuses-accept');
 
     await page.setViewportSize({ width: 390, height: 844 });
     if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)) {

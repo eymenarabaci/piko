@@ -174,13 +174,14 @@ def test_gate_dangerous_token_is_single_use():
     registry = BridgeRegistry()
     registry.register(_dangerous_spec())
     gate = BridgeGate(registry)
+    token = gate.issue_approval("demo.local", "dangerous")
     first = gate.check("implementer", "demo.local", "dangerous",
-                       idempotency_key="k1", approval_token="token-1")
+                       idempotency_key="k1", approval_token=token)
     assert first["approval_used"] is True
     assert first["ledger_key"].startswith("demo.local:dangerous:")
     with pytest.raises(ApprovalRequired):
         gate.check("implementer", "demo.local", "dangerous",
-                   idempotency_key="k2", approval_token="token-1")
+                   idempotency_key="k2", approval_token=token)
 
 
 def test_gate_requires_persona_bridge_grant():

@@ -1,6 +1,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
-const {chromium} = require('C:/Users/user/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
+const {chromium} = require(process.env.PLAYWRIGHT_MODULE || require('node:path').join(process.env.USERPROFILE, '.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'));
 
 (async () => {
   const base = process.env.TEST_URL || 'http://127.0.0.1:8767';

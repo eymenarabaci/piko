@@ -50,7 +50,7 @@ class RunRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     prompt: str = Field(min_length=1, max_length=16000)
     mode: Literal["plan", "orchestrate", "chat"] = "plan"
-    planning_level: Literal["fast", "balanced", "detailed"] = "fast"
+    planning_level: Literal["fast", "balanced", "detailed", "parallel"] = "fast"
     planner_model: str = "gemini-3.8-flash-medium"
     executor_model: str = "auto"
     workspace: str = ""
@@ -60,8 +60,19 @@ class RunRequest(BaseModel):
     allow_writes: bool = False
     timeout_seconds: int = Field(default=900, ge=10, le=3600)
     workflow_timeout_seconds: int = Field(default=14400, ge=10, le=86400)
-    max_parallel: int = Field(default=4, ge=1, le=8)
+    max_parallel: int = Field(default=4, ge=1, le=6)
+    parallel_writes: bool = False  # opt-in isolated copies and conflict-checked merge
+    allow_parallel_plans: bool = False  # planner may compile independent subplans when useful
     execution_backend: Literal["direct", "ao", "cao"] = "direct"
+
+    @model_validator(mode="after")
+    def apply_parallel_planning(self):
+        if self.planning_level == "parallel":
+            self.allow_parallel_plans = True
+            self.parallel_writes = self.allow_writes
+            self.execution_backend = "direct"
+        return self
+
 
 
 def robust_json_decode(text: str) -> tuple[dict, int]:

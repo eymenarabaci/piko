@@ -1,110 +1,84 @@
-# Piko
+# Piko — ajan ve görev motoru
 
-Hazır açık kaynak **[LangGraph](https://github.com/langchain-ai/langgraph)** çalışma zamanı üzerine kurulu yerel CLI ajan yöneticisi. Eski `orchestrator/` motorunu import etmez. Bağımlılık sırası, paralel düğümler, join ve checkpoint/replay işlemlerini gerçek LangGraph `StateGraph` ve `AsyncSqliteSaver` yürütür. API ve arayüz yerel uyarlamadır; tüm upstream uygulamanın fork'u değildir.
+Piko, yerel web arayüzünden CLI tabanlı yapay zekâ işçilerini yöneten bir FastAPI uygulamasıdır. Görevi plana böler, adımları bağımlılıklarına göre yürütür, sonuçları kaydeder ve uygulama değişikliklerini ayrı bir denetim turuyla değerlendirir. Uzun işler için kalıcı iş kaydı, oturumdan devam, kota beklemesi ve sınırlı hata toparlama mekanizmaları bulunur.
 
-## Başlatma
+Bu klasör GitHub deposunun `agent-manager/` bileşenidir. Üst dizinin [README](../README.md) dosyası kurulum ve masaüstü başlatıcıları için giriş noktasıdır.
 
-Python 3.12 ve mevcut CLI oturumları gereklidir. Bu bilgisayarda bağımsız `.venv` kurulmuştur.
+## Kurulum ve başlatma
+
+Windows ve Python 3.12+ gerekir. Depo kökünde:
 
 ```powershell
-cd 'agent-manager'
+.\setup.cmd
 .\desktop.cmd
 ```
 
-### Uzaktan ve Mobil Erişim (Tailscale & Android APK)
+Başlatıcı tarayıcıda yerel adresi açar; varsayılan adres `http://127.0.0.1:8765` olur. İlgili port başka bir kopya tarafından kullanılıyorsa başlatıcının açtığı adresi kullanın. CLI araçları kendi sağlayıcı oturumlarıyla ayrıca kurulmuş ve yetkilendirilmiş olmalıdır. CLI'nın bulunması, modelin erişilebilir olduğu veya kotası bulunduğu anlamına gelmez.
 
-Telefondan veya dış ağdan kontrol etmek için:
-
-```powershell
-.\remote.cmd
-```
-
-Bu komut sunucuyu `0.0.0.0:8765` üzerinde dinleyecek şekilde açar ve ekranda mobil kimlik doğrulama tokenını gösterir. Telefondan bağlanmak için `agent-remote-android/` projesinde üretilen **`AgentRemote.apk`** kullanılır (veya web arayüzündeki **Mobil & Tailscale** sekmesinden indirilir). Yetkili olmayan dış istekler reddedilir; güvenli bağlantı için **Tailscale** IP'si (`100.x.y.z`) ve Bearer Token kullanılır.
-
-Arayüz: **http://127.0.0.1:8765**. Yeni kurulumda önce `setup.cmd` çalıştırılır. Varsayılan tarayıcı kullanıcının uygulamasıdır; servis kapanınca tarayıcı zorla kapatılmaz. Terminalde Ctrl+C sunucuyu ve ona ait CLI işlem gruplarını kapatır.
-
-Tarayıcı açmadan veya başka portla:
+Yalnız bu bileşeni açmak için, kurulmuş ortamla:
 
 ```powershell
-.\.venv\Scripts\python.exe run.py --port 8765
+cd agent-manager
+.\.venv\Scripts\python.exe run.py --open
 ```
 
-Windows'ta `run.py` kullanın: async subprocess için Proactor döngüsü gerekir. Aynı `data/` klasörüne yalnız **tek sunucu süreci** bağlayın; `--workers` veya `--reload` kullanılmaz.
+Aynı veri dizinini birden fazla sunucuya kullandırmayın. Windows subprocess desteği için `run.py` başlatıcısını kullanın; servis için çoklu `--workers` veya geliştirme `--reload` kipi kullanılmaz.
 
-### Gömülü CAO Windows motoru
+## Görev nasıl ilerler?
 
-`setup.cmd`, bu projenin `vendor/cao-upstream/` klasöründeki CAO kaynağını kendi Windows `.venv` ortamına kurar. **Yapılandırma → Yürütme altyapısı → Gömülü CAO (Windows)** seçildiğinde Piko motoru 127.0.0.1 üzerinde, rastgele yerel port ve oturuma özel bearer token ile açar. CAO verisi `data/cao/` altındadır; servis Piko kapanırken onunla birlikte kapatılır. Harici AO masaüstü uygulaması bu modda kullanılmaz. Codex ve Antigravity CLI araçları Windows PATH içinde bulunmalıdır. Ollama için `127.0.0.1:11434` servisi ve seçilen model yüklü olmalıdır.
+1. Kullanıcı hedefi, çalışma alanını ve yazma iznini belirler. Planı inceleyerek yürütme veya orkestrasyon akışı seçilebilir.
+2. Planlayıcı model ve rol atamalarıyla bağımlılık grafiği üretir. Geçersiz şema için sınırlı düzeltme ve uygun model seçimi uygulanır.
+3. Hazır adımlar kapasite oldukça başlar. Bir adım yalnız kendi bağımlılıklarını bekler; bağımsız bir kardeş adımın bitmesi bütün akışı durdurmaz.
+4. Yazma yetkisi olan uygulama adımları bağımsız denetimden geçirilir. Başarısız denetim hedefli düzeltme ister; bozuk veya kullanılamayan denetim doğrulanmış tamamlanma sayılmaz.
+5. İş, adım çıktıları ve kabul kararları kalıcı kayıtlarda tutulur. Bir yürütmenin bitmesi ile kullanıcının teslimi kabul etmesi ayrı kararlardır.
 
-LangGraph planı ve adım durumlarını tutar; Codex ve Antigravity adımlarını CAO terminal işçilerine, Ollama adımlarını CAO'nun yerel metin işçisine gönderir. Ollama kod işçisinin yazma izni açık olduğunda çıktıdaki sınırlı, kesin eşleşen dosya yamaları uygulama tarafından denetlenerek yazılır; modelin doğrudan dosya aracı yoktur. Motor başlatılamazsa arayüzdeki **Modeller ve CLI** bölümü durumu gösterir; ayrıntı için `data/cao/server.log` dosyasına bakın. `data/cao` klasörünü başka bir CAO sunucusuyla aynı anda paylaşmayın.
+Planlama menüsünde **Hızlı**, **Dengeli**, **Ayrıntılı** ve **Paralel** seçenekleri bulunur. İlk üçü plan içeriğinin kapsamını belirler. Paralel seçeneği yararlı olduğunda bağımsız alt planlar üretmeye izin verir; her görevi zorla paralelleştirmez.
 
-Yeni görevlerde yürütücü modeli otomatik seçilir; ayrı bir varsayılan işçi kutusu yoktur. Seçim görev rolü, katalog önceliği, yerel model uygunluğu, gözlenen token kullanımı ve kota/istek sınırı hatasından sonra bekleme süresine dayanır. Sağlayıcı kalan kotasını doğrulanmış biçimde sunmuyorsa sistem bunu **bilinmiyor** olarak gösterir; kesin kalan kota tahmini yapmaz. Kota hatasında adım başka uygun modele en fazla iki kez devredilir. Dosya yazan görevlerde Ollama seçilmez.
+## Paralellik ve kontrollü birleştirme
 
-CAO içinde 20 uzman rolü bulunur. Ana ajan açık bir işçi çağrısı ürettiğinde en fazla üç alt işçi, tek seviye derinlikte çalışır ve sonuçları ana ajana geri verir. Resim rolü sınırlı sahneden SVG vektör görsel; video rolü FFmpeg ile kısa soyut MP4 hareketli grafik üretir. Bunlar fotoğraf veya gelişmiş AI video üretimi değildir ve dosya yazma izni gerektirir. Otomatik görevlerde uygun orkestratör modeli tamamlanan adımları değerlendirir, en çok iki turda toplam 20 adım sınırı içinde gerekli yeni adımları ekleyebilir ve sonuç özeti verir.
+- Hazır DAG adımları için görev başına `max_parallel` 1–6 arasındadır. Aynı motor örneğindeki yürütücüler ortak altı çalışan kapasitesini paylaşır.
+- İsteğe bağlı paralel planlama en fazla altı alt planı, toplam en fazla 20 adımlık bir grafikte birleştirir.
+- `parallel_writes` kapalıyken aynı çalışma alanındaki yazıcılar korunarak sırayla yürütülür. Açıldığında Direct backend bağımsız yazıcılara ayrı dosya kopyaları verir.
+- Denetimden geçen kopyalar başlangıç hash'leriyle karşılaştırılır. Aynı dosyada uyuşmayan değişiklik sessizce ezilmez; çatışma olur. Birleşik ürün için ayrıca entegrasyon/kabul adımı gerekir.
 
-CAO kipinde Codex `reviewer` görevleri `read-only`, `developer` görevleri `workspace-write` sandbox ve `never` onay politikasıyla açılır. Antigravity için sırasıyla `plan` ve `accept-edits` kipleri kullanılır. Antigravity `plan` kipi işletim sistemi düzeyinde dosya sandbox'ı değildir.
+Bu sınır, motor örneğinin adım kapasitesidir; tüm makinedeki her model çağrısı veya ayrı sunucular için ortak bir limit değildir. Ana programın sıralı iş dilimleri korunur; aktif hedefin bağımsız alt planları paralelleşir. Ayrıntı: [İzole paralel yürütme](docs/isolated-parallel.md).
 
-## İş akışı
+## Sağlayıcılar ve devam davranışı
 
-### AO ile Codex işçileri
+`config/models.json` model kataloğunu, `config/cli_config.json` CLI bağlantılarını, `config/execution_policy.json` izin verilen sağlayıcı politikasını tanımlar. Dağıtım politikası katalogda görünen modelleri ayrıca daraltabilir.
 
-AO v0.14.6 bu Windows makinesine kuruldu. Masaüstü AO uygulamasını açın; Piko arayüzündeki **Yapılandırma → Yürütme altyapısı → Agent Orchestrator (AO)** seçeneğini kullanın. Yürütücü olarak Codex seçin, dosya yazma iznini açın ve çalışma klasörü olarak en az bir commit'i ve çözülebilen varsayılan dalı olan Git deposu seçin. Yerel ve remotesiz depoda `git config ao.defaultBranch main` kullanılabilir. AO daemon hazır değilse arayüz açıkça uyarır.
+| Yol | Davranış |
+|---|---|
+| Direct / Evren–OpenCode | CLI JSONL çıktısı, kalıcı oturum kimliği ve aynı adım/model eşleşmesiyle `--session` devamı. Bu yolda sabit CLI duvar saati timeout'u kapalıdır. |
+| Direct / diğer adaptörler | Kurulu CLI veya yerel sağlayıcı üzerinden çalışır; özellikler sağlayıcının araç ve izin desteğine bağlıdır. |
+| AO / CAO | İsteğe bağlı yürütme altyapılarıdır. Kurulum ve uyumlu model gerekir; izole paralel yazma Direct yoluna özeldir. |
 
-LangGraph planı ve checkpoint'i yürütür; AO her adım için Codex Chat oturumu ve ayrı worktree açar. AO oturum kimliği adımın ayrıntısında görünür. Biten AO görevi **İnceleme bekliyor** durumuna geçer: dosya değişiklikleri worktree'de kalır ve ana projeye otomatik aktarılmaz. AO masaüstünde diff'i inceleyip uygun değişiklikleri birleştirin. AGY ve Ollama için **Doğrudan CLI** altyapısı kullanılmaya devam eder; AGY'nin AO Chat kipi bu makinede ek ACP sunucusu olmadan açılmıyor.
+Evren CLI çağrısının sınırsız timeout'u, görevin veya kaynaklarının sınırsız yetkili olduğu anlamına gelmez. Kullanıcı iptali, kota/onay kapıları ve yapılandırılmış diğer bütçeler korunur. Ağ hatasında aynı model/oturum için sınırlı geri çekilme; kota durumunda bekleme ve uygun model yönlendirmesi vardır. Her hata otomatik çözülemez. Süreç yeniden başlatılınca kayıtlı iş devam edebilir; dış araç etkileri için exactly-once garantisi verilmez.
 
-AO Codex pilotu ve AGY doğrudan CLI pilotu sonuçları [araştırma notunda](docs/MULTI_AGENT_RESEARCH.md) kayıtlıdır.
+## Hafıza ve kullanım ölçümü
 
-- **Önce planla:** Seçilen CLI salt okunur plan üretir. JSON ve DAG doğrulanır. Plan incelenip düzenlenebilir, ardından çalıştırılır.
-- **Otomatik:** Planlama ve yürütmeyi art arda çalıştırır.
-- **Doğrudan sohbet:** Yürütücüye tek adım gönderir; planlayıcı çağırmaz.
-- Başarıyla kaydedilen adımlar devam sırasında tekrar çalıştırılmaz. Başarısız/yarım kalan adım kullanıcı **Devam et** dediğinde yeniden denenir. Otomatik fallback/retry yoktur.
-- CLI yan etkileri ile checkpoint yazımı tek işlem değildir. Kesinti anında dosya değiştirmiş ama tamamlanma kaydı yazılmamış adım yeniden çalışabilir. Exactly-once dosya değişikliği garantisi yoktur.
-- Aynı görevde yazma izni varsa adımlar seri, salt okunursa seçilen paralellikte çalışır. Ayrı görevler aynı klasörde eşzamanlı yazdırılmamalıdır.
-- Adım için 300 sn, bir yürütme/devam denemesi için 1800 sn varsayılan deadline vardır. Sırada bekleme bu süreye dahil değildir. Her devam yeni süre penceresi açar.
-- CLI yanıtının tamamlanması, üretilen kodun testlerden geçtiği anlamına gelmez. Gerektiğinde plana açık doğrulama adımı eklenmelidir.
+Proje dosya indeksi ile iş/plan geçmişi ayrı tutulur. Kullanıcı kuralları ve tercihlerinin kaynağı korunur. Modelin kendi başarı raporu otomatik olarak doğrulanmış bilgiye dönüştürülmez; kayıtların doğrulama durumu bağlamda gösterilir.
 
-## CLI uyarlamaları
+Tüketim ekranı sağlayıcının bildirdiği gerçek usage kayıtlarını esas alır. Sağlayıcı sayı vermiyorsa tüketim **unknown / bilinmiyor** kalır; metin uzunluğundan tüketim tahmini yapılmaz. Eski veya ölçülmemiş ledger kayıtları gerçek tüketim toplamı olarak sunulmaz. Model seçimi için ön rezervasyon, fatura veya kesin kalan kota değildir.
 
-`config/models.json` mevcut kataloğun bağımsız kopyasıdır. Model adları yerel yapılandırma kimlikleridir; canlı sağlayıcı kataloğu olarak sunulmaz.
+## Güvenlik ve çalışma alanı
 
-| Sağlayıcı | Bağlantı | İzin/araç davranışı |
-|---|---|---|
-| Codex | Native exe veya Node CLI, `exec --json`, prompt stdin | Doğrudan CLI modunda `read-only` / `workspace-write`; CAO adımında seçilen MCP'ler oturuma özel profile eklenir |
-| Antigravity | `agy --output-format json --print` | Doğrudan modda global araç ayarları geçerlidir; CAO adımında seçilen MCP'ler geçici profile eklenir |
-| Ollama | Yerel `127.0.0.1:11434/api/chat`, NDJSON stream | Metin yanıtı; araç/dosya yürütücüsü eklenmez |
+Piko dosya yazma izinleri, onay kapıları, kaynak kiralamaları ve yerel API erişim kontrolleri uygular. Salt okunur işler ortak okuyucu kiralaması, yazıcı işler tekil kiralama alır. Süreç sahipliği PID ve başlangıç zamanıyla denetlenir; bir işlem yalnız adına bakılarak kapatılmaz.
 
-`CLI bulundu` yalnız executable keşfidir; oturum, kota veya model sağlığını garanti etmez. Devre dışı modeller reddedilir. Mevcut CLI oturumları kullanılır; anahtarlar taşınmaz veya yeniden yazılmaz. Antigravity `plan` modu işletim sistemi dosya sandbox'ı değildir; harici araçların kendi izinleri geçerlidir.
+**Ayrı klasör ve izole kopya işletim sistemi sandbox'ı değildir.** CLI çalıştığı hesabın ve kendi sağlayıcısının yetkilerine sahiptir. Güvenilmeyen görevler için ayrıca kısıtlı kullanıcı/container, dosya ve ağ erişim sınırları gerekir. Uzaktan erişimde `remote.cmd`, Tailscale ve bearer token akışını kullanın; servisi doğrudan internete açmayın. Prompt, araç ve çıktı kayıtları yerel veri dizininde saklanır; bu dizin ve kimlik bilgileri Git'e eklenmez.
 
-## Kapsam
+## Geliştirme ve doğrulama
 
-Planlama, model atama, bağımlı/paralel yürütme, plan düzenleme, iptal, kalıcı geçmiş, checkpoint ile devam, olay görünümü ve çıktı indirme yeniden uygulandı. Paketlenmiş skill ve MCP envanteri bulunur. CAO, kurulu ve kimlik bilgisi istemeyen `context7` ile `sequential-thinking` sunucularını gerekli Codex/Antigravity adımına özel geçici persona üzerinden bağlar. Diğer MCP paketleri otomatik yetkilendirilmez; doğrudan CLI, AO ve Ollama adımlarında bu köprü kullanılmaz. CLI'nın kendi araçları sağlayıcının izinleriyle kullanılabilir.
-
-## Kalıcılık ve kaynaklar
-
-- `data/runs.sqlite`: iş/olay indeksi, asenkron SQLite + WAL.
-- `data/checkpoints.sqlite`: upstream LangGraph checkpoint kayıtları.
-- `data/work.sqlite`: kalıcı iş kaydı, bekleyen kararlar ve sürümlü teslimler.
-- `data/notifications.sqlite`: tekilleştirilmiş bildirimler ve tercihler (sessiz saat, saat dilimi).
-- `data/operations.sqlite`: dış işlem idempotency defteri ve token/süre/düzeltme bütçeleri.
-- `data/metrics.sqlite`: görev türü ve model bazında başarı, süre, maliyet, düzeltme; denetçi/test/kullanıcı kararları ayrı.
-- `work/resource-ledger.json`: sunucu ve CLI yardımcılarının kimlik/kapanma kayıtları; komut satırı ve prompt içermez.
-- Graphify, mevcut proje defterine **ek** kod ilişkisi bağlamı sağlar. `setup.cmd`, `graphifyy==0.9.97` paketini ayrı `.graphify-venv` ortamına kurar. Yerel AST grafiği `data/graphify/` altında arka planda hazırlanır; ilk tarama görevi bekletmez. Hazır sorgu sonucu plan ve adım bağlamına en fazla 1800 karakter olarak eklenir. Graphify kullanılamazsa proje defteri çalışmaya devam eder. Bağımlı adım çıktıları ayrı olarak kırpılır; tam çıktı görev kaydında kalır.
-- CLI stdout+stderr toplam sınırı 2 MiB. Beş saniyelik etkinlik olayları geçen süreyi ve alınan bayt sayısını gösterir. Yanıt metni CLI tamamlanınca gösterilir.
-- Windows Job Object, askıda başlayan CLI'yı sahipli gruba aldıktan sonra sürdürür; iptal/timeout grubun alt süreçlerini kapatır.
-- Yerel API farklı Host/Origin isteklerini reddeder; internet yayını veya çok kullanıcılı kullanım için tasarlanmadı. Prompt ve çıktılar yerel veritabanında saklanır.
-
-## Doğrulama
+Bu bileşen dizininde:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q --basetemp work/test-local
-.\.venv\Scripts\python.exe tests/smoke_cli.py
-node tests/browser-smoke.cjs
-$env:TEST_URL='http://127.0.0.1:8767'; node tests/ui-work-smoke.cjs
+.\.venv\Scripts\python.exe -B -m pytest -p no:cacheprovider -q
 ```
 
-`ui-work-smoke.cjs` iş kaydı, teslim kabulü, bildirim tercihleri, Piko/Geliştirici görünümü ve maskot durumunu gerçek model çağrısı yapmadan doğrular; sunucunun ayrı bir `AGENT_MANAGER_DATA` klasörüyle açılması önerilir. Playwright yolu `PLAYWRIGHT_MODULE` ile değiştirilebilir.
+Test bağımlılıkları için `requirements-dev.txt`, sabitlenmiş çalışma ortamı için `requirements.lock.txt` kullanılır. Test kapsamı sahte sağlayıcılar, birim testleri ve gerçek yerel subprocess deneylerini birlikte içerir. Geçmiş laboratuvar raporları güncel kaynağın geçtiği anlamına gelmez; sürüm doğrulaması ilgili kaynak ve ortamda yeniden yapılmalıdır. Gerçek sağlayıcı çağrıları kota tüketebilir ve ayrıca yetkili ortam gerektirir.
 
-CLI smoke gerçek sağlayıcı çağrısı yapar. Tarayıcı testi bu bilgisayardaki Playwright/Chrome yollarını kullanır; `TEST_URL` ile sunucu değiştirilebilir. Çıktılar ve ekran görüntüleri `work/visual/` altındadır. Kurulum sürümleri `requirements.lock.txt` ile sabittir. Araştırma gerekçesi `docs/UPSTREAM.md`, doğrulama sonuçları `docs/VALIDATION.md` içindedir.
+- [Mimari ve veri akışı](docs/ARCHITECTURE.md)
+- [İzole paralel yürütme](docs/isolated-parallel.md)
+- [İş kaydı ve teslim akışı](docs/WORKFLOW.md)
 
-## Ortak iş kaydı, teslim ve bildirim
-
-Her görev kalıcı bir iş kaydına bağlanır (hedef, gereksinimler, kabul koşulları, öncelik, son tarih, bağımlılıklar, bekleyen kararlar). Sohbet uzasa veya Piko yeniden başlasa da "ne istendi / ne yapıldı / sıradaki adım" buradan okunur. Biten yürütme sürümlü bir teslim üretir; kullanıcı kabul eder, düzeltme ister veya test sonucu bildirir, önceki sürüm korunur. Teslim, engel, karar ve gecikme bildirimleri tekilleştirilir; sessiz saatte ertelenip pencere bitince bir kez teslim edilir. Arayüzde Piko (sade) ve Geliştirici (plan, ajan, terminal, iş kaydı) görünümleri aynı sohbeti korur; maskot gerçek motor durumunu yansıtır. Ayrıntılar `docs/WORKFLOW.md` içindedir.
+Piko görev için kendi kaynak kodunu düzenleyebilir; bu, çalışan servisinin otomatik olarak kendini güncellemesi anlamına gelmez. Kod aktarımı, test ve gerektiğinde kontrollü servis yeniden başlatma ayrı adımlardır.

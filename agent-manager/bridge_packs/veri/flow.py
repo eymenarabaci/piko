@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+from pathlib import Path
 
 from . import adapter
 
@@ -12,13 +13,18 @@ def draft_payload(request: dict) -> dict:
     return adapter.build_draft(request)
 
 
-def issue_approval(draft: dict) -> dict:
+def approval_payload(draft, target, workspace):
+    root = Path(workspace).resolve()
+    return {"workspace": str(root), "target": str((root / target).resolve()), "hashes": draft["hashes"]}
+
+
+def issue_approval(draft: dict, *, gate, target: str, workspace: str) -> dict:
     """Local user approval: a single-use token bound to the draft content hash."""
     digest = hashlib.sha256(
         "|".join(f"{name}:{value}" for name, value in sorted(draft["hashes"].items()))
         .encode("utf-8")).hexdigest()
     return {
-        "approval_token": f"veri-{secrets.token_hex(16)}",
+        "approval_token": gate.issue_approval(adapter.BRIDGE_ID, "apply", payload=approval_payload(draft, target, workspace)),
         "draft_hash": digest,
         "files": sorted(draft["hashes"]),
         "message": ("Onay yalniz bu taslak icerigi icin gecerlidir; hedef klasor "
@@ -57,7 +63,7 @@ def deliver(gate, *, persona, request: dict, target: str = "",
     draft = adapter.build_draft({**request, "workspace": workspace})
     if not str(target or "").strip():
         return {"ok": True, "draft_only": True, "draft": draft,
-                "approval": issue_approval(draft)}
+                "approval": None, "approval_required": True}
 
     levels = ((persona or {}).get("bridges", {}).get(adapter.BRIDGE_ID, {})
               if isinstance(persona, dict) else {})
@@ -68,7 +74,7 @@ def deliver(gate, *, persona, request: dict, target: str = "",
         apply_persona, adapter.BRIDGE_ID, "apply",
         approval_token=approval_token,
         idempotency_key=idempotency_key,
-        payload={"target": target, "hashes": draft["hashes"]})
+        payload=approval_payload(draft, target, workspace))
 
     try:
         applied = adapter.apply_report(

@@ -9,6 +9,7 @@ import operator
 import os
 import re
 import time
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Annotated, TypedDict
@@ -16,11 +17,18 @@ from typing import Annotated, TypedDict
 import httpx
 from langgraph.graph import END, START, StateGraph
 
+from .task_record_audit import task_record_issues
+from .step_context import original_task_context
+from .execution_policy import model_allowed
+from .outcomes import is_timeout_error
 from .adaptive import (MAX_ADAPTATIONS, build_adaptive_prompt, extend_plan,
                        parse_adaptive_decision, repair_explicit_validation_gap,
                        sanitize_adaptive_decision)
 from .ao import AOClient
-from .cao import CAOClient, CAONoResponse
+from .cao import CAOClient, CAONoResponse, bound_cao_prompt
+from .workspace_watch import changes as workspace_changes
+from .workspace_watch import fingerprint as workspace_fingerprint
+from .workspace_watch import summarize as workspace_summary
 from .model_router import ModelRouter, NoEligibleModel, infer_role, parse_quota_wait_seconds
 from .mcp_catalog import PUBLIC_AUTO_SERVERS, get_server_config
 from .optimizer import TokenOptimizer
@@ -30,7 +38,7 @@ from .personas import PersonaManager
 from .project_memory import ProjectMemory
 from .graphify_context import GraphifyContext
 from .planning_policy import planning_guidance
-from .program import (Program, ProgramItem, PhaseAudit, build_program_prompt,
+from .program import (phase_acceptance_issues, Program, ProgramItem, PhaseAudit, build_program_prompt,
                       parse_program, single_item_program, build_phase_planning_prompt,
                       build_completion_audit_prompt, parse_completion_audit)
 from .schema import Plan, RunRequest, Step, parse_plan, validate_models, workspace_path, robust_json_decode
@@ -85,11 +93,19 @@ class Engine:
         self.resource_lock_ttl = 3600.0
         self.resource_retry_seconds = 15.0
         self.pending_restarts: set[str] = set()
+        # Unattended runs must survive transient provider/terminal failures
+        # instead of dying on the first 502. Retries back off exponentially;
+        # the bound only exists so a permanently broken step still surfaces.
+        self.transient_attempt_limit = 40
+        self.transient_backoff_base = 20.0
+        self.transient_backoff_max = 900.0
+        self.transient_waiters: dict[str, asyncio.Task] = {}
         # work_id -> repair lineage; a repair run's delivery is linked to its parent.
         self.repair_context: dict[str, dict] = {}
         # Bound total simultaneous workflows as well as each workflow's workers.
         self.max_concurrent_runs = 2
         self.run_slots = asyncio.Semaphore(self.max_concurrent_runs)
+        self.worker_capacity = asyncio.Semaphore(6)  # shared by all ready DAG dispatchers
         self.slot_active = 0
         self.slot_waiters = 0
         self.slot_max_observed = 0
@@ -243,7 +259,7 @@ class Engine:
         try:
             return await self.resource_locks.acquire(
                 resource, run["id"], timeout=self.resource_lock_timeout,
-                ttl=self.resource_lock_ttl)
+                ttl=self.resource_lock_ttl, shared=not bool(run.get("allow_writes", True)))
         except Exception as exc:
             if type(exc).__name__ != "LockTimeout":
                 raise
@@ -432,8 +448,12 @@ class Engine:
         for run in await self.store.list():
             if await self.store.list_messages(run["id"]):
                 run = await self.instruction_snapshot(run["id"])
-            if run["status"] == "waiting_quota" and run.get("quota_timer", {}).get("resets_at"):
-                self.schedule_quota_resume(run["id"], run["quota_timer"])
+            if run['status'] == 'waiting_quota' and run.get('phase_status') == 'retrying':
+                run.update(status='waiting_retry', retry_timer={**(run.get('quota_timer') or {}), 'reason': 'transient_error'}, quota_timer=None)
+                await self.store.save(run)
+            timer = run.get('retry_timer') if run['status'] == 'waiting_retry' else run.get('quota_timer')
+            if run['status'] in {'waiting_quota', 'waiting_retry'} and timer and timer.get('resets_at'):
+                self.schedule_quota_resume(run['id'], timer)
                 continue
             if run["status"] in {"queued", "planning", "running"}:
                 run.update(status="interrupted", current_steps=[], updated_at=now(),
@@ -453,8 +473,16 @@ class Engine:
         # ID. Mirror provider availability to each executable-backed model.
         for mid, model in self.models.items():
             provider = model.get("provider")
+            runtime = model.get("runtime")
             if provider != "ollama" and mid not in available:
                 available[mid] = bool(available.get(provider, False))
+            if runtime == "opencode":
+                available[runtime] = bool(available.get("opencode", available.get(mid, False)))
+                available[mid] = bool(available.get("opencode", available.get(mid, False)))
+            elif runtime in {"claude-code", "cao"}:
+                available.setdefault(runtime, True)
+            elif runtime == "direct":
+                available.setdefault(runtime, True)
         if any(model.get("provider") == "ollama" for model in self.models.values()):
             try:
                 async with httpx.AsyncClient(trust_env=False, timeout=2.0) as client:
@@ -468,18 +496,24 @@ class Engine:
                 available["ollama"] = bool(installed)
             except (httpx.HTTPError, ValueError, TypeError):
                 available["ollama"] = False
+        for mid, model in self.models.items():
+            # A catalog alias may share its ID with a runtime (e.g. opencode).
+            # Denying that model must not disable Evren on the shared runtime.
+            if not model_allowed(model) and mid not in {"opencode", "direct", "cao", "codex", "antigravity", "ollama", "claude-code"}:
+                available[mid] = False
         return available
 
     async def route(self, run: dict, role: str, *, exclude=(),
                     allow_writes: bool | None = None, estimated_tokens: int = 0,
                     required_modalities: tuple[str, ...] = (), required_tools: bool = False,
-                    task_kind: str = ""):
+                    task_kind: str = "", hold_for_cooling_capable: bool = False):
         return await self.router.choose(
             role=role, backend=run["execution_backend"],
             allow_writes=run["allow_writes"] if allow_writes is None else allow_writes,
             availability=await self.model_availability(), exclude=exclude,
             estimated_tokens=estimated_tokens, required_modalities=required_modalities,
             required_tools=required_tools, task_kind=task_kind or role,
+            hold_for_cooling_capable=hold_for_cooling_capable,
         )
 
     def measured_tokens(self, result: dict, prompt: str) -> tuple[int, int]:
@@ -487,8 +521,20 @@ class Engine:
         def token(key, fallback):
             value = usage.get(key)
             return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 10_000_000 else fallback
-        return (token("input_tokens", self.optimizer.estimate_tokens(prompt)),
-                token("output_tokens", self.optimizer.estimate_tokens(result.get("output", ""))))
+        return (token("input_tokens", 0), token("output_tokens", 0))
+
+    async def record_result_usage(self, run_id, label, result, prompt):
+        incoming, outgoing = self.measured_tokens(result, prompt)
+        usage = result.get('usage') or {}
+        if usage.get('accounted'):
+            total = await self.optimizer.get_run_total(run_id)
+            return {'step_tokens': incoming + outgoing, 'run_total_tokens': total,
+                    'within_budget': total <= self.optimizer.default_run_budget,
+                    'source': usage.get('source', 'unknown')}
+        measured = all(isinstance(usage.get(key), int) and not isinstance(usage[key], bool)
+                       and 0 <= usage[key] <= 10_000_000 for key in ('input_tokens', 'output_tokens'))
+        return await self.optimizer.record_usage(run_id, label, result['model_id'], incoming, outgoing,
+                                                 source=usage.get('source', 'provider_reported' if measured else 'unknown'))
 
     async def create(self, request: RunRequest):
         previous = None
@@ -509,7 +555,7 @@ class Engine:
             if not (await self.ao.health())["available"]:
                 raise ValueError("AO daemon hazır değil. Orchestrator masaüstü uygulamasını açın.")
         if request.execution_backend == "cao":
-            if request.executor_model != "auto" and self.models[request.executor_model].get("provider") not in {"codex", "antigravity", "ollama"}:
+            if request.executor_model != "auto" and self.models[request.executor_model].get("provider") not in {"codex", "antigravity", "ollama", "evren"}:
                 raise ValueError("CAO yürütücüsü Codex, Antigravity veya Ollama modeli gerektirir.")
             if not (await self.cao.health())["available"]:
                 raise ValueError("CAO Windows motoru hazır değil; yerel kurulumu kontrol edin.")
@@ -574,13 +620,13 @@ class Engine:
             try:
                 while True:
                     saved = await self.store.get(run_id)
-                    if (not saved or saved.get("status") != "waiting_quota"
-                            or saved.get("quota_timer", {}).get("resets_at") != timer["resets_at"]):
+                    if (not saved or saved.get("status") not in {"waiting_quota", "waiting_retry"}
+                            or (saved.get("retry_timer") or saved.get("quota_timer") or {}).get("resets_at") != timer["resets_at"]):
                         return
                     remaining = (datetime.fromisoformat(timer["resets_at"]) - datetime.now(timezone.utc)).total_seconds()
                     if remaining <= 0:
-                        await self.change(run_id, status="queued", error=None, quota_timer=None)
-                        await self.store.event(run_id, "quota_resumed", "Model kotası için bekleme bitti; görev otomatik sürdürülüyor.")
+                        await self.change(run_id, status="queued", error=None, quota_timer=None, retry_timer=None)
+                        await self.store.event(run_id, "transient_resumed" if timer.get("reason") == "transient_error" else "quota_resumed", "Geçici hata beklemesi bitti; aynı oturumdan devam ediliyor." if timer.get("reason") == "transient_error" else "Model kotası için bekleme bitti; görev otomatik sürdürülüyor.")
                         self.start(run_id, execute=bool(timer.get("execute", True)))
                         return
                     await asyncio.sleep(min(remaining, 30))
@@ -616,7 +662,7 @@ class Engine:
                               client_message_id: str | None = None):
         """Persist ordered guidance; send live only when one CAO terminal confirms it."""
         run = await self.store.get(run_id)
-        if run is None or run.get("status") not in {"queued", "planning", "running", "waiting_quota"}:
+        if run is None or run.get("status") not in {"queued", "planning", "running", "waiting_quota", "waiting_retry"}:
             raise ValueError("Yalnız etkin göreve ek talimat gönderilebilir.")
         record = await self.store.enqueue_message(run_id, message, delivery, client_message_id or "")
         if delivery == "now" and record["status"] == "queued" and run.get("execution_backend") == "cao":
@@ -676,6 +722,12 @@ class Engine:
         return {"configurable": {"thread_id": f"{run_id}:{phase}"}, "recursion_limit": 50}
 
     async def invoke(self, graph, run_id, phase, initial):
+        if isinstance(graph, dict) and 'ready_dispatch' in graph:
+            # Each node persists its result independently; resume from those
+            # durable results rather than a superstep barrier checkpoint.
+            saved = await self.store.get(run_id)
+            state = {**initial, 'results': {**initial.get('results', {}), **saved.get('results', {})}}
+            return await graph['ready_dispatch'](state)
         run = await self.store.get(run_id)
         # A conversation can contain multiple executions. Only resume checkpoints
         # belonging to this execution, never an earlier plan in the same chat.
@@ -685,17 +737,98 @@ class Engine:
         # LangGraph pending writes prevent replay of successful siblings.
         return await graph.ainvoke(None if snapshot.values else initial, config, durability="sync")
 
+    async def generate_valid_plan(self, run, prompt, preferred):
+        """Bounded schema repair before handing planning to compatible alternatives."""
+        availability = await self.model_availability()
+        ranked = await self.router.rank("architect", run["execution_backend"],
+                                        allow_writes=False, availability=availability)
+        candidates = [preferred] + [c.model_id for c in ranked if c.model_id != preferred]
+        last_error = None
+        total_calls = 0
+        for index, model_id in enumerate(candidates[:3]):
+            if not model_allowed(self.models.get(model_id, {})):
+                continue
+            if model_id in await self.router.get_cooldowns():
+                continue
+            if index:
+                await self.store.event(run["id"], "planner_local_fallback" if self.models[model_id].get("provider") == "ollama" else "planner_fallback",
+                                       f"Plan icin uygun yedek: {model_id}", {"from": preferred, "to": model_id})
+            attempt_prompt = prompt
+            for repair in range(2 if index == 0 else 1):
+                if total_calls >= 4:
+                    break
+                total_calls += 1
+                try:
+                    result = await self.providers.run(model_id, attempt_prompt,
+                        workspace=run["workspace"], allow_writes=False,
+                        timeout=max(600, min(1800, run["timeout_seconds"])),
+                        on_event=self.emitter(run["id"], "planner"))
+                    result.setdefault('model_id', model_id)
+                    await self.record_result_usage(run["id"], "planner", result, attempt_prompt)
+                    ensure_usable_result(result)
+                    try:
+                        if len(result["output"]) > 24000:
+                            raise ValueError("Plan 24000 karakter sinirini asti; daha kisa uret.")
+                        plan_origins = None
+                        raw_plan, _ = robust_json_decode(result["output"])
+                        if "parallel_plans" in raw_plan:
+                            if not run.get("allow_parallel_plans"):
+                                raise ValueError("Paralel alt planlar bu görev için etkin değil.")
+                            from .parallel_plans import flatten_parallel_plans
+                            plan, plan_origins = flatten_parallel_plans(raw_plan["parallel_plans"])
+                        else:
+                            plan = parse_plan(result["output"])
+                        validate_models(plan, self.models)
+                        supports_mcp = run.get("execution_backend") == "cao" and any(
+                            model_allowed(m) and m.get("execution_supported", True) and
+                            m.get("provider") in {"codex", "antigravity"} for m in self.models.values())
+                        if any(step.mcp_servers for step in plan.steps) and not supports_mcp:
+                            raise ValueError("Etkin saglayici politikasinda MCP yurutucusu yok. Gereksiz mcp_servers taleplerini kaldir; mevcut yerel araclarla uygulanabilir plan uret.")
+                        # Backend validation follows auto routing in plan_graph.
+                    except ValueError as exc:
+                        last_error = exc
+                        await self.store.event(run["id"], "planner_response_invalid",
+                                               "Plan semasi gecersiz; sinirli onarim uygulanacak.",
+                                               {"model_id": model_id, "attempt": total_calls, "error": str(exc)[:300]})
+                        attempt_prompt = prompt + ("\nONARIM: Onceki plan reddedildi: " + str(exc)[:300]
+                            + "\nYalniz tek gecerli JSON nesnesi yaz; aciklama/kod blogu ekleme. En fazla 8 adim, her prompt en fazla 1200 karakter. model_id=auto. Eksik virgul ve tirnaklari kontrol et.")
+                        continue
+                    if plan_origins is not None:
+                        await self.change(run["id"], parallel_plan_origins=plan_origins)
+                        await self.store.event(run["id"], "parallel_plans_compiled",
+                                               "Bağımsız alt planlar ortak hazır-adım havuzuna bağlandı.",
+                                               {"plan_ids": list(dict.fromkeys(v["plan_id"] for v in plan_origins.values())),
+                                                "steps": len(plan.steps)})
+                    await self.router.record_success(model_id)
+                    if total_calls > 1:
+                        await self.store.event(run["id"], "planner_recovered", "Gecerli plan otomatik onarimla alindi.",
+                                               {"model_id": model_id, "attempts": total_calls})
+                    return plan, model_id
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if is_infrastructure_error(exc):
+                        raise
+                    last_error = exc
+                    await self.router.record_failure(model_id, exc)
+                    await self.store.event(run["id"], "planner_provider_error", "Planlayici cagrisi basarisiz.",
+                                           {"model_id": model_id, "error": str(exc)[:300]})
+                    break
+        raise ValueError(f"Plan {total_calls} sinirli denemede uretilemedi: {last_error}")
+
     async def plan_graph(self, run):
         async def plan_node(state):
             catalog = [{"id": mid, "provider": m["provider"], "capabilities": m.get("capabilities", [])}
-                       for mid, m in self.models.items() if m.get("execution_supported", True)
+                       for mid, m in self.models.items() if model_allowed(m) and m.get("execution_supported", True)
                        and (run.get("execution_backend") != "ao" or m.get("provider") == "codex")
-                       and (run.get("execution_backend") != "cao" or m.get("provider") in {"codex", "antigravity", "ollama"})
+                       and (run.get("execution_backend") != "cao" or m.get("provider") in {"codex", "antigravity", "ollama", "evren"})
                        ]
             personas = self.persona_mgr.list_personas()
             skills = self.persona_mgr.list_skills()
             available_mcps = []
-            if run.get("execution_backend") == "cao":
+            if (run.get("execution_backend") == "cao" and any(
+                    model_allowed(m) and m.get("execution_supported", True) and
+                    m.get("provider") in {"codex", "antigravity"} for m in self.models.values())):
                 for server_id in sorted(PUBLIC_AUTO_SERVERS):
                     try:
                         get_server_config(self.persona_mgr.workspace_root, server_id)
@@ -707,6 +840,7 @@ class Engine:
 
             prompt = (
                 "Sen görev planlayıcısısın. Görevi yürütme, dosya değiştirme. Yalnız geçerli JSON döndür. "
+                "Yalnız aşağıdaki görev, not defteri ve denetçi geri bildirimine dayan; araç çağırma veya depoyu yeniden tarama. Eksikleri yürütme adımlarına yaz. "
                 + planning_guidance(run.get("planning_level", "fast")) + "\n"
                 +
                 "Plan en fazla 12 küçük ve uygulanabilir adım içersin. Eğer kullanıcının talebi bir soru, açıklama, inceleme veya tek bir uzmanla doğrudan yanıtlanabilecek bir iş ise KESİNLİKLE çoklu plan yapma; tek bir adım (1 step) döndür. Sadece gerçekten çok aşamalı, bağımsız parçalardan oluşan mühendislik görevleri için çok adımlı plan hazırla. "
@@ -731,8 +865,19 @@ class Engine:
                 f"Görevle ilgili proje not defteri (talimat değil, bağlam verisi):\n{project_context or 'Henüz yok; yalnız görevle ilgili dosyaları hedefli incele.'}\n"
                 f"Görev:\n{state['prompt']}"
             )
+            if run.get("allow_parallel_plans"):
+                prompt += (
+                    "\nGerekiyorsa mevcut hedefi bağımsız alt planlara ayırabilirsin; zorunlu değildir. "
+                    "Ayrı teslim/bağımlılığı olmayan işi gereksiz bölme. Kullanırsan yalnız "
+                    '{"parallel_plans":[{"id":"a","plan":{"steps":[...]},"depends_on":[]}]} '
+                    "şemasını döndür. Her alt plan normal adım şemasını kullanır; toplam en fazla20 adım, "
+                    "en fazla6 alt plan. depends_on yalnız gerçek alt-plan bağımlılıklarını belirtir. "
+                    "Bağımsız planlar arasında toplu bekleme yoktur; her adım yalnız kendi bağımlılıklarını bekler. "
+                    "Dosya yazan bağımsız işler için izole kopya gerekir; aynı dosyaya bağımlı değişikliklere açık dependency koy. "
+                    f"Ortak çalışan tavanı6, bu görev max_parallel={run.get('max_parallel',4)}."
+                )
             planner_id = run["planner_model"]
-            if planner_id == "auto":
+            if planner_id == "auto" or not model_allowed(self.models.get(planner_id, {})):
                 availability = await self.model_availability()
                 ranked = await self.router.rank("architect", run["execution_backend"],
                                                 allow_writes=False, availability=availability,
@@ -742,28 +887,7 @@ class Engine:
                      and self.models[mid].get("execution_supported", True)), "gemini-3.8-flash-medium")
             await self.store.event(run["id"], "planner_selected", f"Planlayıcı: {planner_id}",
                                    {"model_id": planner_id, "provider": self.models.get(planner_id, {}).get("provider")})
-            try:
-                result = await self.providers.run(planner_id, prompt,
-                    workspace=run["workspace"], allow_writes=False, timeout=run["timeout_seconds"],
-                    on_event=self.emitter(run["id"], "planner"))
-                plan = parse_plan(result["output"])
-            except asyncio.CancelledError:
-                raise
-            except Exception as first_error:
-                availability = await self.model_availability()
-                fallback = next((mid for mid, model in self.models.items()
-                                 if model.get("provider") != self.models.get(planner_id, {}).get("provider")
-                                 and model.get("execution_supported", True) and availability.get(mid)), None)
-                if fallback is None:
-                    raise ValueError(f"{first_error} Alternatif planlayıcı hazır değil.") from first_error
-                await self.store.event(run["id"], "planner_local_fallback" if self.models[fallback].get("provider") == "ollama" else "planner_fallback",
-                                       f"{planner_id} plan üretemedi; {fallback} deneniyor.",
-                                       {"from": planner_id, "to": fallback})
-                result = await self.providers.run(fallback, prompt,
-                    workspace=run["workspace"], allow_writes=False, timeout=run["timeout_seconds"],
-                    on_event=self.emitter(run["id"], "planner"))
-                plan = parse_plan(result["output"])
-                planner_id = fallback
+            plan, planner_id = await self.generate_valid_plan(run, prompt, planner_id)
             await self.change(run["id"], planner_model_actual=planner_id)
             if run["executor_model"] == "auto":
                 reservations: dict[str, int] = {}
@@ -779,6 +903,10 @@ class Engine:
                         required_modalities=tuple(getattr(step, "required_modalities", ())),
                     )
                     if not choices:
+                        await self.store.event(run["id"], "planning_requirements_unavailable",
+                                               "Plan adiminin gereksinimleri mevcut yurutuculerle karsilanamadi.",
+                                               {"step_id": step.id, "role": role, "mcp_servers": step.mcp_servers,
+                                                "required_modalities": step.required_modalities})
                         raise NoEligibleModel(f"{step.title} için uygun yürütücü model bulunamadı.")
                     selected = min(choices, key=lambda choice: (choice.score + 3 * reservations.get(choice.model_id, 0), choice.model_id))
                     step.model_id = selected.model_id
@@ -822,6 +950,28 @@ class Engine:
 
     def emitter(self, run_id, step_id):
         async def emit(kind, message, data=None):
+            if kind in {'provider_session_lookup', 'provider_session'}:
+                async with self.locks.setdefault(run_id, asyncio.Lock()):
+                    run = await self.store.get(run_id)
+                    if not run:
+                        return None
+                    key = str(run.get('execution_id', '')) + ':' + step_id
+                    sessions = run.setdefault('cli_sessions', {})
+                    model_id = (data or {}).get('model_id')
+                    if kind == 'provider_session_lookup':
+                        previous = sessions.get(key) or {}
+                        return previous.get('session_id') if previous.get('model_id') == model_id else None
+                    sessions[key] = {'session_id': data['session_id'], 'model_id': model_id}
+                    await self.store.save(run)
+                await self.store.event(run_id, kind, message, {**data, 'step_id': step_id})
+                return True
+
+            if kind == 'provider_usage':
+                usage = data or {}
+                await self.optimizer.record_usage(run_id, step_id, usage['model_id'],
+                    usage['input_tokens'], usage['output_tokens'], source=usage['source'], call_id=usage['call_id'])
+                await self.store.event(run_id, kind, message, {**usage, 'step_id': step_id})
+                return True
             await self.store.event(run_id, kind, message, {**(data or {}), "step_id": step_id})
             if kind == "cao_terminal_ready" and (data or {}).get("terminal_id"):
                 async with self.locks.setdefault(run_id, asyncio.Lock()):
@@ -838,8 +988,34 @@ class Engine:
                 self.models[s.model_id].get("provider") != "codex" for s in plan.steps):
             raise ValueError("AO planında şu anda yalnız Codex adımları kullanılabilir.")
         if run.get("execution_backend") == "cao" and any(
-                self.models[s.model_id].get("provider") not in {"codex", "antigravity", "ollama"} for s in plan.steps):
+                self.models[s.model_id].get("provider") not in {"codex", "antigravity", "ollama", "evren"} for s in plan.steps):
             raise ValueError("CAO planında Codex, Antigravity veya Ollama adımları kullanılabilir.")
+
+    async def _recover_step_from_files(self, run: dict, step, before: dict, exc: Exception) -> dict | None:
+        """Accept a step whose terminal really edited files but returned no summary.
+
+        The CAO terminal sometimes finishes the edit and then answers with the
+        prompt echo. Throwing that step away discards completed work and re-runs
+        it forever, so the workspace diff decides: proof of change completes the
+        step, and the missing prose summary is recorded instead of faked.
+        """
+        if not before or not isinstance(exc, CAONoResponse):
+            return None
+        diff = workspace_changes(before, run.get("workspace"))
+        if not diff["count"]:
+            return None
+        summary = workspace_summary(diff)
+        output = ("Terminal yanit metnini dondurmedi; adim gercek dosya degisikligi "
+                  f"yaptigi icin kabul edildi. {summary}")
+        result = {"status": "completed", "output": output, "error": "",
+                  "model_id": step.model_id, "persona": getattr(step, "persona", ""),
+                  "recovered_from_files": diff, "recovered_reason": str(exc)[:300]}
+        await self.node_state(run["id"], step.id, result)
+        await self.store.event(run["id"], "step_recovered_from_files",
+                               f"{step.title}: dosya degisikligi kanitiyla tamamlandi.",
+                               {"step_id": step.id, "files": diff["count"],
+                                "summary": summary[:400]})
+        return {"results": {step.id: result}}
 
     async def run_executor(self, run, step, prompt, *, previous=None, allow_writes=None,
                            role=None, on_event=None):
@@ -852,24 +1028,34 @@ class Engine:
         event = on_event or self.emitter(run["id"], step.id)
         attempted: set[str] = set()
         selected = step.model_id
+        if selected != "auto" and not model_allowed(self.models.get(selected, {})):
+            selected = "auto"
         last_error = None
         if selected == "auto":
-            if run.get("executor_model") and run["executor_model"] != "auto":
+            if (run.get("executor_model") and run["executor_model"] != "auto"
+                    and model_allowed(self.models.get(run["executor_model"], {}))):
                 selected = run["executor_model"]
             else:
                 try:
                     selected = (await self.route(run, role, allow_writes=writable,
                                                  required_modalities=tuple(getattr(step, "required_modalities", ())), required_tools=bool(getattr(step, "mcp_servers", ())),
-                                                 estimated_tokens=self.optimizer.estimate_tokens(prompt))).model_id
+                                                 estimated_tokens=self.optimizer.estimate_tokens(prompt),
+                                                 hold_for_cooling_capable=bool(writable))).model_id
                 except NoEligibleModel as nem:
                     last_error = nem
                     selected = None
         elif selected in await self.router.get_cooldowns():
             # A plan's model may have exhausted its quota after planning.
+            prov = self.models.get(selected, {}).get("provider")
+            exclude_ids = {selected}
+            if prov in {"codex", "claude-code"}:
+                exclude_ids.update(mid for mid, m in self.models.items() if m.get("provider") == prov)
             try:
                 replacement = await self.route(run, role, allow_writes=writable,
+                                               exclude=attempted | exclude_ids,
                                                required_modalities=tuple(getattr(step, "required_modalities", ())), required_tools=bool(getattr(step, "mcp_servers", ())),
-                                               estimated_tokens=self.optimizer.estimate_tokens(prompt))
+                                               estimated_tokens=self.optimizer.estimate_tokens(prompt),
+                                               hold_for_cooling_capable=bool(writable))
                 if replacement.model_id != selected:
                     await self.set_step_model(run["id"], step.id, replacement.model_id)
                     await self.store.event(run["id"], "model_handoff",
@@ -882,6 +1068,7 @@ class Engine:
         # Build ve doğrulama adımları için en az 1200 saniye (20 dakika) süre tanı
         step_timeout = max(int(run.get("timeout_seconds") or 600), 1200)
         is_timeout = False
+        timeout_attempts = 0
         max_attempts = min(8, len(self.models)) if selected else 0
         for attempt in range(max_attempts):
             model = self.models[selected]
@@ -900,52 +1087,58 @@ class Engine:
                         on_spawn=spawned, on_event=event,
                     )
                 elif run["execution_backend"] == "cao":
-                    persona_name = getattr(step, "persona", "")
-                    if persona_name:
-                        self.persona_mgr.ensure_persona_in_cao(
-                            name=persona_name,
-                            instructions=f"{step.title} için özel planlanan görev personeli.",
-                            skills=getattr(step, "skills", []),
-                            is_writer=writable
+                    if model.get("provider") in {"claude-code", "opencode", "evren"}:
+                        result = await self.providers.run(
+                            selected, prompt, workspace=run["workspace"], allow_writes=writable,
+                            timeout=step_timeout, on_event=event,
                         )
-                    mcp_profile = None
-                    requested_mcps = list(dict.fromkeys(getattr(step, "mcp_servers", []) or []))
-                    if requested_mcps:
-                        if model.get("provider") not in {"codex", "antigravity"}:
-                            raise ValueError("Bu CAO sağlayıcısı MCP araçlarını desteklemiyor.")
-                        configs = {server_id: get_server_config(self.persona_mgr.workspace_root, server_id)
-                                   for server_id in requested_mcps}
-                        persona_name, mcp_profile = self.persona_mgr.create_mcp_session_persona(
-                            persona_name or ("developer" if writable else "reviewer"), configs)
-                    try:
+                    else:
+                        persona_name = getattr(step, "persona", "")
+                        if persona_name:
+                            self.persona_mgr.ensure_persona_in_cao(
+                                name=persona_name,
+                                instructions=f"{step.title} için özel planlanan görev personeli.",
+                                skills=getattr(step, "skills", []),
+                                is_writer=writable
+                            )
+                        mcp_profile = None
+                        requested_mcps = list(dict.fromkeys(getattr(step, "mcp_servers", []) or []))
                         if requested_mcps:
-                            await self.store.event(run["id"], "mcp_attached",
-                                                   f"{step.title}: MCP araçları bağlandı.",
-                                                   {"step_id": step.id, "servers": requested_mcps})
+                            if model.get("provider") not in {"codex", "antigravity"}:
+                                raise ValueError("Bu CAO sağlayıcısı MCP araçlarını desteklemiyor.")
+                            configs = {server_id: get_server_config(self.persona_mgr.workspace_root, server_id)
+                                       for server_id in requested_mcps}
+                            persona_name, mcp_profile = self.persona_mgr.create_mcp_session_persona(
+                                persona_name or ("developer" if writable else "reviewer"), configs)
                         try:
-                            result = await self.cao.run(
-                                model, prompt, workspace=run["workspace"], allow_writes=writable,
-                                timeout=step_timeout, on_event=event,
-                                persona=persona_name,
-                            )
-                        except CAONoResponse:
-                            if model.get("provider") != "codex" or requested_mcps:
-                                raise
-                            await self.store.event(run["id"], "cao_direct_fallback",
-                                                   f"{step.title}: CAO yanıt vermedi; aynı Codex modeli doğrudan CLI ile deneniyor.",
-                                                   {"step_id": step.id, "model_id": selected})
-                            recovery_prompt = (
-                                prompt + "\n\nÖnce çalışma alanındaki mevcut değişiklikleri incele. "
-                                "Önceki terminal denemesi yanıt vermeden bitmiş olabilir; "
-                                "tamamlanmış düzenlemeleri tekrarlama. Eksik işi bitir ve sonucu açıkça bildir."
-                            )
-                            result = await self.providers.run(
-                                selected, recovery_prompt, workspace=run["workspace"],
-                                allow_writes=writable, timeout=step_timeout, on_event=event,
-                            )
-                    finally:
-                        if mcp_profile is not None:
-                            mcp_profile.unlink(missing_ok=True)
+                            if requested_mcps:
+                                await self.store.event(run["id"], "mcp_attached",
+                                                       f"{step.title}: MCP araçları bağlandı.",
+                                                       {"step_id": step.id, "servers": requested_mcps})
+                            try:
+                                result = await self.cao.run(
+                                    model, prompt, workspace=run["workspace"], allow_writes=writable,
+                                    timeout=step_timeout, on_event=event,
+                                    persona=persona_name,
+                                )
+                            except CAONoResponse:
+                                if model.get("provider") != "codex" or requested_mcps:
+                                    raise
+                                await self.store.event(run["id"], "cao_direct_fallback",
+                                                       f"{step.title}: CAO yanıt vermedi; aynı Codex modeli doğrudan CLI ile deneniyor.",
+                                                       {"step_id": step.id, "model_id": selected})
+                                recovery_prompt = (
+                                    prompt + "\n\nÖnce çalışma alanındaki mevcut değişiklikleri incele. "
+                                    "Önceki terminal denemesi yanıt vermeden bitmiş olabilir; "
+                                    "tamamlanmış düzenlemeleri tekrarlama. Eksik işi bitir ve sonucu açıkça bildir."
+                                )
+                                result = await self.providers.run(
+                                    selected, recovery_prompt, workspace=run["workspace"],
+                                    allow_writes=writable, timeout=step_timeout, on_event=event,
+                                )
+                        finally:
+                            if mcp_profile is not None:
+                                mcp_profile.unlink(missing_ok=True)
                 else:
                     result = await self.providers.run(
                         selected, prompt, workspace=run["workspace"], allow_writes=writable,
@@ -964,9 +1157,20 @@ class Engine:
                                            {"step_id": step.id, "error": str(exc)[:600]})
                     raise
                 last_error = exc
-                is_timeout = "504" in str(exc) or "did not complete within" in str(exc).lower() or "timed out" in str(exc).lower() or "timeout" in type(exc).__name__.lower()
-                
+                if '[exit=' in str(exc) and '; transport]' in str(exc):
+                    await self.store.event(run['id'], 'transport_retry_deferred',
+                        'Ağ hatası: model değiştirilmeden aynı oturum için geri çekilme uygulanacak.',
+                        {'step_id': step.id, 'model_id': selected})
+                    raise
+                is_timeout = is_timeout_error(exc)
+
                 if is_timeout:
+                    timeout_attempts += 1
+                    if timeout_attempts >= 2:
+                        await self.store.event(run['id'], 'step_retry_budget_exhausted',
+                            'İki süre sınırından sonra aynı büyük adım başka modellere taşınmadı; kapsam küçültülmeli.',
+                            {'step_id': step.id, 'timeout_attempts': timeout_attempts})
+                        break
                     # Zaman aşımı kota hatası değildir; modeli kotaya sokma
                     kind = None
                     await self.store.event(run["id"], "step_timeout",
@@ -980,6 +1184,11 @@ class Engine:
                     await self.store.event(run["id"], "model_quota",
                                            f"{selected} kotasına ulaşıldı; uygun başka model seçiliyor.",
                                            {"step_id": step.id, "model_id": selected, "kind": kind})
+                    failed_prov = self.models.get(selected, {}).get("provider")
+                    if kind in {"quota", "weekly_quota"} and failed_prov in {"codex", "claude-code"}:
+                        for peer_id, peer_model in self.models.items():
+                            if peer_model.get("provider") == failed_prov:
+                                attempted.add(peer_id)
                 elif not is_timeout:
                     await self.store.event(run["id"], "model_error",
                                            f"⚠️ {selected} yürütme hatası ({str(exc)[:120]}). Alternatif model deneniyor...",
@@ -1029,6 +1238,7 @@ class Engine:
                     choice = await self.route(run, "reviewer", allow_writes=False)
                 prompt = review_prompt(run.get("active_goal") or run["prompt"],
                                        step.title, step.prompt, str(result.get("output", "")))
+                prompt += original_task_context(run, can_write=False)
                 if run.get("execution_backend") == "cao":
                     checked = await self.cao.run(self.models[choice.model_id], prompt,
                                                  workspace=run["workspace"], allow_writes=False,
@@ -1042,9 +1252,7 @@ class Engine:
                 checked.setdefault("model_id", choice.model_id)
                 ensure_usable_result(checked)
                 await self.router.record_success(choice.model_id)
-                in_tokens, out_tokens = self.measured_tokens(checked, prompt)
-                await self.optimizer.record_usage(run["id"], f"{step.id}:review:{round_index}",
-                                                  checked["model_id"], in_tokens, out_tokens)
+                await self.record_result_usage(run["id"], f"{step.id}:review:{round_index}", checked, prompt)
                 review = parse_review(checked["output"])
             except asyncio.CancelledError:
                 raise
@@ -1052,7 +1260,7 @@ class Engine:
                 await self.store.event(run["id"], "step_review_unavailable",
                                        f"{step.title}: bağımsız denetim tamamlanamadı.",
                                        {"step_id": step.id, "error": str(exc)[:300]})
-                return result, {"status": "unavailable", "error": str(exc)[:300]}
+                raise RuntimeError(f"{step.title}: bağımsız denetim tamamlanamadı; adım doğrulanmış sayılmadı.") from exc
             details = review.model_dump()
             details["model_id"] = checked["model_id"]
             details["repair_count"] = round_index
@@ -1065,26 +1273,29 @@ class Engine:
                                                  writer_in + writer_out, verified=True)
             await self.store.event(run["id"], "step_review", f"{step.title}: {review.status}",
                                    {"step_id": step.id, "round": round_index + 1, **details})
+            if review.status == "needs_user_test":
+                raise RuntimeError(f"{step.title}: kullanıcı doğrulaması gerekiyor; tamamlandı sayılmadı. {review.question}")
             if review.status != "fail":
                 return result, details
             if round_index:
                 raise ValueError(f"{step.title}: denetimde düzeltilemeyen hata: {review.findings[0].issue}")
             correction = repair_prompt(run.get("active_goal") or run["prompt"],
                                        step.title, step.prompt, review.findings)
+            correction += original_task_context(run, can_write=True)
             repair_started = time.monotonic()
             result = await self.run_executor(run, step, correction, role="development",
                                              on_event=self.emitter(run["id"], f"{step.id}:repair"))
             result["execution_seconds"] = time.monotonic() - repair_started
             writer_model = result["model_id"]
-            in_tokens, out_tokens = self.measured_tokens(result, correction)
-            await self.optimizer.record_usage(run["id"], f"{step.id}:repair", result["model_id"],
-                                              in_tokens, out_tokens)
+            await self.record_result_usage(run["id"], f"{step.id}:repair", result, correction)
         return result, {"status": "unavailable"}
 
     async def execution_graph(self, run):
         plan = Plan.model_validate(run["plan"])
         validate_models(plan, self.models)
         self.validate_backend_plan(run, plan)
+        if run.get("parallel_writes") and run.get("execution_backend") != "direct":
+            raise ValueError("İzole paralel yazma şu anda yalnız direct yürütme yolunda destekleniyor.")
         # Parallel execution across independent DAG steps according to max_parallel setting
         slots = asyncio.Semaphore(max(1, int(run.get("max_parallel", 4))))
         workspace_write_lock = self.workspace_lock(run["workspace"])
@@ -1094,24 +1305,26 @@ class Engine:
 
         def make_node(step):
             async def execute(state):
-                saved = await self.store.get(run["id"])
+                step_run = dict(run)
+                isolated = None
+                saved = await self.store.get(step_run["id"])
                 previous = saved["results"].get(step.id)
                 if previous and previous["status"] == "completed":
                     return {"results": {step.id: previous}}
 
-                is_step_writer = bool(run["allow_writes"] and getattr(step, "persona", "") not in READ_ONLY_PERSONAS)
+                is_step_writer = bool(step_run["allow_writes"] and getattr(step, "persona", "") not in READ_ONLY_PERSONAS)
 
-                # DAG Pipelining: Read-only steps run concurrently without waiting for write lock.
+                # DAG Pipelining: Read-only steps step_run concurrently without waiting for write lock.
                 # Writers acquire workspace write lock only during the execution window.
                 async with slots:
-                    await self.node_state(run["id"], step.id, starting=True)
-                    await self.store.event(run["id"], "step_started", step.title, {
+                    await self.node_state(step_run["id"], step.id, starting=True)
+                    await self.store.event(step_run["id"], "step_started", step.title, {
                         "step_id": step.id,
                         "model_id": step.model_id,
                         "persona": getattr(step, "persona", ""),
                         "mode": "writer" if is_step_writer else "pipelined_read",
                     })
-                    
+
                     # Context trimming and compression for token quota protection
                     raw_context = {dep: state.get("results", {}).get(dep, {}).get("output", "")
                                    for dep in step.dependencies}
@@ -1123,12 +1336,12 @@ class Engine:
                         + ("Görev kapsamındaki dosyaları düzenleyebilirsin." if is_step_writer else "Salt okunur çalış; dosya değiştirme.")
                         + " Küçük ve hedefli düzenlemeler yap; tüm dosyayı gereksiz yeniden yazma."
                     )
-                    if run.get("execution_backend") == "cao":
+                    if step_run.get("execution_backend") == "cao":
                         static_prefix += "\n\n" + worker_request_instructions()
 
-                    if run.get("workspace"):
+                    if step_run.get("workspace"):
                         project_context = await self.project_memory_context(
-                            run["workspace"], f"{step.title}\n{step.prompt}", max_chars=6000)
+                            step_run["workspace"], f"{step.title}\n{step.prompt}", max_chars=6000)
                         if project_context:
                             static_prefix += (
                                 "\n\n[Göreve İlgili Kalıcı Proje Not Defteri]:\n" + project_context
@@ -1136,7 +1349,9 @@ class Engine:
                                 "Geçmiş ajan raporlarını başarı kanıtı sayma."
                             )
 
-                    static_prefix += (f"\n\n=== ŞİMDİKİ İŞ DİLİMİ ===\n{run.get('active_goal') or run['prompt']}"
+                    static_prefix += original_task_context(step_run, can_write=is_step_writer)
+
+                    static_prefix += (f"\n\n=== ŞİMDİKİ İŞ DİLİMİ ===\n{step_run.get('active_goal') or step_run['prompt']}"
                                       "\nSonraki iş dilimlerini henüz yapma; bunlar ayrı planlanacak.")
 
                     # Dynamic suffix: Only the step-specific payload at the end
@@ -1154,32 +1369,57 @@ class Engine:
                     if getattr(step, "user_response", "").strip():
                         dynamic_suffix += f"\n\nKullanıcı Yanıtı/Talimatı:\n{step.user_response}"
 
-                    guidance = await self.store.claim_messages(run["id"], ["next_step"], step.id)
+                    guidance = await self.store.claim_messages(step_run["id"], ["next_step"], step.id)
                     if guidance:
-                        await self.instruction_snapshot(run["id"])
+                        await self.instruction_snapshot(step_run["id"])
                         dynamic_suffix += ("\n\nBu adıma teslim edilen kullanıcı yönlendirmeleri (sırayla):\n"
                                            + json.dumps([item["message"] for item in guidance], ensure_ascii=False))
-                        await self.store.event(run["id"], "instruction_delivered",
+                        await self.store.event(step_run["id"], "instruction_delivered",
                                                f"{len(guidance)} mesaj {step.title} adımına teslim edildi.",
                                                {"step_id": step.id, "instruction_ids": [item["id"] for item in guidance]})
 
                     prompt = static_prefix + dynamic_suffix
+                    if step_run.get("execution_backend") == "cao":
+                        # Long pastes are not delivered to the CLI at all: the
+                        # TUI swallows the Enter, reports idle, and hands the
+                        # prompt back as the "answer". Keep the instructions and
+                        # the current step, drop the middle of the context.
+                        prompt = bound_cao_prompt(prompt)
                     input_tokens = self.optimizer.estimate_tokens(prompt)
                     try:
                         usage_prompt = prompt
                         execution_started = time.monotonic()
-                        # DAG Pipelining: Writers acquire workspace_write_lock; read-only steps run concurrently without locking
-                        if is_step_writer:
+                        if is_step_writer and step_run.get("parallel_writes"):
+                            from .isolated_workspace import IsolatedWorkspace
+                            canonical_workspace = step_run["workspace"]
+                            storage = Path(tempfile.gettempdir()) / "piko-isolated-workspaces"
+                            identity = f"{step_run['id']}:{step_run['execution_id']}:{step.id}"
                             async with workspace_write_lock:
-                                result = await self.run_executor(run, step, prompt, previous=previous)
+                                isolated = await asyncio.to_thread(IsolatedWorkspace.create, canonical_workspace, storage, identity)
+                            step_run["workspace"] = str(isolated.path)
+                            # Absolute paths in the user contract must point at the private copy.
+                            prompt = prompt.replace(canonical_workspace, str(isolated.path))
+                            prompt += ("\nİzole paralel çalışma kopyasındasın. Yalnız bu çalışma dizinine yaz; "
+                                       "ana kopyaya veya kardeş kopyalara erişme. Birleştirmeyi motor yapacak.")
+                            usage_prompt = prompt
+                            await self.store.event(step_run["id"], "isolated_step_created", step.title,
+                                                   {"step_id": step.id, "workspace": str(isolated.path)})
+                        watch_before = workspace_fingerprint(step_run.get("workspace"))
+                        # DAG Pipelining: Writers acquire workspace_write_lock; read-only steps step_run concurrently without locking
+                        # CAO is the exception: every step opens an interactive terminal in the same
+                        # directory, and two of them steal each other's keystrokes — the paste never
+                        # submits and the prompt comes back as the "answer". One at a time.
+                        if (is_step_writer and isolated is None) or (step_run.get("execution_backend") == "cao" and self.models.get(step.model_id, {}).get("provider") not in {"evren", "opencode", "claude-code"}):
+                            async with workspace_write_lock:
+                                result = await self.run_executor(step_run, step, prompt, previous=previous)
                         else:
-                            result = await self.run_executor(run, step, prompt, previous=previous, allow_writes=False)
+                            result = await self.run_executor(step_run, step, prompt, previous=previous, allow_writes=False)
                         result["execution_seconds"] = time.monotonic() - execution_started
 
                         if not result.get("output", "").strip():
                             raise ValueError("CLI boş yanıt döndürdü.")
 
-                        if run.get("execution_backend") == "cao":
+                        if step_run.get("execution_backend") == "cao":
                             calls = []
                             try:
                                 calls = extract_worker_calls(result["output"])
@@ -1191,10 +1431,7 @@ class Engine:
                                     except Exception:
                                         calls = []
                             if calls:
-                                initial_in, initial_out = self.measured_tokens(result, prompt)
-                                await self.optimizer.record_usage(
-                                    run["id"], f"{step.id}:parent_initial", result["model_id"],
-                                    initial_in, initial_out)
+                                await self.record_result_usage(step_run["id"], f"{step.id}:parent_initial", result, prompt)
                                 worker_results = []
                                 for index, call in enumerate(calls):
                                     spec = get_worker(call.role)
@@ -1207,7 +1444,7 @@ class Engine:
                                     max_attempts = min(2, len(self.models))
                                     for attempt in range(max_attempts):
                                         try:
-                                            choice = await self.route(run, worker_role,
+                                            choice = await self.route(step_run, worker_role,
                                                                       allow_writes=worker_writes,
                                                                       exclude=attempted,
                                                                       estimated_tokens=self.optimizer.estimate_tokens(call.task))
@@ -1219,9 +1456,9 @@ class Engine:
                                             async def invoke_worker():
                                                 return await self.cao.run_worker(
                                                     call.role, call.task, self.models[choice.model_id],
-                                                    workspace=run["workspace"], allow_writes=bool(is_step_writer and spec.may_write),
-                                                    timeout=run["timeout_seconds"],
-                                                    on_event=self.emitter(run["id"], step.id))
+                                                    workspace=step_run["workspace"], allow_writes=bool(is_step_writer and spec.may_write),
+                                                    timeout=step_run["timeout_seconds"],
+                                                    on_event=self.emitter(step_run["id"], step.id))
                                             if is_step_writer and spec.may_write:
                                                 async with workspace_write_lock:
                                                     child = await invoke_worker()
@@ -1238,15 +1475,12 @@ class Engine:
                                             if is_infrastructure_error(exc):
                                                 raise
                                             kind = await self.router.record_failure(choice.model_id, exc)
-                                            await self.store.event(run["id"], "worker_handoff",
+                                            await self.store.event(step_run["id"], "worker_handoff",
                                                                    f"{call.role} işçisi ({choice.model_id}) hatası: {str(exc)[:150]}. Başka model deneniyor.",
                                                                    {"step_id": step.id, "role": call.role,
                                                                     "from": choice.model_id, "error": str(exc)[:200]})
                                     if child is not None:
-                                        child_in, child_out = self.measured_tokens(child, call.task)
-                                        await self.optimizer.record_usage(
-                                            run["id"], f"{step.id}:worker:{index}", child["model_id"],
-                                            child_in, child_out)
+                                        await self.record_result_usage(step_run["id"], f"{step.id}:worker:{index}", child, call.task)
                                         worker_results.append({"role": call.role, "model_id": child["model_id"],
                                                                "output": child["output"],
                                                                **({"artifact": child["artifact"]} if child.get("artifact") else {})})
@@ -1260,44 +1494,43 @@ class Engine:
                                 final_step = step.model_copy(update={"model_id": result["model_id"]})
                                 if is_step_writer:
                                     async with workspace_write_lock:
-                                        result = await self.run_executor(run, final_step, followup)
+                                        result = await self.run_executor(step_run, final_step, followup)
                                 else:
-                                    result = await self.run_executor(run, final_step, followup, allow_writes=False)
+                                    result = await self.run_executor(step_run, final_step, followup, allow_writes=False)
                                 usage_prompt = followup
-                                # Gracefully clean residual worker tags so they do not crash the run or corrupt output
+                                # Gracefully clean residual worker tags so they do not crash the step_run or corrupt output
                                 cleaned = re.sub(r"<cao_workers>.*?</cao_workers>", "", result["output"], flags=re.DOTALL).strip()
                                 if cleaned:
                                     result["output"] = cleaned
                                 result["worker_results"] = worker_results
-                        
+
                         # Apply surgical diff patches if any were emitted
-                        if is_step_writer and run.get("workspace") and not result.get("local_patch_applied"):
+                        if is_step_writer and step_run.get("workspace") and not result.get("local_patch_applied"):
                             patch_blocks = parse_search_replace_blocks(result.get("output", ""))
                             if patch_blocks:
                                 async with workspace_write_lock:
-                                    count, logs = apply_patch_blocks(Path(run["workspace"]), patch_blocks)
+                                    count, logs = apply_patch_blocks(Path(step_run["workspace"]), patch_blocks)
                                 if count > 0:
                                     patch_note = f"\n\n⚡ [Otomatik Hızlı Diff]: {count} blok başarıyla uygulandı:\n" + "\n".join(logs)
                                     result["output"] += patch_note
-                                    await self.store.event(run["id"], "diff_patch_applied",
+                                    await self.store.event(step_run["id"], "diff_patch_applied",
                                                            f"⚡ {count} dosya bloğu hızlı diff motoruyla güncellendi.",
                                                            {"step_id": step.id, "applied_count": count, "logs": logs})
 
                         usage_result = result
                         if is_step_writer:
-                            result, independent_review = await self.verify_implementation(run, step, result)
+                            result, independent_review = await self.verify_implementation(step_run, step, result)
                             result["independent_review"] = independent_review
                         input_tokens, output_tokens = self.measured_tokens(usage_result, usage_prompt)
-                        usage_stats = await self.optimizer.record_usage(run["id"], step.id, result["model_id"],
-                                                                        input_tokens, output_tokens)
-                        
+                        usage_stats = await self.record_result_usage(step_run["id"], step.id, usage_result, usage_prompt)
+
                         # Check if agent output is a quota/usage limit failure before marking completed
                         out_text = str(result.get("output", ""))
                         ensure_usable_result(result)
 
                         # Check if agent is asking a question or awaiting user confirmation
                         is_question = bool(re.search(r"(\?|soru|onaylıyor musunuz|devam edeyim mi|seçiniz)", out_text[-400:], re.IGNORECASE))
-                        
+
                         result = {
                             **result,
                             "status": "completed",
@@ -1306,44 +1539,60 @@ class Engine:
                             "token_usage": usage_stats,
                             "awaiting_input": is_question,
                         }
-                        await self.node_state(run["id"], step.id, result)
-                        await self.store.event(run["id"], "step_completed", step.title, {
+                        if isolated is not None:
+                            async with workspace_write_lock:
+                                merged = await asyncio.to_thread(isolated.merge)
+                            result["isolated_merge"] = merged
+                            await self.store.event(step_run["id"], "isolated_step_merged", step.title,
+                                                   {"step_id": step.id, **merged})
+                        await self.node_state(step_run["id"], step.id, result)
+                        await self.store.event(step_run["id"], "step_completed", step.title, {
                             "step_id": step.id,
                             "tokens": usage_stats["step_tokens"],
                             "awaiting_input": is_question,
                         })
+                        await self.refresh_project_memory(step_run["id"])
+                        if isolated is not None:
+                            await asyncio.to_thread(isolated.cleanup)
+
                         return {"results": {step.id: result}}
                     except asyncio.CancelledError:
-                        latest = (await self.store.get(run["id"]))["results"].get(step.id, {})
-                        if run.get("execution_backend") == "ao" and latest.get("ao_session_id"):
+                        latest = (await self.store.get(step_run["id"]))["results"].get(step.id, {})
+                        if isolated is not None and latest.get("status") == "completed":
+                            await asyncio.shield(asyncio.to_thread(isolated.cleanup))
+
+                        if step_run.get("execution_backend") == "ao" and latest.get("ao_session_id"):
                             try:
                                 await self.ao.kill(latest["ao_session_id"])
                             except Exception:
-                                await self.store.event(run["id"], "ao_cleanup_failed", "AO oturumu kapatılamadı; AO içinden denetleyin.", {"ao_session_id": latest["ao_session_id"]})
-                        await self.node_state(run["id"], step.id)
+                                await self.store.event(step_run["id"], "ao_cleanup_failed", "AO oturumu kapatılamadı; AO içinden denetleyin.", {"ao_session_id": latest["ao_session_id"]})
+                        await self.node_state(step_run["id"], step.id)
                         raise
                     except Exception as exc:
-                        latest = (await self.store.get(run["id"]))["results"].get(step.id, {})
+                        latest = (await self.store.get(step_run["id"]))["results"].get(step.id, {})
                         if isinstance(exc, NoEligibleModel):
                             exc.step_id = step.id
-                            await self.node_state(run["id"], step.id,
+                            await self.node_state(step_run["id"], step.id,
                                 {"status": "waiting_quota", "model_id": latest.get("model_id") or step.model_id,
                                  "output": "", "error": str(exc)[:2000]})
                             raise
-                        await self.node_state(run["id"], step.id,
+                        recovered = None if isolated is not None else await self._recover_step_from_files(step_run, step, watch_before, exc)
+                        if recovered is not None:
+                            return recovered
+                        await self.node_state(step_run["id"], step.id,
                             {"status": "failed", "model_id": step.model_id, "output": "", "error": str(exc)[:2000],
                              **({"ao_session_id": latest["ao_session_id"]} if latest.get("ao_session_id") else {})})
                         raise
             return execute
 
-        for step in plan.steps:
-            builder.add_node(step.id, make_node(step))
-        depended = {dep for s in plan.steps for dep in s.dependencies}
-        for step in plan.steps:
-            builder.add_edge(step.dependencies or START, step.id)
-            if step.id not in depended:
-                builder.add_edge(step.id, END)
-        return builder.compile(checkpointer=self.checkpointer)
+        from .dag_dispatch import execute_dag
+        nodes = {step.id: make_node(step) for step in plan.steps}
+        dependencies = {step.id: step.dependencies for step in plan.steps}
+        async def dispatch(state):
+            return await execute_dag(dependencies, nodes, state,
+                                     max_parallel=min(6, max(1, int(run.get('max_parallel', 2)))),
+                                     capacity_pool=self.worker_capacity)
+        return {'ready_dispatch': dispatch}
 
     async def reflect(self, run: dict):
         """Have an orchestrator inspect completed outputs and extend only for a real gap."""
@@ -1354,7 +1603,7 @@ class Engine:
             goal += "\nKullanıcının görev sırasında verdiği ek talimatlar:\n" + json.dumps(messages, ensure_ascii=False)
         catalog = [{"id": mid, "provider": model["provider"]}
                    for mid, model in self.models.items() if model.get("execution_supported", True)
-                   and (run["execution_backend"] != "cao" or model.get("provider") in {"codex", "antigravity", "ollama"})]
+                   and (run["execution_backend"] != "cao" or model.get("provider") in {"codex", "antigravity", "ollama", "evren"})]
         prompt = build_adaptive_prompt(goal, plan, run["results"],
                                        revision=run.get("plan_revision", 0),
                                        allow_writes=run["allow_writes"], available_models=catalog)
@@ -1379,9 +1628,7 @@ class Engine:
                                                       allow_writes=False, timeout=run["timeout_seconds"],
                                                       on_event=self.emitter(run["id"], "orchestrator"))
                 await self.router.record_success(model_id)
-                await self.optimizer.record_usage(run["id"], f"orchestrator:{run.get('plan_revision', 0)}",
-                                                  model_id, self.optimizer.estimate_tokens(prompt),
-                                                  self.optimizer.estimate_tokens(result["output"]))
+                await self.record_result_usage(run["id"], f"orchestrator:{run.get('plan_revision', 0)}", result, prompt)
                 decision = repair_explicit_validation_gap(
                     goal, plan, run["results"], parse_adaptive_decision(result["output"]),
                     revision=run.get("plan_revision", 0))
@@ -1409,7 +1656,7 @@ class Engine:
                 return str(single_res.get("output", "")).strip() or "İşlem tamamlandı."
             completed_steps = sum(1 for s in steps if results.get(s["id"], {}).get("status") in {"completed", "success"})
             failed_steps = sum(1 for s in steps if results.get(s["id"], {}).get("status") == "failed")
-            
+
             persona_names = {
                 "developer": "💻 Yazılım Geliştirici",
                 "feature_developer": "🚀 Özellik Geliştirici",
@@ -1423,7 +1670,7 @@ class Engine:
                 "firebase_specialist": "🔥 Firebase Uzmanı",
                 "mobile_engineer": "📱 Mobil Mühendisi",
             }
-            
+
             lines = [
                 f"### ◈ Orkestratör Yönetici Özeti",
                 f"**Hedef:** {run['prompt']}",
@@ -1431,7 +1678,7 @@ class Engine:
                 "",
                 "#### 👥 Ajan Dağılımı ve Yapılan İşlemler:",
             ]
-            
+
             files_changed = []
             for s in steps:
                 res = results.get(s["id"], {})
@@ -1440,7 +1687,7 @@ class Engine:
                 used_model = res.get("model_id") or s.get("model_id") or "auto"
                 p_key = s.get("persona", "developer")
                 p_label = persona_names.get(p_key, f"👤 {p_key.title()}")
-                
+
                 out = str(res.get("output", "")).strip()
                 # Extract 1-2 sentence core accomplishment from output
                 clean_lines = [l.strip() for l in out.splitlines() if l.strip() and not l.strip().startswith(("#", "-", "*", "`", "[", "<"))]
@@ -1453,7 +1700,7 @@ class Engine:
                 lines.append(f"- **Amaç (Ne İçin Yapıldı):** {s.get('prompt', '')[:140]}...")
                 lines.append(f"- **Sonuç (Ne Yapıldı):** {first_meaningful}")
                 lines.append("")
-                
+
                 if "[Otomatik Hızlı Diff]" in out:
                     m = re.findall(r"✓\s*([a-zA-Z0-9_\-\./\\]+)", out)
                     files_changed.extend(m)
@@ -1486,8 +1733,13 @@ class Engine:
         preferred = run.get("planner_model")
         candidates = ([preferred] if preferred in self.models and availability.get(preferred) else [])
         candidates += [choice.model_id for choice in ranked if choice.model_id not in candidates]
+        # A terminal that already exhausted its quota cannot answer an audit;
+        # walk the ranked candidates instead of failing after two attempts.
+        cooling = await self.router.get_cooldowns()
+        fresh = [model_id for model_id in candidates if model_id not in cooling]
+        candidates = fresh or candidates
         last_error = None
-        for model_id in candidates[:2]:
+        for model_id in candidates[:4]:
             try:
                 if run.get("execution_backend") == "cao":
                     result = await self.cao.run(self.models[model_id], prompt,
@@ -1498,9 +1750,14 @@ class Engine:
                     result = await self.providers.run(model_id, prompt, workspace=run["workspace"],
                                                       allow_writes=False, timeout=run["timeout_seconds"],
                                                       on_event=self.emitter(run["id"], label))
+                result.setdefault('model_id', model_id)
+                await self.record_result_usage(run["id"], label, result, prompt)
                 ensure_usable_result(result)
-                in_tokens, out_tokens = self.measured_tokens(result, prompt)
-                await self.optimizer.record_usage(run["id"], label, model_id, in_tokens, out_tokens)
+                # Invalid structured decisions must stay inside bounded model fallback.
+                if label.startswith("phase_audit:"):
+                    parse_completion_audit(result["output"])
+                elif label == "program":
+                    parse_program(result["output"])
                 await self.router.record_success(model_id)
                 return {"output": result["output"], "model_id": model_id}
             except asyncio.CancelledError:
@@ -1508,7 +1765,48 @@ class Engine:
             except Exception as exc:
                 last_error = exc
                 await self.router.record_failure(model_id, exc)
-        raise RuntimeError(f"{label} tamamlanamadı: {last_error or 'uygun model yok'}")
+        # Every CLI route answered with its own prompt echo. A local model has no
+        # terminal to echo into, so the phase audit can still close instead of
+        # burning the whole retry budget; the run keeps a marker for the record.
+        local_error = None
+        for model_id in self._local_reader_models(availability):
+            try:
+                result = await self.providers.run(model_id, prompt, workspace=run["workspace"],
+                                                  allow_writes=False,
+                                                  timeout=run["timeout_seconds"],
+                                                  on_event=self.emitter(run["id"], label))
+                result.setdefault('model_id', model_id)
+                await self.record_result_usage(run["id"], label, result, prompt)
+                ensure_usable_result(result)
+                # Invalid structured decisions must stay inside bounded model fallback.
+                if label.startswith("phase_audit:"):
+                    parse_completion_audit(result["output"])
+                elif label == "program":
+                    parse_program(result["output"])
+                await self.store.event(
+                    run["id"], "architect_local_fallback",
+                    f"{label} terminal yanıtsız kaldı; yerel modelle tamamlandı.",
+                    {"model_id": model_id, "reason": str(last_error or "")[:200]})
+                return {"output": result["output"], "model_id": model_id}
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                local_error = exc
+        raise RuntimeError(
+            f"{label} tamamlanamadı: {last_error or local_error or 'uygun model yok'}")
+
+    def _local_reader_models(self, availability: dict) -> list[str]:
+        """Local (no terminal) models that can answer a read-only JSON call."""
+        ready = []
+        for model_id, model in self.models.items():
+            if str(model.get("provider") or "").lower() not in {"ollama", "ollama_local"}:
+                continue
+            if availability.get(model_id) is False:
+                continue
+            if not model.get("execution_supported", True):
+                continue
+            ready.append(model_id)
+        return ready[:2]
 
     async def ensure_program(self, run: dict) -> dict:
         if run.get("program_items"):
@@ -1538,6 +1836,14 @@ class Engine:
             prompt += "\nKullanıcının gerçek test yanıtı: " + str(run["user_test_answer"])[:2000]
         response = await self._architect_json(run, prompt, f"phase_audit:{run['program_index']}:{run.get('program_attempt', 0)}")
         decision = parse_completion_audit(response["output"])
+        issues = phase_acceptance_issues(run) + task_record_issues(run)
+        if decision.action == "accept" and issues:
+            decision = PhaseAudit(action="repair", reason="Deterministik kabul kapısı: " + "; ".join(issues)[:1400],
+                                  repair_goal="Eksik doğrulamaları ve tutarsız kayıtları gerçek kanıtla gider: " + "; ".join(issues)[:1800])
+            await self.store.event(run["id"], "phase_acceptance_blocked", decision.reason,
+                                   {"issues": issues, "program_index": run["program_index"]})
+        await self.change(run["id"], last_phase_audit=decision.model_dump())
+        await self.refresh_project_memory(run["id"])
         await self.store.event(run["id"], "phase_audit", decision.reason,
                                {"action": decision.action, "model_id": response["model_id"],
                                 "program_index": run["program_index"]})
@@ -1545,6 +1851,10 @@ class Engine:
 
     async def archive_and_advance(self, run: dict, audit: PhaseAudit) -> bool:
         """Persist one finished plan and prepare a fresh checkpoint for the next one."""
+        if audit.action == "accept":
+            issues = phase_acceptance_issues(run) + task_record_issues(run)
+            if issues:
+                raise ValueError("İş dilimi doğrulanmadan kapatılamaz: " + "; ".join(issues)[:1800])
         index = int(run["program_index"])
         item = ProgramItem.model_validate(run["program_items"][index])
         summary = await self.synthesize_summary(run, run["results"])
@@ -1570,7 +1880,8 @@ class Engine:
                                              goal=queued_goal).model_dump())
         if next_index >= len(program_items):
             await self.change(run["id"], plan_history=history, completed_items=completed,
-                              phase_status="completed", orchestrator_answer=summary)
+                              phase_status="completed", orchestrator_answer=summary,
+                              transient_attempts=0, transient_error="")
             return False
         next_item = ProgramItem.model_validate(program_items[next_index])
         next_prompt = build_phase_planning_prompt(run["prompt"], next_item, completed,
@@ -1581,7 +1892,8 @@ class Engine:
                           active_goal=next_item.goal, planning_prompt=next_prompt,
                           execution_id=uuid.uuid4().hex, plan=None, results={},
                           plan_revision=0, current_steps=[], orchestrator_answer="",
-                          user_test_answer="", phase_status="planning")
+                          user_test_answer="", phase_status="planning",
+                          transient_attempts=0, transient_error="")
         await self.store.event(run["id"], "phase_advanced",
                                f"Yeni plan: {next_item.title}",
                                {"program_index": next_index, "attempt": attempt})
@@ -1616,11 +1928,7 @@ class Engine:
                     error="Çalışma alanı kilidi bekleniyor; otomatik yeniden denenecek.")
                 return
             try:
-                await self._slot_enter(run)
-                try:
-                    await self._drive_locked(run_id, execute)
-                finally:
-                    await self._slot_exit()
+                await self._drive_with_lease(run, execute, lease)
             finally:
                 await lease.release()
         except NoEligibleModel as exc:
@@ -1629,9 +1937,45 @@ class Engine:
             await self._finish_cancelled(run_id)
             raise
         except Exception as exc:
-            await self._finish_failed(run_id, exc)
+            if not await self._defer_transient(run_id, exc):
+                await self._finish_failed(run_id, exc)
         finally:
             await self._finish_drive(run_id)
+
+    async def _drive_with_slot(self, run, execute):
+        await self._slot_enter(run)
+        try:
+            await self._drive_locked(run["id"], execute)
+        finally:
+            await self._slot_exit()
+
+    async def _drive_with_lease(self, run, execute, lease):
+        if not hasattr(lease, "renew"):
+            return await self._drive_with_slot(run, execute)
+        await lease.assert_owned()
+
+        async def maintain():
+            interval = max(0.001, min(30.0, self.resource_lock_ttl / 3))
+            while True:
+                await asyncio.sleep(interval)
+                await lease.renew(self.resource_lock_ttl)
+
+        worker = asyncio.create_task(self._drive_with_slot(run, execute))
+        keeper = asyncio.create_task(maintain())
+        try:
+            done, _ = await asyncio.wait((worker, keeper), return_when=asyncio.FIRST_COMPLETED)
+            if keeper in done:
+                # Failure is fail-closed: cancellation reaches provider cleanup
+                # before this drive releases its ownership token.
+                await keeper
+            result = await worker
+            await lease.assert_owned()
+            return result
+        finally:
+            for task in (worker, keeper):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(worker, keeper, return_exceptions=True)
 
     async def _drive_locked(self, run_id, execute):
 
@@ -1741,7 +2085,20 @@ class Engine:
                         (not step or step.get("persona") not in {"reviewer", "qa_tester", "security_auditor", "architect", "researcher", "analyzer"}))
         cooldown = await self.router.next_cooldown(
             role, saved["execution_backend"], writable,
-            availability=await self.model_availability())
+            availability=await self.model_availability(),
+            hold_for_cooling_capable=writable)
+        if not cooldown and step_id:
+            try:
+                available_choice = await self.route(saved, role, allow_writes=writable)
+                if available_choice:
+                    await self.set_step_model(run_id, step_id, available_choice.model_id)
+                    await self.store.event(run_id, "model_handoff",
+                                           f"{step_id}: Kotası açık model ({available_choice.model_id}) ile otomatik devam ediliyor.",
+                                           {"step_id": step_id, "model_id": available_choice.model_id})
+                    asyncio.create_task(self.resume(run_id))
+                    return
+            except Exception:
+                pass
         if cooldown:
             timer = {"step_id": step_id, "model_id": cooldown["model_id"],
                      "resets_at": cooldown["cooldown_until"], "execute": bool(execute or saved.get("plan"))}
@@ -1771,8 +2128,83 @@ class Engine:
             await self._notify("blocker", "İş durdu", error[:400], run=failed,
                                dedupe_key=f"failed:{run_id}:model", severity="high")
 
+    #: Errors that must not be retried by waiting: a broken local install needs
+    #: an operator, and a rejected plan/audit payload is a deterministic bug.
+    NON_RETRYABLE_ERRORS = (ValueError, TypeError, KeyError, PermissionError)
+
+    TRANSIENT_MARKERS = (
+        "502", "503", "504", "529", "bad gateway", "unavailable", "temporar",
+        "connection", "bağlan", "zaman aşımı", "timeout", "timed out",
+        "kota", "quota", "rate limit", "usage limit", "too many requests",
+        "yankı", "yanıt döndürmedi", "no response", "terminal",
+    )
+
+    def _transient_error(self, exc: BaseException) -> bool:
+        """Retry only what a later attempt can plausibly fix.
+
+        A deliberate provider/step failure must still reach the user as
+        ``failed``; parking a real bug in a two-day backoff loop hides it.
+        """
+        if isinstance(exc, self.NON_RETRYABLE_ERRORS):
+            return False
+        if is_infrastructure_error(exc):
+            return False
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError,
+                            CAONoResponse, OSError)):
+            return True
+        if type(exc).__name__ in {"CAOConnectionError", "TransportError", "ConnectError",
+                                  "ReadTimeout", "ConnectTimeout"}:
+            return True
+        text = str(exc).casefold()
+        return any(marker in text for marker in self.TRANSIENT_MARKERS)
+
+    async def _defer_transient(self, run_id, exc) -> bool:
+        """Park a run on a bounded backoff instead of failing a long job.
+
+        One 502 from a CLI terminal must not end a two-day task: the run enters
+        the same waiting state the quota watcher uses, the work record goes back
+        to ``waiting`` so other work keeps flowing, and a timer resumes it from
+        the persisted checkpoint.
+        """
+        if not self._transient_error(exc):
+            return False
+        saved = await self.store.get(run_id)
+        if saved is None:
+            return False
+        attempts = int(saved.get("transient_attempts") or 0) + 1
+        if attempts > self.transient_attempt_limit:
+            await self.store.event(
+                run_id, "retry_exhausted",
+                f"Geçici hata {self.transient_attempt_limit} denemede giderilemedi.",
+                {"error": str(exc)[:400]})
+            return False
+        delay = min(self.transient_backoff_max,
+                    self.transient_backoff_base * (2 ** min(attempts - 1, 6)))
+        resets_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        timer = {"step_id": None, "model_id": "", "resets_at": resets_at.isoformat(),
+                 "execute": bool(saved.get("plan")), "reason": "transient_error"}
+        await self.change(run_id, status="waiting_retry", retry_timer=timer, quota_timer=None,
+                          current_steps=[], error=None, phase_status="retrying",
+                          transient_attempts=attempts, transient_error=str(exc)[:500])
+        await self.store.event(
+            run_id, "transient_retry",
+            f"Geçici hata; {int(delay)} sn sonra kaldığı yerden denenecek "
+            f"({attempts}/{self.transient_attempt_limit}).",
+            {"delay_seconds": delay, "attempt": attempts, "error": str(exc)[:400]})
+        waiting = await self.store.get(run_id)
+        await self.sync_work(waiting, "waiting",
+                             "Geçici hata; otomatik yeniden deneme bekleniyor.")
+        await self._notify(
+            "delay", "Geçici hata, otomatik deneme",
+            f"{str(exc)[:200]}\n{int(delay)} saniye sonra yeniden denenecek "
+            f"({attempts}/{self.transient_attempt_limit}).",
+            run=waiting, dedupe_key=f"transient:{run_id}:{attempts}")
+        self.schedule_quota_resume(run_id, timer)
+        return True
+
     async def _finish_cancelled(self, run_id):
-        await self.change(run_id, status="cancelled", current_steps=[], error="Kullanıcı veya servis tarafından durduruldu.")
+        await self.change(run_id, status="cancelled", current_steps=[],
+                          error="Kullanıcı veya servis tarafından durduruldu.")
         await self.store.event(run_id, "cancelled", "Görev durduruldu. Tamamlanan adımlar saklandı.")
         cancelled = await self.store.get(run_id)
         await self.sync_work(cancelled, "cancelled", "Kullanıcı görevi durdurdu.")
@@ -1815,7 +2247,7 @@ class Engine:
         plan_steps = {s["id"] for s in (run.get("plan") or {}).get("steps", [])}
         if step_id not in plan_steps:
             raise ValueError(f"Geçersiz adım kimliği: {step_id}")
-        
+
         task = self.tasks.get(run_id)
         if task and not task.done():
             task.cancel()
@@ -1823,11 +2255,19 @@ class Engine:
                 await task
             except asyncio.CancelledError:
                 pass
-        
+
         run = await self.store.get(run_id)
         results = dict(run.get("results", {}))
-        results.pop(step_id, None)
-        current = [s for s in run.get("current_steps", []) if s != step_id]
+        # A retry invalidates its dependent verification, not unrelated siblings.
+        invalidated = {step_id}
+        while True:
+            more = {step["id"] for step in (run.get("plan") or {}).get("steps", [])
+                    if set(step.get("dependencies", [])) & invalidated} - invalidated
+            if not more:
+                break
+            invalidated.update(more)
+        results = {key: value for key, value in results.items() if key not in invalidated}
+        current = [s for s in run.get("current_steps", []) if s not in invalidated]
 
         # Otomatik Model Seçimi: Adımın mevcut modeli kotada ise otomatik alternatif modele devret
         step_obj = next((s for s in (run.get("plan") or {}).get("steps", []) if s.get("id") == step_id), None)
@@ -1851,7 +2291,8 @@ class Engine:
         # Each CAO run-step owns and tears down its terminal. The former
         # GET /terminals lookup was not a CAO endpoint and silently returned
         # 404 on every retry; never guess terminal ownership by step name.
-        await self.change(run_id, results=results, current_steps=current, status="queued", error=None, quota_timer=None)
+        await self.change(run_id, results=results, current_steps=current, status="queued", error=None, quota_timer=None,
+                          execution_id=uuid.uuid4().hex)
         await self.store.event(run_id, "step_retry", f"{step_id} adımı için tekrar deneme başlatıldı.", {"step_id": step_id})
         self.start(run_id, execute=True)
         return await self.store.get(run_id)
@@ -1861,7 +2302,7 @@ class Engine:
         run = await self.store.get(run_id)
         if not run:
             raise ValueError("Görev bulunamadı.")
-        
+
         task = self.tasks.get(run_id)
         if task and not task.done():
             task.cancel()
@@ -1869,7 +2310,7 @@ class Engine:
                 await task
             except asyncio.CancelledError:
                 pass
-        
+
         run = await self.store.get(run_id)
         results = dict(run.get("results", {}))
         failed_steps = [k for k, v in results.items() if v.get("status") == "failed"]
@@ -1892,8 +2333,8 @@ class Engine:
                                                {"step_id": sid, "from": curr_model, "to": choice.model_id})
                     except Exception:
                         pass
-        
-        await self.change(run_id, results=results, current_steps=[], status="queued", error=None, quota_timer=None)
+
+        await self.change(run_id, results=results, current_steps=[], status="queued", error=None, quota_timer=None, retry_timer=None)
         await self.store.event(run_id, "retry_failed_steps", f"Başarısız olan {len(failed_steps)} adım için tekrar deneme başlatıldı.", {"step_ids": failed_steps})
         self.start(run_id, execute=True)
         return await self.store.get(run_id)
@@ -1901,9 +2342,9 @@ class Engine:
     async def resume(self, run_id):
         self.cancel_quota_resume(run_id)
         run = await self.store.get(run_id)
-        if run["status"] not in {"planned", "failed", "cancelled", "interrupted", "waiting_quota"}:
+        if run["status"] not in {"planned", "failed", "cancelled", "interrupted", "waiting_quota", "waiting_retry"}:
             raise ValueError("Bu görev şu anda devam ettirilemez.")
-        await self.change(run_id, status="queued", error=None, quota_timer=None)
+        await self.change(run_id, status="queued", error=None, quota_timer=None, retry_timer=None)
         await self.store.event(run_id, "resumed", "Devam istendi. Tamamlanan adımlar tekrar çalıştırılmayacak.")
         self.start(run_id, execute=True)
         return await self.store.get(run_id)
@@ -1927,13 +2368,13 @@ class Engine:
                 # Task may be cancelled before drive enters its try/finally.
                 pass
             run = await self.store.get(run_id)
-            if run["status"] in {"queued", "planning", "running", "waiting_quota"}:
+            if run["status"] in {"queued", "planning", "running", "waiting_quota", "waiting_retry"}:
                 await self.change(run_id, status="cancelled", current_steps=[], quota_timer=None)
                 await self.store.event(run_id, "cancelled", "Görev durduruldu.")
                 await self.cao.clear_terminal_pool(run.get("workspace"))
         else:
             run = await self.store.get(run_id)
-            if run["status"] not in {"planned", "queued", "waiting_quota"}:
+            if run["status"] not in {"planned", "queued", "waiting_quota", "waiting_retry"}:
                 raise ValueError("Görev şu anda iptal edilemez.")
             await self.change(run_id, status="cancelled", current_steps=[], quota_timer=None)
             await self.cao.clear_terminal_pool(run.get("workspace"))

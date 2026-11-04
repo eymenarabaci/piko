@@ -58,7 +58,8 @@ def test_evidence_generator_matches_contract():
 
 def test_gate_returns_ledger_key_for_allowed_level():
     gate = BridgeGate(_registry())
+    token = gate.issue_approval(BRIDGE_ID, "apply")
     result = gate.check(_persona(), BRIDGE_ID, 'apply',
                         idempotency_key="smoke-key",
-                        approval_token="smoke-approval-token")
+                        approval_token=token)
     assert result["ledger_key"].startswith(BRIDGE_ID + ":" + 'apply' + ":")

@@ -103,6 +103,7 @@
     'work.waiting': 'bekliyor',
     'work.awaiting_review': 'bekliyor',
     'run.waiting_quota': 'bekliyor',
+    'run.waiting_retry': 'bekliyor',
     'deliverable.test_pending': 'bekliyor',
     'deliverable.awaiting_review': 'bekliyor',
     awaiting_review: 'bekliyor',

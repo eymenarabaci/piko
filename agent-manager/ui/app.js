@@ -1,13 +1,13 @@
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
-const activeStatuses = new Set(['queued', 'planning', 'running', 'waiting_quota']);
+const activeStatuses = new Set(['queued', 'planning', 'running', 'waiting_quota', 'waiting_retry']);
 const statusLabels = {
   queued: 'Sırada', planning: 'Planlanıyor', planned: 'Plan hazır',
   running: 'Çalışıyor', awaiting_review: 'İnceleme bekliyor',
   awaiting_user_test: 'Kullanıcı testi bekleniyor', scheduled: 'Zamanlandı',
   completed: 'Tamamlandı', failed: 'Başarısız', cancelled: 'İptal edildi',
   interrupted: 'Kesildi', pending: 'Bekliyor', blocked: 'Bağımlılık bekliyor',
-  success: 'Tamamlandı', skipped: 'Atlandı', waiting_quota: '⏳ Kota Bekleniyor'
+  waiting_retry: 'Ağ/servis hatası · yeniden deneme bekleniyor', success: 'Tamamlandı', skipped: 'Atlandı', waiting_quota: '⏳ Kota Bekleniyor'
 };
 const unifiedHint = 'Sorunuzu veya yapmak istediğiniz işi yazın. Gerektiğinde planı inceleyip onaylayabilirsiniz.';
 const instructionDeliveryLabels = {
@@ -288,7 +288,7 @@ function save(key, value) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
 }
 state.settings = load('agent-manager-settings', {});
-const planningLevelLabels = {fast: 'Hızlı', balanced: 'Dengeli', detailed: 'Ayrıntılı'};
+const planningLevelLabels = {fast: 'Hızlı', balanced: 'Dengeli', detailed: 'Ayrıntılı', parallel: 'Paralel'};
 if (!Object.hasOwn(planningLevelLabels, state.settings.planning_level)) state.settings.planning_level = 'fast';
 $('#planning-level').value = state.settings.planning_level;
 
@@ -361,7 +361,7 @@ async function api(path, options = {}) {
 function connected(ok) {
   const el = $('#connection');
   el.className = `connection ${ok ? 'online' : 'offline'}`;
-  el.querySelector('span').textContent = ok ? 'Bağlı (CAO Native)' : 'Bağlantı kesildi';
+  el.querySelector('span').textContent = ok ? 'Bağlı' : 'Bağlantı kesildi';
 }
 function setBusy(value) {
   state.busy = value;
@@ -393,10 +393,20 @@ function beginChatLive(prompt, modelId, runId, attachments = []) {
   let cursor = state.cursor || 0;
   let closed = false;
   let phase = 'Model yanıtı bekleniyor';
+  if (window.PikoConstellation) {
+    window.PikoConstellation.setMood('thinking', 'Talimatınız analiz ediliyor...');
+  }
   const timer = setInterval(() => {
     const seconds = Math.floor((Date.now() - started) / 1000);
     elapsed.textContent = `${seconds} sn`;
     status.textContent = `${phase}…`;
+    if (window.PikoConstellation) {
+      if (phase.includes('çıktı') || phase.includes('yanıtlıyor')) {
+        window.PikoConstellation.setMood('speaking', `${phase} (${seconds} sn)`);
+      } else {
+        window.PikoConstellation.setMood('thinking', `${phase} (${seconds} sn)`);
+      }
+    }
   }, 1000);
   const pollActivity = async () => {
     if (!runId || closed) return;
@@ -419,11 +429,18 @@ function beginChatLive(prompt, modelId, runId, attachments = []) {
       closed = true;
       clearInterval(timer);
       if (error) {
+        if (window.PikoConstellation) window.PikoConstellation.setMood('worried', error);
         assistant.classList.add('chat-live-error');
         head.querySelector('.chat-live-dot')?.remove();
         status.textContent = error;
         elapsed.textContent = 'Yanıt alınamadı';
       } else {
+        if (window.PikoConstellation) {
+          window.PikoConstellation.setMood('speaking', 'Piko yanıtı sundu.');
+          setTimeout(() => {
+            if (window.PikoConstellation && !state.run) window.PikoConstellation.setMood('idle');
+          }, 3500);
+        }
         live.remove();
       }
     }
@@ -513,6 +530,28 @@ function storeRun(run) {
   renderRecent();
 }
 
+let recentRefreshTimer = null;
+let recentRefreshInFlight = false;
+async function refreshRecentInBackground() {
+  if (document.hidden || recentRefreshInFlight) return;
+  recentRefreshInFlight = true;
+  const generation = state.generation;
+  const selected = state.selectedId;
+  try {
+    await refreshRuns();
+    if (generation !== state.generation || selected !== state.selectedId || state.polling || !state.run) return;
+    const latest = groupedRuns(state.runs).find(run => conversationKey(run) === conversationKey(state.run));
+    if (latest && (latest.id !== state.run.id || latest.status !== state.run.status || latest.updated_at !== state.run.updated_at)) {
+      await loadConversation(selected, generation);
+      if (generation === state.generation) { renderRun(); schedulePoll(0); }
+    }
+  } catch {} finally { recentRefreshInFlight = false; }
+}
+function startRecentRefresh() {
+  if (recentRefreshTimer) clearInterval(recentRefreshTimer);
+  recentRefreshTimer = setInterval(refreshRecentInBackground, 15000);
+}
+
 async function refreshRuns() {
   const data = await api('/api/runs');
   state.runs = Array.isArray(data) ? data : (data.runs || []);
@@ -561,13 +600,30 @@ function setActiveProject(proj) {
 
 async function loadProjectMetrics() {
   if (!state.activeProject) return;
+  const project = state.activeProject;
   try {
-    const stats = await api(`/api/projects/${state.activeProject.id}/stats`);
+    const stats = await api(`/api/projects/${project.id}/stats`);
+    let measured = stats.provider_reported_tokens;
+    if (measured === undefined) {
+      // Older servers expose only mixed totals on project stats. Sum their
+      // actual per-run provider measurements instead; never show estimates.
+      const normalized = value => String(value || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+      const runs = [...new Map([...state.runs, ...state.conversationRuns, ...(state.run ? [state.run] : [])]
+        .filter(run => run.project_id === project.id || (!run.project_id && normalized(run.workspace) === normalized(project.path)))
+        .map(run => [run.id, run])).values()];
+      if (runs.length) {
+        const totals = await Promise.all(runs.map(run => api(`/api/runs/${encodeURIComponent(run.id)}/tokens`)));
+        if (totals.every(total => Number.isFinite(total.provider_reported_tokens))) {
+          measured = totals.reduce((sum, total) => sum + total.provider_reported_tokens, 0);
+        }
+      } else if (stats.total_runs === 0) measured = 0;
+    }
+    if (state.activeProject?.id !== project.id) return;
     const tokEl = $('#metric-total-tokens');
     const stepEl = $('#metric-total-steps');
     const trigEl = $('#metric-active-triggers');
     const projEl = $('#metric-proj-name');
-    if (tokEl) tokEl.textContent = stats.total_tokens > 1000 ? `${(stats.total_tokens / 1000).toFixed(1)}k` : stats.total_tokens;
+    if (tokEl) tokEl.textContent = formatTokenCount(measured);
     if (stepEl) stepEl.textContent = `${stats.total_steps} adım`;
     if (trigEl) trigEl.textContent = `${stats.active_triggers} tetikleyici`;
     if (projEl) projEl.textContent = state.activeProject.name;
@@ -651,7 +707,7 @@ function renderRecent() {
   const container = $('#recent-runs');
   if (!container) return;
   container.replaceChildren();
-  
+
   let allRuns = groupedRuns(state.runs);
   let filtered = allRuns;
   const isProjectScope = (state.recentScope || 'project') === 'project';
@@ -666,6 +722,9 @@ function renderRecent() {
     filtered = matched;
   }
 
+  if (isProjectScope && allRuns.length > filtered.length) {
+    container.append(button(`Diğer projelerde ${allRuns.length - filtered.length} sohbet — Tümünü göster`, 'outline-button', () => $('#scope-all-btn')?.click()));
+  }
   if (!filtered.length) {
     container.append(node('p', 'empty-note', isProjectScope ? 'Bu projede henüz sohbet yok.' : 'Henüz sohbet yok.'));
     return;
@@ -728,6 +787,9 @@ async function selectRun(id) {
     const run = await api(`/api/runs/${encodeURIComponent(id)}`);
     if (generation !== state.generation) return;
     state.run = run;
+    const normalizedWorkspace = (run.workspace || '').toLowerCase().replace(/\\/g, '/');
+    const runProject = state.projects.find(p => (p.path || '').toLowerCase().replace(/\\/g, '/') === normalizedWorkspace);
+    if (runProject && runProject.id !== state.activeProject?.id) setActiveProject(runProject);
     await loadConversation(id, generation);
     $('#allow-writes').checked = run.allow_writes === true;
     renderRun();
@@ -747,14 +809,35 @@ async function selectRun(id) {
     schedulePoll();
   }
 }
+window.selectRun = selectRun;
 
 async function fetchRunTokens(id) {
   try {
     const data = await api(`/api/runs/${encodeURIComponent(id)}/tokens`);
     state.runTokenTotals[id] = data.total_tokens || 0;
+    state.runTokenBreakdowns ||= {};
+    state.runTokenBreakdowns[id] = data;
     state.runTokens = state.runTokenTotals[state.selectedId] || 0;
+    if (!state.tokenMetricsAt || Date.now() - state.tokenMetricsAt > 15000) {
+      state.tokenMetricsAt = Date.now();
+      loadProjectMetrics();
+    }
     if (inspectedPlan()?.id === id) renderRun();
   } catch {}
+}
+
+function formatTokenCount(value) {
+  if (!Number.isFinite(value) || value < 0) return '—';
+  const number = new Intl.NumberFormat('tr-TR', {maximumFractionDigits: 1});
+  if (value >= 1000000) return `${number.format(value / 1000000)}M`;
+  if (value >= 1000) return `${number.format(value / 1000)}k`;
+  return number.format(value);
+}
+
+function tokenAccountingNote(id) {
+  const data = state.runTokenBreakdowns?.[id];
+  if (!data || data.provider_reported_tokens === undefined) return 'Sağlayıcı ölçümü henüz alınmadı; tüketim bilinmiyor';
+  return `Sağlayıcı bildirimi: ${data.provider_reported_tokens.toLocaleString('tr-TR')} · Ölçülmeyen kayıt: ${data.unmeasured_records ?? data.unknown_calls ?? 0}. Önbellek ve akıl yürütme dahildir; parasal ücret değildir. Tahmin üretilmez.`;
 }
 
 function inspectedPlan() {
@@ -800,9 +883,10 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
   }
   // 1. KULLANICI HEDEFİ BALONU
   if (!(run.mode === 'chat' && run.chat_history?.[0]?.text === run.prompt)) {
-    const userBubble = node('article', 'message-bubble user-message');
-    const userHead = node('div', 'user-head');
-    userHead.append(node('span', 'user-avatar', '👤'), node('b', '', 'Siz'), node('time', 'time-meta', date(run.created_at, true)));
+    const userBubble = node('article', `message-bubble ${archived ? 'chat-bubble-assistant piko-planned-goal' : 'user-message'}`);
+    const userHead = node('div', archived ? 'chat-bubble-head' : 'user-head');
+    userHead.append(node('span', 'user-avatar', archived ? '◈' : '👤'), node('b', '', archived ? 'Piko · Kendi planladığı hedef' : 'Siz'));
+    if (run.created_at) userHead.append(node('time', 'time-meta', date(run.created_at, true)));
     userBubble.append(userHead, node('div', 'user-body', run.prompt));
     container.append(userBubble);
   }
@@ -971,8 +1055,9 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
 
   for (const step of steps) {
     if (run.mode === 'chat' && step.id === 'response') continue;
-    const result = run.results?.[step.id];
     const isRunning = (run.current_steps || []).includes(step.id);
+    const savedResult = run.results?.[step.id];
+    const result = isRunning ? {...savedResult, status: 'running', error: null, output: ''} : savedResult;
     if (!result && !isRunning) continue;
 
     const personaKey = step.persona || 'developer';
@@ -992,13 +1077,14 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
     bPills.append(node('span', 'worker-id-pill', `🤖 ${result?.model_id || step.model_id || 'auto'}`));
     if (result?.cao_terminal_id) {
       bPills.append(button('Terminal ↗', 'output-open-button', () => {
-        openTerminalModal(step.title || step.id, result?.output || 'Terminal oturumu aktif...', result?.cao_terminal_id);
+        openStepOutput(run, step, result);
       }));
     }
     if (isRunning && !archived) {
-      const live = button(result?.cao_terminal_id ? 'Canlı terminali aç ↗' : 'Terminal hazırlanıyor…', 'output-open-button',
-        () => openLiveTerminal(step.title || step.id, result?.cao_terminal_id));
-      live.disabled = !result?.cao_terminal_id;
+      const cliOutput = usesCliOutput(run, step, result);
+      const live = button(cliOutput ? 'Canlı çıktıyı aç' : result?.cao_terminal_id ? 'Canlı terminali aç ↗' : 'Terminal hazırlanıyor…', 'output-open-button',
+        () => cliOutput ? openStepOutput(run, step, result) : openLiveTerminal(step.title || step.id, result?.cao_terminal_id));
+      live.disabled = !cliOutput && !result?.cao_terminal_id;
       bPills.append(live);
     }
     bHead.append(bId, bPills);
@@ -1119,13 +1205,15 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
 
 function renderRun() {
   const run = state.run;
+  statusLabels.waiting_quota = run?.quota_timer?.reason === 'transient_error' || run?.phase_status === 'retrying'
+    ? 'Geçici hata · yeniden deneme bekleniyor' : 'Kota bekleniyor';
   const container = $('#run-content');
   updateMascot(run);
   if (run?.id && !workState.jobs[run.id] && !workState.loading[run.id]) loadWorkForRun(run);
   $('#welcome').hidden = !!state.selectedId;
   container.hidden = !state.selectedId;
 
-  const anyWaitingQuota = run?.status === 'waiting_quota' || Object.values(run?.results || {}).some(r => r.status === 'waiting_quota');
+  const anyWaitingQuota = ['waiting_quota', 'waiting_retry'].includes(run?.status) || Object.values(run?.results || {}).some(r => r.status === 'waiting_quota');
   $('#job-banner').hidden = !run || (!activeStatuses.has(run.status) && !anyWaitingQuota);
   $('#cancel-job').textContent = 'Durdur';
   const activeRun = !!run && activeStatuses.has(run.status);
@@ -1142,17 +1230,17 @@ function renderRun() {
     : 'Mesajınızı yazın…';
   $('#job-banner').classList.toggle('banner-waiting-quota', anyWaitingQuota);
   if (anyWaitingQuota) {
-    const timer = run.quota_timer || Object.values(run.results || {}).find(r => r.status === 'waiting_quota');
+    const timer = run.retry_timer || run.quota_timer || Object.values(run.results || {}).find(r => r.status === 'waiting_quota');
     const waitingStepId = timer?.step_id || Object.keys(run.results || {}).find(k => run.results[k]?.status === 'waiting_quota');
     const label = $('#job-label');
     label.replaceChildren();
     const summary = node('span', 'quota-banner-summary');
-    summary.append(node('strong', '', 'Kota bekleniyor'), node('span', '', ' · Otomatik devam edecek · '));
+    summary.append(node('strong', '', run.phase_status === 'retrying' ? 'Geçici ağ/servis hatası · yeniden deneme bekleniyor' : 'Kota bekleniyor'), node('span', '', ' · Otomatik devam edecek · '));
     const clock = node('span', 'countdown-badge quota-countdown', 'Hesaplanıyor…');
     if (timer?.resets_at) clock.dataset.resetAt = timer.resets_at;
     summary.append(clock, node('span', '', ` · ${timer?.model_id || 'model seçimi bekleniyor'}`));
     label.append(summary);
-    if (waitingStepId && !archivedPlanSelected()) {
+    if (waitingStepId && !archivedPlanSelected() && run.phase_status !== 'retrying') {
       const actions = node('span', 'quota-banner-actions');
       actions.append(
         button('Model seç', 'banner-auto-switch-btn', () => {
@@ -1180,7 +1268,13 @@ function renderRun() {
     const program = programProgress(viewRun);
     if (program) stats.append(node('span', 'stat-chip', `İş ${program.index + 1}/${program.total}`));
     stats.append(node('span', 'stat-chip', `Adımlar ${done}/${total || '—'} · %${percent}`));
-    stats.append(node('span', 'stat-chip', `⚡ ${(state.runTokenTotals[viewRun.id] || Object.values(viewRun.results || {}).reduce((sum, item) => sum + Number(item.token_usage?.step_tokens || item.tokens || 0), 0)).toLocaleString('tr-TR')} token`));
+    const tokenStat = node('span', 'stat-chip', `⚡ ${formatTokenCount(state.runTokenBreakdowns?.[viewRun.id]?.provider_reported_tokens)} ölçülen token`);
+    tokenStat.title = tokenAccountingNote(viewRun.id);
+    stats.append(tokenStat);
+    const tokenBreakdown = state.runTokenBreakdowns?.[viewRun.id];
+    if (tokenBreakdown?.provider_reported_tokens !== undefined) {
+      stats.append(node('span', 'stat-chip', `${tokenBreakdown.unmeasured_records ?? tokenBreakdown.unknown_calls ?? 0} kayıt ölçülemedi`));
+    }
     if (viewRun.current_steps?.length) stats.append(node('span', 'stat-chip', `${viewRun.current_steps.length} ajan çalışıyor`));
     progress.append(stats);
     if (viewRun.error) progress.append(node('span', 'progress-error', String(viewRun.error).slice(0, 220)));
@@ -1400,8 +1494,25 @@ function renderInspector() {
 
     if (!steps.length) {
       container.append(node('p', 'empty-note', 'Plan hazırlandığında alt ajanlar burada listelenecektir.'));
+      if (activeStatuses.has(run.status)) {
+        const planning = node('div', 'worker-card');
+        planning.append(node('div', 'worker-card-title', 'Orkestratör ve planlayıcı'),
+          node('p', 'empty-note', 'Çalışan CLI sürecinin salt okunur çıktısını ve etkinliğini izleyin.'));
+        const actions = node('div', 'worker-actions');
+        for (const [stepId, label] of [['program', 'Orkestratör çıktısını aç'], ['planner', 'Planlayıcı çıktısını aç']]) {
+          actions.append(button(label, 'outline-button', () => openTerminalModal(label, '', null, {runId: run.id, stepId})));
+        }
+        planning.append(actions);
+        container.append(planning);
+      }
     }
 
+    if (activeStatuses.has(run.status) && run.phase_status === 'auditing') {
+      const audit = node('div', 'worker-card');
+      audit.append(node('div', 'worker-card-title', 'Orkestratör denetimi'),
+        button('Denetçi çıktısını aç', 'outline-button', () => openTerminalModal('Orkestratör denetimi', '', null, {runId: run.id, stepId: 'phase_audit'})));
+      container.append(audit);
+    }
     steps.forEach(step => {
       const result = run.results?.[step.id];
       const isRunning = activeSteps.has(step.id);
@@ -1426,13 +1537,14 @@ function renderInspector() {
       const actions = node('div', 'worker-actions');
       if (isRunning || isDone) {
         actions.append(button('Terminal Çıktısını Aç', 'outline-button', () => {
-          openTerminalModal(step.title || step.id, result?.output || 'Terminal oturumu aktif. Komutlar yürütülüyor...', result?.cao_terminal_id);
+          openStepOutput(run, step, result);
         }));
       }
       if (isRunning && !archivedPlanSelected()) {
-        const live = button(result?.cao_terminal_id ? 'Canlı terminali aç' : 'Terminal hazırlanıyor…', 'outline-button',
-          () => openLiveTerminal(step.title || step.id, result?.cao_terminal_id));
-        live.disabled = !result?.cao_terminal_id;
+        const cliOutput = usesCliOutput(run, step, result);
+        const live = button(cliOutput ? 'Canlı çıktıyı aç' : result?.cao_terminal_id ? 'Canlı terminali aç' : 'Terminal hazırlanıyor…', 'outline-button',
+          () => cliOutput ? openStepOutput(run, step, result) : openLiveTerminal(step.title || step.id, result?.cao_terminal_id));
+        live.disabled = !cliOutput && !result?.cao_terminal_id;
         actions.append(live);
       }
       if (result?.status === 'waiting_quota') {
@@ -1527,10 +1639,10 @@ function renderInspector() {
     statsRow.append(stepsChip);
 
     // Active Sub-agents / Quota Timer
-    if (run.status === 'waiting_quota') {
+    if (['waiting_quota', 'waiting_retry'].includes(run.status)) {
       const timerChip = node('div', 'stat-chip quota-timer-chip');
-      timerChip.append(node('span', '', '⏳'), node('strong', '', 'Kota yenilenince devam:'), node('span', 'countdown-display quota-countdown', 'Hesaplanıyor…'));
-      const timer = run.quota_timer;
+      timerChip.append(node('span', '', '⏳'), node('strong', '', run.phase_status === 'retrying' ? 'Geçici hata sonrası devam:' : 'Kota yenilenince devam:'), node('span', 'countdown-display quota-countdown', 'Hesaplanıyor…'));
+      const timer = run.retry_timer || run.quota_timer;
       if (timer?.resets_at) timerChip.querySelector('.quota-countdown').dataset.resetAt = timer.resets_at;
       statsRow.append(timerChip);
     } else if (activeWorkers.length) {
@@ -1542,7 +1654,8 @@ function renderInspector() {
     // Token Usage Stat
     const tokenChip = node('div', 'stat-chip');
     tokenChip.id = 'run-token-chip';
-    tokenChip.innerHTML = `<span>⚡</span> Token: <strong>${(state.runTokenTotals[run.id] || Object.values(run.results || {}).reduce((sum, item) => sum + Number(item.token_usage?.step_tokens || item.tokens || 0), 0)).toLocaleString('tr-TR')} tokens</strong>`;
+    tokenChip.innerHTML = `<span>⚡</span> Ölçülen token: <strong>${formatTokenCount(state.runTokenBreakdowns?.[run.id]?.provider_reported_tokens)}</strong>`;
+    tokenChip.title = tokenAccountingNote(run.id);
     statsRow.append(tokenChip);
 
 
@@ -1589,7 +1702,7 @@ function renderInspector() {
     for (const [id, result] of results) {
       container.append(node('h3', 'inspector-title', run.plan?.steps?.find(s => s.id === id)?.title || id));
       if (result.persona) container.append(node('p', 'empty-note', `Atanan Persona: ${result.persona}`));
-      if (result.token_usage) container.append(node('p', 'empty-note', `Adım Token: ${result.token_usage.step_tokens}`));
+      if (result.token_usage?.source === 'provider_reported') container.append(node('p', 'empty-note', `Ölçülen adım tokenı: ${result.token_usage.step_tokens}`));
       if (result.cao_terminal_id) container.append(node('p', 'empty-note', `CAO ConPTY Terminali: ${result.cao_terminal_id}`));
       const output = node('div', 'markdown-body inspector-markdown');
       output.innerHTML = renderMarkdownHtml(result.output || result.error || 'Henüz çıktı yok.');
@@ -1718,13 +1831,7 @@ function renderInspector() {
 
       container.append(node('h3', 'inspector-title', 'Teslim sürümleri'));
       if (!job.deliverables?.length) container.append(node('p', 'empty-note', 'Henüz teslim kaydı yok.'));
-      for (const deliverable of job.deliverables || []) {
-        const item = node('div', 'worker-card');
-        item.append(node('div', 'worker-card-title', `${deliverable.title} · v${deliverable.version}`));
-        item.append(node('small', '', deliverable.summary || ''));
-        item.append(node('div', 'worker-meta', `${deliverable.status}${deliverable.parent_version ? ' · v' + deliverable.parent_version + ' üzerinden' : ''}`));
-        container.append(item);
-      }
+      for (const deliverable of job.deliverables || []) container.append(deliveryCard(deliverable));
 
       const audit = node('div', 'worker-card');
       audit.append(node('div', 'worker-card-title', 'Ajanlar ve modeller'));
@@ -1749,15 +1856,38 @@ function renderInspector() {
   container.scrollTop = previousScroll;
 }
 
-function openTerminalModal(title, output, terminalId = null) {
+let terminalOutputTarget = null;
+let terminalOutputTimer = null;
+
+function stopTerminalOutput() {
+  clearTimeout(terminalOutputTimer);
+  terminalOutputTimer = null;
+  terminalOutputTarget = null;
+  state.activeTerminalId = null;
+}
+
+function usesCliOutput(run, step = {}, result = {}) {
+  if (result?.cao_terminal_id) return false;
+  const id = result?.model_id || step.model_id || run.planner_model_actual || run.planner_model || '';
+  const model = (state.bootstrap?.models || []).find(row => row.id === id);
+  return run.execution_backend !== 'cao' || ['evren', 'opencode', 'claude-code'].includes(model?.provider)
+    || ['opencode', 'claude-code'].includes(model?.runtime) || /^(opencode:|evren\/|claude-code:)/.test(id);
+}
+
+function openStepOutput(run, step, result = {}) {
+  const target = usesCliOutput(run, step, result) ? {runId: run.id, stepId: step.id} : null;
+  openTerminalModal(step.title || step.id, result?.output || '', result?.cao_terminal_id, target);
+}
+
+function openTerminalModal(title, output, terminalId = null, cliTarget = null) {
+  stopTerminalOutput();
   state.activeTerminalId = terminalId;
-  $('#terminal-modal-title').textContent = `${title} · ConPTY Terminal Çıktısı`;
-  $('#terminal-modal-subtitle').textContent = terminalId ? `Terminal ID: ${terminalId}` : 'Terminal Akışı';
-  $('#terminal-modal-output').textContent = output || 'Terminal çıktısı yükleniyor...';
-  $('#terminal-modal').showModal();
-  if (terminalId) {
-    refreshTerminalOutput();
-  }
+  terminalOutputTarget = cliTarget ? {...cliTarget, initialOutput: output || '', busy: false} : null;
+  $('#terminal-modal-title').textContent = `${title} · ${cliTarget ? 'Canlı CLI çıktısı' : 'ConPTY Terminal Çıktısı'}`;
+  $('#terminal-modal-subtitle').textContent = cliTarget ? 'Salt okunur stdout · süreç durumu yükleniyor…' : terminalId ? `Terminal ID: ${terminalId}` : 'Kaydedilmiş çıktı';
+  $('#terminal-modal-output').textContent = output || (cliTarget ? 'Süreç çıktısı sorgulanıyor…' : 'Terminal çıktısı bulunamadı.');
+  if (!$('#terminal-modal').open) $('#terminal-modal').showModal();
+  if (terminalId || cliTarget) refreshTerminalOutput();
 }
 
 let liveTerminalConnection = null;
@@ -1828,13 +1958,46 @@ function openLiveTerminal(title, terminalId) {
 }
 
 async function refreshTerminalOutput() {
-  if (!state.activeTerminalId) return;
+  const target = terminalOutputTarget;
+  const terminalId = state.activeTerminalId;
+  const dialog = $('#terminal-modal');
+  if (!dialog.open || (!target && !terminalId) || target?.busy) return;
+  clearTimeout(terminalOutputTimer);
+  if (target) target.busy = true;
+  let keepPolling = !!target;
   try {
-    const res = await api(`/api/terminals/${encodeURIComponent(state.activeTerminalId)}/output`);
-    $('#terminal-modal-output').textContent = res.output || 'Terminal çıktısı boş.';
-    toast('Terminal çıktısı güncellendi.');
-  } catch (e) {
-    toast(errorText(e));
+    const path = target
+      ? `/api/runs/${encodeURIComponent(target.runId)}/steps/${encodeURIComponent(target.stepId)}/live-output`
+      : `/api/terminals/${encodeURIComponent(terminalId)}/output`;
+    let res;
+    res = await api(path, {timeoutMs: 8000});
+    if (target && res.state === 'waiting' && /canli cikti kaydi etkinlesmeden/.test(res.output || '')) {
+      res.output = 'Bu adımın canlı çıktı akışı henüz mevcut değil; çalışma sırasını bekliyor olabilir. Çalışan diğer ajanın çıktısını açabilirsiniz.';
+      res.pid = null; res.elapsed_seconds = null; res.idle_seconds = null; res.received_bytes = null;
+    }
+    if (!dialog.open || target !== terminalOutputTarget || terminalId !== state.activeTerminalId) return;
+    $('#terminal-modal-output').textContent = res.output || target?.initialOutput || (target ? 'Henüz stdout alınmadı. Süreç durumu takip ediliyor.' : 'Terminal çıktısı boş.');
+    if (target) {
+      const labels = {running: 'Çalışıyor', completed: 'Tamamlandı', timeout: 'Süre sınırı', cancelled: 'İptal edildi', failed: 'Hata', waiting: 'Çıktı kaydı bekleniyor'};
+      const details = ['Salt okunur stdout', labels[res.state] || res.state || 'Durum bilinmiyor'];
+      if (res.pid) details.push(`PID ${res.pid}`);
+      for (const [field, label] of [['elapsed_seconds', 'Süre'], ['idle_seconds', 'Son çıktıdan beri']]) {
+        if (Number.isFinite(res[field])) details.push(`${label}: ${Math.floor(res[field])} sn`);
+      }
+      if (Number.isFinite(res.received_bytes)) details.push(`${res.received_bytes} bayt`);
+      if (res.source_step_id) details.push(`Kaynak: ${res.source_step_id}`);
+      $('#terminal-modal-subtitle').textContent = details.join(' · ');
+      keepPolling = activeStatuses.has(res.run_state) || !['completed', 'timeout', 'cancelled', 'failed'].includes(res.state);
+    }
+  } catch (error) {
+    if (!dialog.open || target !== terminalOutputTarget || terminalId !== state.activeTerminalId) return;
+    if (target) $('#terminal-modal-subtitle').textContent = `Salt okunur stdout · ${errorText(error)} · Yeniden denenecek`;
+    else toast(errorText(error));
+  } finally {
+    if (target) target.busy = false;
+    if (target && keepPolling && target === terminalOutputTarget && dialog.open) {
+      terminalOutputTimer = setTimeout(refreshTerminalOutput, 2000);
+    }
   }
 }
 
@@ -1897,7 +2060,7 @@ function renderPersonasPage() {
   container.append(mcpsList);
 }
 
-function renderModels() {
+function renderModelsLegacy() {
   const container = $('#data-page');
   container.replaceChildren(
     node('h2', '', 'Modeller ve CLI'),
@@ -1923,6 +2086,200 @@ function renderModels() {
     content.append(node('b', '', model.id), node('small', '', `${model.provider}${model.capabilities?.length ? ' · ' + model.capabilities.join(', ') : ''}`));
     row.append(content, node('span', 'status-badge', model.default_effort || 'Varsayılan'));
     container.append(row);
+  }
+}
+
+function isModelCalibrated(model) {
+  return !!(model?.role_weights && (model.provenance?.calibrated || model.provenance?.provenance === 'auto_calibrated'));
+}
+
+function modelTripleLabel(model) {
+  return `${model.model || model.base_model || model.id} (${model.runtime || 'direct'})`;
+}
+
+function findModelByTriple(triple) {
+  return (state.bootstrap?.models || []).find(model => (model.triple_key || `${model.model || model.id}::${model.runtime || 'direct'}::${model.account || 'default'}`) === triple);
+}
+
+function modelQuotaBar(model) {
+  const wrap = node('div', 'model-quota');
+  wrap.style.cssText = 'min-width:120px;display:flex;flex-direction:column;gap:3px';
+  const cooldown = (state.bootstrap?.model_cooldowns || {})[model.id];
+  const track = node('div', 'quota-track');
+  track.style.cssText = 'height:6px;border-radius:99px;background:#e6ecf5;overflow:hidden';
+  const fill = node('span', 'quota-fill');
+  const pct = cooldown ? 18 : 100;
+  fill.style.cssText = `display:block;height:100%;width:${pct}%;background:${cooldown ? '#d96b5f' : '#5aa37a'}`;
+  track.append(fill);
+  const label = cooldown
+    ? `Kota: ${cooldown.error_kind || 'bekleme'}`
+    : (model.availability?.quota_status === 'unknown' ? 'Kota: bilinmiyor' : `Kota: ${model.availability?.quota_status || 'bilinmiyor'}`);
+  wrap.append(track, node('small', '', label));
+  return wrap;
+}
+
+async function toggleModelHidden(model) {
+  try {
+    const res = await api('/api/models/hide', {
+      method: 'POST', body: JSON.stringify({ id: model.id, hidden: !model.hidden })
+    });
+    state.bootstrap.models = res.models;
+    populateModels();
+    renderModels();
+  } catch (error) {
+    toast(errorText(error));
+  }
+}
+
+async function calibrateSelection(triples) {
+  if (!triples.length) return toast('Kalibre edilecek üçlü seçilmedi.');
+  if (state.calibrationAbort) return toast('Önce çalışan kalibrasyonu iptal edin.');
+  const controller = new AbortController();
+  state.calibrationAbort = controller;
+  state.calibrationProgress = {};
+  try {
+    const response = await fetch('/api/models/calibrate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ triples }),
+      signal: controller.signal
+    });
+    if (!response.ok || !response.body) throw new Error(`Kalibrasyon başlatılamadı (${response.status}).`);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let index;
+      while ((index = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, index).trim();
+        buffer = buffer.slice(index + 1);
+        if (!line) continue;
+        let event;
+        try { event = JSON.parse(line); } catch { continue; }
+        if (event.type === 'start') {
+          state.calibrationToken = event.token;
+        } else if (event.type === 'triple_start') {
+          state.calibrationProgress[event.id] = 'Kalibrasyon başladı';
+        } else if (event.type === 'task_done') {
+          const model = findModelByTriple(event.triple);
+          if (model) state.calibrationProgress[model.id] = event.passed ? 'Görev geçti' : 'Görev kaldı';
+        } else if (event.type === 'triple_done') {
+          state.calibrationProgress[event.id] = 'Kalibre edildi';
+        } else if (event.type === 'triple_cancelled') {
+          state.calibrationProgress[event.id] = 'İptal edildi';
+        } else if (event.type === 'done') {
+          if (Array.isArray(event.models)) state.bootstrap.models = event.models;
+          const report = event.report || {};
+          toast(`Kalibrasyon: ${report.calibrated?.length || 0} tamam, ${report.cancelled?.length || 0} iptal, ${report.skipped?.length || 0} atlandı.`);
+        } else if (event.type === 'error') {
+          toast(event.error);
+        }
+        if (state.page === 'models') renderModels();
+      }
+    }
+    if (state.page === 'models') renderModels();
+    populateModels();
+  } catch (error) {
+    if (error.name !== 'AbortError') toast(errorText(error));
+  } finally {
+    state.calibrationAbort = null;
+    state.calibrationToken = null;
+    if (state.page === 'models') renderModels();
+  }
+}
+
+function renderModels() {
+  const container = $('#data-page');
+  container.replaceChildren(
+    node('h2', '', 'Modeller ve CLI'),
+    node('p', 'page-description', 'Her satır bir (model, runtime, hesap) üçlüsüdür; kotalar ayrıdır.')
+  );
+  const providers = node('div', 'provider-list');
+  for (const provider of state.bootstrap?.providers || []) {
+    const item = node('section', 'provider');
+    item.append(node('h3', '', provider.id), badge(provider.available ? 'completed' : 'failed'), node('small', '', provider.available ? 'CLI bulundu' : 'CLI bulunamadı'));
+    if (provider.executable) item.append(node('small', '', Array.isArray(provider.executable) ? provider.executable.join(' ') : provider.executable));
+    providers.append(item);
+  }
+  const cao = state.bootstrap?.cao || {};
+  const caoItem = node('section', 'provider');
+  caoItem.append(node('h3', '', 'Gömülü CAO / Windows ConPTY'), badge(cao.available ? 'completed' : 'failed'), node('small', '', cao.detail || 'CAO durumu bilinmiyor'));
+  providers.append(caoItem);
+  container.append(providers);
+
+  const all = state.bootstrap?.models || [];
+  const visible = all.filter(model => state.hiddenFilter ? true : !model.hidden);
+  const toolbar = node('div', 'model-toolbar');
+  toolbar.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0';
+  toolbar.append(
+    button(state.hiddenFilter ? 'Gizlileri gizle' : 'Gizli', 'outline-button', () => {
+      state.hiddenFilter = !state.hiddenFilter;
+      renderModels();
+    }),
+    button('Kalibre edilmemişleri çalıştır', 'primary-button', () => {
+      const triples = visible.filter(model => !model.hidden && !isModelCalibrated(model)).map(model => ({ id: model.id }));
+      calibrateSelection(triples);
+    })
+  );
+  if (state.calibrationAbort) {
+    toolbar.append(button('Kalibrasyonu iptal et', 'outline-button', async () => {
+      const token = state.calibrationToken;
+      if (token) api('/api/models/calibrate/cancel', { method: 'POST', body: JSON.stringify({ token }) }).catch(() => {});
+      state.calibrationAbort?.abort();
+    }));
+  }
+  container.append(toolbar);
+  container.append(node('small', '', `${visible.length} / ${all.length} üçlü gösteriliyor · ${visible.filter(isModelCalibrated).length} kalibre`));
+
+  if (!visible.length) container.append(node('p', 'empty-note', 'Model kataloğu yüklenemedi.'));
+  const calibrated = visible.filter(isModelCalibrated);
+  const devTop = calibrated.reduce((best, model) => ((model.role_weights?.development || 0) > (best?.role_weights?.development || 0) ? model : best), null);
+  const archTop = calibrated.reduce((best, model) => ((model.role_weights?.architect || 0) > (best?.role_weights?.architect || 0) ? model : best), null);
+  const groups = new Map();
+  for (const model of visible) {
+    const key = model.base_model || model.model || model.id;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(model);
+  }
+  for (const [base, models] of groups) {
+    const section = node('section', 'provider model-group');
+    section.append(node('h3', '', base));
+    for (const model of models) {
+      const row = node('div', 'model-row');
+      if (model.hidden) row.style.opacity = '0.55';
+      const content = node('div');
+      content.style.cssText = 'display:flex;flex-direction:column;gap:2px;min-width:220px';
+      const title = node('b', '', model.model || model.id);
+      const runtime = node('span', 'status-badge', model.runtime || 'direct');
+      runtime.style.marginLeft = '6px';
+      title.append(runtime);
+      content.append(title, node('small', '', `${model.provider}${model.capabilities?.length ? ' · ' + model.capabilities.join(', ') : ''}`));
+      if (isModelCalibrated(model)) {
+        const roles = node('small', '', Object.entries(model.role_weights || {})
+          .filter(([role]) => ['development', 'architect', 'reviewer'].includes(role))
+          .map(([role, weight]) => `${role} ${Number(weight).toFixed(2)}`).join(' · '));
+        content.append(roles);
+        if (devTop && model.id === devTop.id) content.append(node('small', 'status-badge', 'birincil kodcu'));
+        if (archTop && model.id === archTop.id) content.append(node('small', 'status-badge', 'birincil plancı'));
+      } else {
+        content.append(node('small', '', 'kalibre edilmedi'));
+      }
+      const actions = node('div');
+      actions.style.cssText = 'display:flex;gap:6px;align-items:center;flex-wrap:wrap';
+      actions.append(modelQuotaBar(model));
+      const progress = state.calibrationProgress?.[model.id];
+      if (progress) actions.append(node('small', '', progress));
+      actions.append(
+        button(isModelCalibrated(model) ? 'Yeniden kalibre et' : 'Kalibre et', 'outline-button', () => calibrateSelection([{ id: model.id }])),
+        button(model.hidden ? 'Göster' : 'Gizle', 'outline-button', () => toggleModelHidden(model))
+      );
+      row.append(content, actions);
+      section.append(row);
+    }
+    container.append(section);
   }
 }
 
@@ -2539,6 +2896,71 @@ async function retryQuotaStep(runId, stepId) {
   }
 }
 
+function renderModelOptgroups(selectElement, models, {
+  currentModel = null,
+  cooldowns = {},
+  includeAuto = false,
+  autoLabel = '⚡ Varsayılan Model (Otomatik Yönlendirme)'
+} = {}) {
+  selectElement.replaceChildren();
+
+  if (includeAuto) {
+    const autoOption = node('option', '', autoLabel);
+    autoOption.value = '';
+    selectElement.appendChild(autoOption);
+  }
+
+  const groups = [
+    { label: 'Google Antigravity (Gemini & Claude)', match: m => m.provider === 'antigravity' },
+    { label: 'Claude Code CLI (Anthropic)', match: m => m.provider === 'claude-code' || m.runtime === 'claude-code' },
+    { label: 'Ollama (Yerel Modeller)', match: m => m.provider === 'ollama' || m.runtime === 'ollama' },
+    { label: 'OpenCode CLI', match: m => m.provider === 'opencode' },
+    { label: 'Evren (OpenCode)', match: m => m.provider === 'evren' },
+    { label: 'OpenAI Codex', match: m => m.provider === 'codex' },
+    { label: 'Diğer Modeller', match: () => true }
+  ];
+
+  const handled = new Set();
+  let firstAvailableId = null;
+
+  for (const group of groups) {
+    const groupModels = models.filter(m => !handled.has(m.id) && group.match(m));
+    if (!groupModels.length) continue;
+
+    const optgroup = document.createElement('optgroup');
+    optgroup.label = group.label;
+
+    for (const m of groupModels) {
+      handled.add(m.id);
+      const isCurrent = m.id === currentModel;
+      const cd = cooldowns[m.id];
+      const isCooldown = Boolean(cd && cd.remaining_seconds > 0);
+
+      let label = m.id;
+      if (isCurrent) label += ' (Mevcut)';
+      if (isCooldown) {
+        const rem = cd.remaining_seconds;
+        const hours = Math.floor(rem / 3600);
+        const mins = Math.floor((rem % 3600) / 60);
+        const timeStr = hours > 0 ? `${hours} sa ${mins} dk` : `${mins} dk`;
+        label += ` · Kota bekliyor (${timeStr})`;
+      }
+
+      const opt = node('option', '', label);
+      opt.value = m.id;
+      if (isCurrent || isCooldown) {
+        opt.disabled = true;
+      } else if (!firstAvailableId) {
+        firstAvailableId = m.id;
+      }
+      optgroup.appendChild(opt);
+    }
+    selectElement.appendChild(optgroup);
+  }
+
+  return firstAvailableId;
+}
+
 async function openModelSwitchModal(runId, step) {
   currentSwitchTarget = { runId, stepId: step.id };
   const modal = $('#model-switch-dialog');
@@ -2558,56 +2980,17 @@ async function openModelSwitchModal(runId, step) {
 
   const currentModel = state.run?.results?.[step.id]?.model_id || step.model_id;
   const models = state.bootstrap?.models || [];
-  const run = state.run || {};
-  const readOnly = new Set(['reviewer', 'qa_tester', 'security_auditor', 'architect', 'researcher', 'analyzer']);
-  const writing = Boolean(run.allow_writes && !readOnly.has(step.persona));
-  const roleText = `${step.persona || ''} ${(step.title || '')} ${(step.prompt || '').slice(0, 400)}`.toLocaleLowerCase();
-  const role = ['review', 'audit', 'security', 'test', 'qa', 'incele', 'denet'].some(s => roleText.includes(s)) ? 'reviewer'
-    : ['plan', 'architect', 'mimar', 'tasarım', 'decompos'].some(s => roleText.includes(s)) ? 'architect'
-    : ['orchestrat', 'koordina', 'yönetic'].some(s => roleText.includes(s)) ? 'master'
-    : ['develop', 'frontend', 'backend', 'code', 'implement', 'kod', 'geliştir'].some(s => roleText.includes(s)) ? 'development'
-    : 'general';
-  const eligible = models.filter(m => {
-    const caps = new Set((m.capabilities || []).map(x => String(x).toLowerCase()));
-    return m.execution_supported !== false && !m.hidden && m.provider !== 'opencode'
-      && (!writing || m.provider !== 'ollama')
-      && (run.execution_backend !== 'ao' || m.provider === 'codex')
-      && (run.execution_backend !== 'cao' || ['codex', 'antigravity', 'ollama'].includes(m.provider))
-      && (caps.has(role) || (role === 'architect' && caps.has('master')));
+  // Kullanıcının sistemdeki tüm desteklenen modelleri seçebilmesini sağla (Ollama, OpenCode, Claude Code dahil)
+  const eligible = models.filter(isSelectableModel);
+
+  const firstAvailableId = renderModelOptgroups(select, eligible, {
+    currentModel,
+    cooldowns
   });
 
-  let firstAvailableId = null;
-
-  for (const m of eligible) {
-    const isCurrent = m.id === currentModel;
-    const cd = cooldowns[m.id];
-    const isCooldown = Boolean(cd && cd.remaining_seconds > 0);
-
-    let label = `${m.id} · ${m.provider.toUpperCase()}`;
-    if (isCurrent) {
-      label += ' (Mevcut Adım)';
-    }
-    if (isCooldown) {
-      const rem = cd.remaining_seconds;
-      const hours = Math.floor(rem / 3600);
-      const mins = Math.floor((rem % 3600) / 60);
-      const timeStr = hours > 0 ? `${hours} sa ${mins} dk` : `${mins} dk`;
-      label += ` · Kota bekliyor (${timeStr})`;
-    }
-
-    const opt = node('option', '', label);
-    opt.value = m.id;
-    if (isCurrent || isCooldown) {
-      opt.disabled = true;
-    } else if (!firstAvailableId) {
-      firstAvailableId = m.id;
-    }
-    select.append(opt);
-  }
-
-  // Kotası dolu olmayan ve mevcut olmayan öncelikli modeli seç (Gemini / Claude vb.)
+  // Kotası dolu olmayan ve mevcut olmayan öncelikli modeli seç (Gemini / Claude / Ollama vb.)
   const preferred = eligible.find(m => m.id !== currentModel && !cooldowns[m.id] &&
-    (m.provider === 'antigravity' || m.id.includes('gemini') || m.id.includes('claude')));
+    (m.provider === 'antigravity' || m.id.includes('gemini') || m.id.includes('claude') || m.provider === 'ollama'));
   if (preferred) {
     select.value = preferred.id;
   } else if (firstAvailableId) {
@@ -2805,30 +3188,42 @@ function openPlanEditor(run = inspectedPlan()) {
   $('#plan-dialog').showModal();
 }
 
+function isSelectableModel(model) {
+  const policy = state.bootstrap?.execution_policy;
+  return model.execution_supported !== false && !model.hidden &&
+    (!policy || policy.allowed_providers.includes(model.provider));
+}
+
 function populateModels() {
   const models = state.bootstrap?.models || [];
+  // Sistemden çekilen tüm desteklenen modelleri dahil et (Ollama, OpenCode, Claude Code, Antigravity, Codex)
+  const offered = models.filter(isSelectableModel);
+
   const select = $('#planner-model');
-  select.replaceChildren(node('option', '', 'Varsayılan model (Otomatik yönlendirme)'));
-  select.firstChild.value = '';
-  const offered = models.filter(model => model.execution_supported !== false && model.provider !== 'opencode');
-  for (const model of offered) {
-    const option = node('option', '', `${model.id} · ${model.provider}`);
-    option.value = model.id;
-    select.append(option);
-  }
+  renderModelOptgroups(select, offered, {
+    includeAuto: true,
+    autoLabel: '⚡ Varsayılan model (Otomatik yönlendirme)'
+  });
   if (offered.some(m => m.id === state.settings.planner_model)) {
     select.value = state.settings.planner_model;
   }
   $('#model-count').textContent = models.length;
+
   const chatSelect = $('#chat-model');
-  chatSelect.replaceChildren();
-  for (const model of offered) {
-    const option = node('option', '', `${model.id} · ${model.provider}`);
-    option.value = model.id;
-    chatSelect.append(option);
+  const cds = state.bootstrap?.model_cooldowns || {};
+  renderModelOptgroups(chatSelect, offered, { cooldowns: cds });
+
+  // Kota cooldown kontrolü: Eğer Codex veya seçili model kotada ise Gemini, Claude veya yerel modele devret
+  const isCooled = id => Boolean(cds[id] && cds[id].remaining_seconds > 0);
+  let preferred = state.settings.chat_model;
+  if (!preferred || isCooled(preferred) || !offered.some(m => m.id === preferred)) {
+    preferred = offered.find(m => m.id === 'gemini-3.8-flash-medium' && !isCooled(m.id))?.id
+      || offered.find(m => m.provider === 'antigravity' && !isCooled(m.id))?.id
+      || offered.find(m => (m.provider === 'claude-code' || m.runtime === 'claude-code') && !isCooled(m.id))?.id
+      || offered.find(m => m.provider === 'ollama' && !isCooled(m.id))?.id
+      || offered.find(m => !isCooled(m.id))?.id
+      || offered[0]?.id;
   }
-  const preferred = state.settings.chat_model || offered.find(model => model.id === 'gpt-6.1-sol')?.id
-    || offered.find(model => model.provider === 'codex')?.id || offered[0]?.id;
   if (preferred) chatSelect.value = preferred;
 }
 
@@ -2939,11 +3334,12 @@ $('#composer').addEventListener('submit', async event => {
       body: JSON.stringify({
         message: prompt, model_id: requestedModel, planner_model: state.settings.planner_model || 'auto',
         planning_level: $('#planning-level').value,
+        mode: 'orchestrate',
         conversation_run_id: previousId || '', client_run_id: clientRunId,
         workspace: state.activeProject?.path || state.settings.workspace || state.bootstrap.workspace_default,
         project_id: state.activeProject?.id || '', allow_writes: $('#allow-writes').checked,
         attachments, timeout_seconds: Number(state.settings.timeout_seconds || 1200),
-        max_parallel: Number(state.settings.max_parallel || 4),
+        max_parallel: $('#planning-level').value === 'parallel' ? 6 : Number(state.settings.max_parallel || 4),
         execution_backend: state.settings.execution_backend || 'cao'
       }),
       timeoutMs: 630000
@@ -3044,6 +3440,8 @@ $('#close-inspector').addEventListener('click', () => {
 // Terminal modal buttons
 const refreshBtn = $('#refresh-terminal-btn');
 if (refreshBtn) refreshBtn.addEventListener('click', refreshTerminalOutput);
+$('#terminal-modal').addEventListener('close', stopTerminalOutput);
+window.addEventListener('pagehide', stopTerminalOutput);
 const closeTermBtn = $('#close-terminal-modal');
 if (closeTermBtn) closeTermBtn.addEventListener('click', () => $('#terminal-modal').close());
 const dismissTermBtn = $('#dismiss-terminal-btn');
@@ -3071,6 +3469,29 @@ $('#prompt').addEventListener('keydown', event => {
   }
 });
 
+$('#prompt').addEventListener('input', () => {
+  const val = $('#prompt').value.trim();
+  if (val) {
+    if (mascot) mascot.dispatch({ event: 'chat.message' });
+    if (window.PikoConstellation) window.PikoConstellation.setMood('listening', 'Sizi dinliyorum...');
+  } else {
+    updateMascot(state.run);
+    if (window.PikoConstellation && !state.run) window.PikoConstellation.setMood('idle');
+  }
+});
+
+$('#prompt').addEventListener('focus', () => {
+  if (window.PikoConstellation && !state.run) {
+    window.PikoConstellation.setMood('listening', 'Sizi dinliyorum...');
+  }
+});
+
+$('#prompt').addEventListener('blur', () => {
+  if (window.PikoConstellation && !state.run && !$('#prompt').value.trim()) {
+    window.PikoConstellation.setMood('idle');
+  }
+});
+
 document.addEventListener('keydown', event => {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'n') {
     event.preventDefault();
@@ -3083,7 +3504,7 @@ document.addEventListener('keydown', event => {
 });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) clearTimeout(state.timer);
-  else schedulePoll(0);
+  else { schedulePoll(0); refreshRecentInBackground(); }
 });
 
 $('#planner-model').addEventListener('change', () => {
@@ -3215,7 +3636,17 @@ $('#scope-all-btn')?.addEventListener('click', () => {
 async function initialize() {
   try {
     state.bootstrap = await api('/api/bootstrap');
+    const parallelOption = $('#planning-level option[value="parallel"]');
+    parallelOption.disabled = state.bootstrap.features?.isolated_parallel_planning !== true;
+    parallelOption.title = parallelOption.disabled ? 'Sunucu güncellemesi bekleniyor' : 'Bağımsız işleri gerektiğinde ortak kapasiteyle yürüt';
+    if (parallelOption.disabled && $('#planning-level').value === 'parallel') {
+      $('#planning-level').value = 'balanced';
+      state.settings.planning_level = 'balanced';
+      save('agent-manager-settings', state.settings);
+    }
+
     connected(true);
+    startMascotHeartbeat();
     $('#version-label').textContent = `Piko ${state.bootstrap.version || ''}`;
     applySettings();
     bindWorkUi();
@@ -3227,8 +3658,17 @@ async function initialize() {
     await loadTriggersStats();
     $('#footer-state').textContent = 'Hazır';
     await refreshRuns();
-    const id = load('agent-manager-selected', null);
+    const linkedId = new URL(location.href).searchParams.get('run');
+    const id = /^[a-f0-9]{32}$/.test(linkedId || '') ? linkedId : load('agent-manager-selected', null);
+    if (linkedId && id === linkedId) {
+      state.recentScope = 'all';
+      $('#scope-all-btn')?.classList.add('active');
+      $('#scope-project-btn')?.classList.remove('active');
+      renderRecent();
+    }
+    startRecentRefresh();
     if (id) await selectRun(id);
+    else updateMascot(null);
   } catch (error) {
     connected(false);
     $('#footer-state').textContent = 'Sunucuya bağlanılamadı';
@@ -3258,12 +3698,104 @@ initialize().finally(() => {
 /* ---------- Ortak iş kaydı, teslim masası, bildirimler ve görünüm ---------- */
 const workState = { jobs: {}, loading: {} };
 
-const mascotStates = {
-  working: ['queued', 'planning', 'running', 'waiting_quota'],
-  waiting: ['planned', 'awaiting_user_test', 'awaiting_review'],
-  blocked: ['failed', 'interrupted'],
-  done: ['completed']
+const mascot = (() => {
+  const stage = document.getElementById('piko-mascot-stage');
+  if (!stage || typeof initMascot !== 'function') return null;
+  return initMascot(stage, { spriteUrl: '#' });
+})();
+
+const mascotRunEvents = {
+  queued: 'run.queued',
+  planning: 'run.planning',
+  running: 'run.running',
+  completed: 'run.completed',
+  cancelled: 'run.cancelled',
+  failed: 'run.failed',
+  interrupted: 'run.interrupted'
 };
+
+const mascotDeliverableStates = new Set([
+  'draft', 'delivered', 'repair_requested', 'test_pending', 'test_passed', 'test_failed'
+]);
+
+function updateMascot(run) {
+  if (window.PikoConstellation) {
+    window.PikoConstellation.updateState({ run, job: workState.jobs[run?.id], state });
+  }
+
+  const dispatchBoth = payload => {
+    if (window.PikoConstellation) {
+      window.PikoConstellation.dispatch(payload);
+    }
+    if (mascot) {
+      return mascot.dispatch(payload);
+    }
+  };
+
+  if (!run) {
+    return dispatchBoth({ event: 'idle' });
+  }
+
+  const job = workState.jobs[run.id];
+  const work = job?.work;
+  const deliverables = job?.deliverables || [];
+  const latest = deliverables[deliverables.length - 1];
+  const workId = work?.id || run.id;
+
+  if (run.status === 'failed' || run.status === 'interrupted' || (work?.status === 'blocked' && !activeStatuses.has(run.status))) {
+    const reason = run.error || work?.last_result || statusLabels[run.status] || 'Müdahale gerekiyor.';
+    return dispatchBoth({ event: 'work.blocked', work_id: workId, reason });
+  }
+
+  if (latest && mascotDeliverableStates.has(latest.status)) {
+    return dispatchBoth({
+      event: 'deliverable.updated',
+      work_id: workId,
+      deliverable_status: latest.status,
+      reason: latest.title || latest.summary || ''
+    });
+  }
+
+  const waiting = decisionWaiting(work);
+  if (waiting || ['planned', 'awaiting_review', 'awaiting_user_test', 'waiting_quota'].includes(run.status)) {
+    return dispatchBoth({
+      event: 'work.waiting',
+      work_id: workId,
+      reason: waiting?.question || statusLabels[run.status] || ''
+    });
+  }
+
+  const event = mascotRunEvents[run.status];
+  if (event) {
+    const reason = activeStatuses.has(run.status) && run.current_steps?.length
+      ? run.current_steps.join(', ') : undefined;
+    return dispatchBoth({ event, work_id: workId, reason });
+  }
+
+  return dispatchBoth({ event: 'idle', work_id: workId });
+}
+
+let mascotHeartbeatTimer = null;
+
+async function pollMascotHealth() {
+  if (!mascot) return;
+  try {
+    const health = await api('/api/health', { timeoutMs: 5000 });
+    const alive = health.daemon_alive !== false;
+    mascot.setHeartbeatAlive(alive);
+    const trouble = !alive || health.kill_switch
+      || (Array.isArray(health.stale_runs) && health.stale_runs.length > 0);
+    if (trouble) mascot.dispatch({ event: 'health_report', ...health });
+  } catch {
+    /* Ulaşılamayan sunucu canlılık sinyali üretmez; mascot.js 120 sn sonra uyur. */
+  }
+}
+
+function startMascotHeartbeat() {
+  if (!mascot || mascotHeartbeatTimer !== null) return;
+  mascotHeartbeatTimer = setInterval(pollMascotHealth, 30000);
+  setTimeout(pollMascotHealth, 5000);
+}
 
 function applyView(view = state.view || 'piko') {
   state.view = view === 'developer' ? 'developer' : 'piko';
@@ -3278,29 +3810,6 @@ function applyView(view = state.view || 'piko') {
     $('#inspector')?.classList.add('open');
     $('#toggle-inspector')?.setAttribute('aria-expanded', 'true');
   }
-}
-
-function mascotState(run) {
-  if (!run) return { state: 'idle', label: 'Hazır' };
-  const status = run.status;
-  if (mascotStates.done.includes(status)) return { state: 'done', label: 'Tamamlandı' };
-  if (mascotStates.blocked.includes(status)) return { state: 'blocked', label: 'Müdahale gerekiyor' };
-  if (status === 'awaiting_user_test') return { state: 'waiting', label: 'Test yanıtı bekliyor' };
-  if (mascotStates.waiting.includes(status)) return { state: 'waiting', label: 'Onay bekliyor' };
-  if (mascotStates.working.includes(status)) {
-    return { state: 'working', label: run.current_steps?.length ? 'Ajanlar çalışıyor' : 'Çalışıyor' };
-  }
-  return { state: 'idle', label: statusLabels[status] || 'Hazır' };
-}
-
-function updateMascot(run) {
-  const mascot = $('#piko-mascot');
-  if (!mascot) return;
-  const info = mascotState(run);
-  mascot.dataset.state = info.state;
-  mascot.setAttribute('aria-label', `Piko durumu: ${info.label}`);
-  const label = $('#mascot-label');
-  if (label) label.textContent = info.label;
 }
 
 async function loadWorkForRun(run) {
@@ -3326,11 +3835,48 @@ function decisionWaiting(work) {
   return (work?.decisions || []).find(item => item.status === 'waiting');
 }
 
+function evidenceBlock(deliverable) {
+  const view = deliverable.evidence_view || {};
+  const block = node('div', 'delivery-section evidence-block');
+  block.append(node('strong', '', 'Kanıt'));
+  if (view.complete === false) {
+    block.append(node('span', 'status-badge evidence-missing',
+      `eksik kanıt: ${(view.missing || []).join(', ') || 'kanıt yok'}`));
+  } else if (view.bridge) {
+    block.append(node('span', 'status-badge evidence-ok', 'kanıt tam'));
+  }
+  if (view.summary) block.append(node('div', 'evidence-summary', view.summary));
+  if (view.branch) block.append(node('div', 'evidence-line', `dal: ${view.branch}`));
+  for (const link of view.links || []) {
+    const anchor = node('a', 'evidence-line evidence-link', link);
+    anchor.href = link;
+    anchor.target = '_blank';
+    anchor.rel = 'noreferrer';
+    block.append(anchor);
+  }
+  if ((view.short_hashes || []).length) {
+    const hashes = node('div', 'worker-meta');
+    for (const hash of view.short_hashes) hashes.append(node('span', 'worker-id-pill', `sha256 ${hash}`));
+    block.append(hashes);
+  }
+  const lines = view.lines || deliverable.evidence || [];
+  if (lines.length) {
+    const list = node('ul', 'evidence-lines');
+    for (const line of lines) list.append(node('li', '', String(line)));
+    block.append(list);
+  }
+  return block;
+}
+
 function deliveryCard(deliverable) {
   const card = node('article', 'delivery-card');
   const head = node('div', 'delivery-card-head');
   const title = node('div', '');
-  title.append(node('b', '', deliverable.title || 'Teslim'), node('span', 'delivery-version', `v${deliverable.version}`));
+  title.append(node('b', '', deliverable.title || 'Teslim'),
+    node('span', 'delivery-version',
+      deliverable.parent_version
+        ? `v${deliverable.version} · v${deliverable.parent_version} üzerinden`
+        : `v${deliverable.version}`));
   const labels = {
     accepted: 'Kabul edildi', repair_requested: 'Düzeltme istendi',
     test_failed: 'Test başarısız', test_passed: 'Test geçti', test_pending: 'Test bekleniyor'
@@ -3338,6 +3884,12 @@ function deliveryCard(deliverable) {
   head.append(title, node('span', `status-badge status-${deliverable.status}`,
     labels[deliverable.status] || 'İncelemeye hazır'));
   card.append(head);
+  const clusterTag = node('div', 'chat-cluster-agents');
+  const cBadge = node('span', 'cluster-badge', deliverable.cluster_title || 'Paralel Plan Kümesi: Doğrulama');
+  const agent1 = node('span', 'agent-pill verifier', '🟢 Denetçi (Verifier)');
+  const agent2 = node('span', 'agent-pill coder', '🔵 Geliştirici (Coder)');
+  clusterTag.append(cBadge, agent1, agent2);
+  card.append(clusterTag);
   card.append(node('div', 'delivery-summary', deliverable.summary || ''));
   if (deliverable.requirements?.length) {
     const block = node('div', 'delivery-section');
@@ -3347,16 +3899,9 @@ function deliveryCard(deliverable) {
     block.append(list);
     card.append(block);
   }
+  card.append(evidenceBlock(deliverable));
   const details = node('details', 'delivery-details technical');
   details.append(node('summary', 'details-toggle', 'Ayrıntıları göster'));
-  if (deliverable.evidence?.length) {
-    const block = node('div', 'delivery-section');
-    block.append(node('strong', '', 'Doğrulama kanıtları'));
-    const list = node('ul', '');
-    for (const item of deliverable.evidence) list.append(node('li', '', item));
-    block.append(list);
-    details.append(block);
-  }
   if (deliverable.open_points?.length) {
     const block = node('div', 'delivery-section');
     block.append(node('strong', '', 'Açık kalan noktalar'));
@@ -3375,9 +3920,19 @@ function deliveryCard(deliverable) {
 
   const actions = node('div', 'delivery-actions');
   if (deliverable.status !== 'accepted') {
-    actions.append(button('Kabul et', 'primary-button', () => actOnDelivery(deliverable, 'accept')));
+    const accept = button('Kabul et', 'primary-button', () => actOnDelivery(deliverable, 'accept'));
+    const incomplete = deliverable.evidence_view?.complete === false;
+    const cannotAccept = incomplete || deliverable.can_accept === false || deliverable.is_latest === false;
+    if (cannotAccept) {
+      accept.disabled = true;
+      accept.title = deliverable.accept_block_reason || (deliverable.is_latest === false
+        ? 'Bu önceki bir teslim sürümü. Güncel teslimi inceleyin.'
+        : 'Kanıt eksik olduğu için teslim kabul edilemez.');
+    }
+    actions.append(accept);
   }
-  actions.append(button('Düzeltme iste', 'outline-button', () => actOnDelivery(deliverable, 'repair')));
+  actions.append(button('Düzelt', 'outline-button', () => actOnDelivery(deliverable, 'repair')));
+  actions.append(button('Şunu dene', 'outline-button', () => actOnDelivery(deliverable, 'try')));
   actions.append(button('Test sonucu bildir', 'outline-button', () => actOnDelivery(deliverable, 'test')));
   card.append(actions);
   return card;
@@ -3385,8 +3940,13 @@ function deliveryCard(deliverable) {
 
 async function actOnDelivery(deliverable, action) {
   let body = {};
-  if (action === 'repair' || action === 'test') {
-    const note = window.prompt(action === 'repair' ? 'Neyin düzeltilmesini istiyorsunuz?' : 'Test sonucunuzu kısaca yazın (geçti/kaldı ayrıntısı).', '');
+  const prompts = {
+    repair: 'Neyin düzeltilmesini istiyorsunuz?',
+    try: 'Piko şunu denesin:',
+    test: 'Test sonucunuzu kısaca yazın (geçti/kaldı ayrıntısı).'
+  };
+  if (prompts[action]) {
+    const note = window.prompt(prompts[action], '');
     if (note === null) return;
     if (!note.trim()) { toast('Kısa bir açıklama gerekli.'); return; }
     body.note = note.trim();
@@ -3397,6 +3957,7 @@ async function actOnDelivery(deliverable, action) {
       method: 'POST', body: JSON.stringify(body)
     });
     toast(action === 'accept' ? 'Teslim kabul edildi.'
+      : action === 'try' ? 'Öneri onarım kuyruğuna eklendi.'
       : action === 'repair' ? 'Düzeltme isteği kaydedildi.' : 'Test sonucu kaydedildi.');
     if (state.run) {
       delete workState.jobs[state.run.id];
@@ -3455,11 +4016,58 @@ function renderWorkPanel(run, container) {
   container.append(panel);
 }
 
+async function answerWorkDecision(workId, decisionId, answer) {
+  await api(`/api/work/${encodeURIComponent(workId)}/decisions/${encodeURIComponent(decisionId)}/answer`, {
+    method: 'POST', body: JSON.stringify({answer})
+  });
+  toast('Karar kaydedildi.');
+  if (state.run) {
+    delete workState.jobs[state.run.id];
+    await loadWorkForRun(state.run);
+  }
+  refreshNotifications();
+  openNotifications();
+}
+
+function notificationActions(item) {
+  const holder = node('div', 'notification-actions');
+  if (!item.work_id) return holder;
+  api(`/api/work/${encodeURIComponent(item.work_id)}`).then(job => {
+    const work = job.work || {};
+    const decision = decisionWaiting(work);
+    const latest = (job.deliverables || []).slice(-1)[0];
+    if (decision) {
+      holder.append(button('Kabul et', 'primary-button',
+        () => answerWorkDecision(work.id, decision.id, 'Kabul ediyorum').catch(e => toast(errorText(e)))));
+      holder.append(button('Düzelt', 'outline-button', async () => {
+        const note = window.prompt('Neyin düzeltilmesini istiyorsunuz?', '');
+        if (!note?.trim()) return;
+        answerWorkDecision(work.id, decision.id, `Düzelt: ${note.trim()}`).catch(e => toast(errorText(e)));
+      }));
+      holder.append(button('Şunu dene', 'outline-button', async () => {
+        const note = window.prompt('Piko şunu denesin:', '');
+        if (!note?.trim()) return;
+        answerWorkDecision(work.id, decision.id, `Şunu dene: ${note.trim()}`).catch(e => toast(errorText(e)));
+      }));
+    } else if (latest && latest.status !== 'accepted') {
+      holder.append(button('Kabul et', 'primary-button',
+        () => actOnDelivery(latest, 'accept')));
+      holder.append(button('Düzelt', 'outline-button',
+        () => actOnDelivery(latest, 'repair')));
+      holder.append(button('Şunu dene', 'outline-button',
+        () => actOnDelivery(latest, 'try')));
+    }
+    if (!holder.children.length) holder.remove();
+  }).catch(() => holder.remove());
+  return holder;
+}
+
 function notificationItem(item) {
   const card = node('article', `notification-item${item.read ? '' : ' unread'}`);
   card.append(node('b', '', item.title || item.kind));
   if (item.body) card.append(node('p', '', item.body));
   card.append(node('time', '', new Date(item.created_at).toLocaleString('tr-TR')));
+  card.append(notificationActions(item));
   if (!item.read) {
     card.append(button('Okundu', 'outline-button', async () => {
       try {
@@ -3672,8 +4280,10 @@ function bridgeCard(status) {
   const lastTitle = node('div', '');
   lastTitle.append(node('b', '', last.title || 'Teslim'),
     node('span', 'delivery-version', `v${last.version}`));
+  const lastLabels = {accepted: 'Kabul edildi', repair_requested: 'Düzeltme istendi'};
   lastHead.append(lastTitle,
-    node('span', `status-badge status-${last.status}`, last.status));
+    node('span', `status-badge status-${last.status}`,
+      lastLabels[last.status] || last.status));
   card.append(lastHead);
   card.append(node('div', 'delivery-summary', last.summary || ''));
 
@@ -3685,14 +4295,7 @@ function bridgeCard(status) {
     block.append(list);
     card.append(block);
   }
-  if (last.evidence?.length) {
-    const block = node('div', 'delivery-section');
-    block.append(node('strong', '', 'Kanıt'));
-    const list = node('ul', '');
-    for (const line of last.evidence) list.append(node('li', '', String(line)));
-    block.append(list);
-    card.append(block);
-  }
+  if (last.evidence?.length || last.evidence_view) card.append(evidenceBlock(last));
   card.append(node('small', '', `Teslim ${new Date(last.created_at).toLocaleString('tr-TR')}`));
   return card;
 }

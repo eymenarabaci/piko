@@ -4,7 +4,8 @@ import httpx
 import pytest
 from types import SimpleNamespace
 
-from manager.cao import CAOClient, CAOError, CAONoResponse
+from manager.cao import (CAOClient, CAOError, CAONoResponse, bound_cao_prompt,
+                         looks_like_internal_echo)
 from manager.engine import Engine
 from manager.local_edits import LocalEditError
 
@@ -241,3 +242,21 @@ async def test_cao_error_recovers_quota_from_current_scrollback_when_raw_log_tai
     monkeypatch.setattr(httpx, "AsyncClient", lambda **_: FakeHTTPClient())
     with pytest.raises(CAOError, match="Individual quota reached"):
         await client.request("POST", "/terminals/run-step")
+
+
+def test_bound_cao_prompt_keeps_head_and_tail():
+    prompt = "HEAD " + ("x" * 20000) + " STEP_INSTRUCTION"
+    clipped = bound_cao_prompt(prompt, limit=1200)
+    assert len(clipped) <= 1200
+    assert clipped.startswith("HEAD")
+    assert clipped.endswith("STEP_INSTRUCTION")
+    assert bound_cao_prompt("kisa", limit=1200) == "kisa"
+
+
+def test_internal_echo_marker_detection_ignores_real_answers():
+    echoed = ("Varsayilanim olarak is" + " " * 400)
+    preamble = ("Varsay\u0131lan olarak i\u015fi kendin tamamla. " + "a" * 500 +
+                " === \u0130\u015e\u0130N D\u0130L\u0130M\u0130 ===")
+    assert looks_like_internal_echo(preamble) is True
+    assert looks_like_internal_echo(
+        "src/App.tsx duzeltildi, derleme gecti. " + "b" * 500) is False

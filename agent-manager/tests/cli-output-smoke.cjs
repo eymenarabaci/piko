@@ -1,0 +1,25 @@
+const fs=require('node:fs'),path=require('node:path'),cp=require('node:child_process');
+const {chromium}=require(path.join(process.env.USERPROFILE,'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'));
+const root=path.resolve(__dirname,'..'),out=path.join(root,'work/terminal-proof');fs.mkdirSync(out,{recursive:true});
+const python=path.join(root,'.venv/Scripts/python.exe');let server,browser,entry;
+function record(state){const code='import sys,json,psutil; from pathlib import Path; from manager.processes import _record; p=psutil.Process(int(sys.argv[1])); e={"resource_id":"visibility-browser-"+str(p.pid)+"-"+str(p.create_time()),"owner_task":"piko-visibility-planner-fix","pid":p.pid,"created_utc":__import__("datetime").datetime.fromtimestamp(p.create_time(),__import__("datetime").timezone.utc).isoformat(),"executable_path":p.exe(),"parent_pid":p.ppid(),"shared":False,"disposable":True,"state":"running"}; _record(Path.cwd(),e); print(json.dumps(e))';entry=JSON.parse(cp.execFileSync(python,['-B','-c',code,String(server.process().pid)],{cwd:root,encoding:'utf8'}));}
+(async()=>{const errors=[],network=[],checks=[];try{
+ server=await chromium.launchServer({headless:true,executablePath:'C:/Program Files/Google/Chrome/Application/chrome.exe'});record();
+ browser=await chromium.connect(server.wsEndpoint());const page=await browser.newPage({viewport:{width:1440,height:1000}});
+ page.on('pageerror',e=>errors.push(e.message));page.on('console',e=>{if(e.type()==='error')errors.push(e.text())});page.on('response',r=>{if(r.status()>=400)network.push([r.status(),r.url()])});
+ const url='http://127.0.0.1:8765/?run=2c256f9cab3d4d2491883b56e1906d12';
+ async function openOutput(){await page.locator('#view-dev').click();if(!(await page.locator('#inspector').getAttribute('class')).includes('open'))await page.locator('#toggle-inspector').click();
+ await page.locator('.inspector-more > summary').click();await page.locator('[data-tab="terminals"]').click(); const live=page.getByRole('button',{name:'Canlı çıktıyı aç',exact:true});const audit=page.getByRole('button',{name:'Denetçi çıktısını aç',exact:true});const saved=page.getByRole('button',{name:'Terminal Çıktısını Aç',exact:true});
+ if(await live.count())await live.first().click();else if(await audit.count())await audit.first().click();else await saved.first().click();await page.locator('#terminal-modal').waitFor();}
+ await page.route('**/api/bootstrap',async route=>{const response=await route.fetch();const data=await response.json();delete data.features.cli_live_output;await route.fulfill({json:data});}); await page.goto(url);await page.waitForLoadState('networkidle');await openOutput();await page.getByText(/Salt okunur stdout/).first().waitFor();
+ if((await page.locator('#terminal-modal-title').textContent()).includes('ConPTY'))throw Error('CLI incorrectly labeled ConPTY');
+ checks.push('actual-evren-output-button-enabled-without-cao-id');checks.push('live-api-works-despite-stale-bootstrap-capability');checks.push('readonly-cli-label-and-process-status');
+ await page.screenshot({path:path.join(out,'actual-cli-output-dialog.png'),fullPage:true});await page.locator('#close-terminal-modal').click();
+ const bootstrap=await (await page.request.get('http://127.0.0.1:8765/api/bootstrap')).json();let requests=0;
+ await page.route('**/api/bootstrap',route=>route.fulfill({json:{...bootstrap,features:{...bootstrap.features,cli_live_output:true}}}));
+ await page.route('**/live-output',route=>{requests++;route.fulfill({json:{kind:'cli',read_only:true,state:'running',run_state:'running',output:requests>1?'Birinci satır\nİkinci satır':'Birinci satır',pid:321,elapsed_seconds:42,idle_seconds:1,received_bytes:80,source_step_id:'adim_4'}})});
+ await page.reload();await page.waitForLoadState('networkidle');await openOutput();await page.locator('#terminal-modal-output').filter({hasText:'İkinci satır'}).waitFor({timeout:7000});checks.push('live-output-updates-every-two-seconds');
+ if(!(await page.locator('#terminal-modal-subtitle').textContent()).includes('PID 321'))throw Error('Missing real process metadata');checks.push('pid-elapsed-idle-byte-metadata');
+ await page.screenshot({path:path.join(out,'streaming-cli-output-fixture.png'),fullPage:true});await page.locator('#close-terminal-modal').click();const atClose=requests;await page.waitForTimeout(2500);if(requests!==atClose)throw Error('Output polling leaked after close');checks.push('polling-stops-on-modal-close');
+ const report={checks,errors,network,fixture:'Second phase uses browser-only output fixture; real running task was not changed.'};fs.writeFileSync(path.join(out,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify(report));if(errors.length||network.length)process.exitCode=1;
+ }catch(e){console.error(e.stack);process.exitCode=1;}finally{if(browser)await browser.close();if(server)await server.close();if(entry){entry.state='completed';cp.execFileSync(python,['-B','-c','import sys,json; from pathlib import Path; from manager.processes import _record; _record(Path.cwd(),json.loads(sys.argv[1]))',JSON.stringify(entry)],{cwd:root});}}})();

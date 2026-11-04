@@ -49,12 +49,12 @@ async def test_deliverable_versions_keep_repair_lineage(tmp_path):
     await manager.open()
     item = await manager.create("Site yap")
     v1 = await manager.add_deliverable(item["id"], summary="İlk sürüm",
-                                       idempotency_key="deliver-1")
+                                       evidence=["test: ana sayfa açıldı"], idempotency_key="deliver-1")
     duplicate = await manager.add_deliverable(item["id"], summary="İlk sürüm",
-                                              idempotency_key="deliver-1")
+                                              evidence=["test: ana sayfa açıldı"], idempotency_key="deliver-1")
     assert duplicate["id"] == v1["id"]
     await manager.request_repair(v1["id"], "Başlık eksik")
-    v2 = await manager.add_deliverable(item["id"], summary="Başlık eklendi")
+    v2 = await manager.add_deliverable(item["id"], summary="Başlık eklendi", evidence=["test: başlık görünür"])
     assert v2["version"] == 2
     assert v2["parent_version"] == 1
 
@@ -68,7 +68,7 @@ async def test_user_test_result_is_recorded_separately(tmp_path):
     manager = WorkRecordManager(tmp_path / "work.sqlite")
     await manager.open()
     item = await manager.create("Mobil ekranı dene")
-    deliverable = await manager.add_deliverable(item["id"], summary="Ekran hazır")
+    deliverable = await manager.add_deliverable(item["id"], summary="Ekran hazır", evidence=["önizleme: ekran görüntüsü hazır"])
     updated = await manager.record_test(deliverable["id"], False, "Buton görünmüyor")
     assert updated["status"] == "test_failed"
     work = await manager.get(item["id"])

@@ -98,13 +98,14 @@ def test_apply_requires_a_single_use_approval_token():
     with pytest.raises(PermissionError):
         gate.check(adapter.APPROVER_PERSONA, BRIDGE_ID, "apply",
                    idempotency_key="k1")
+    token = gate.issue_approval(BRIDGE_ID, "apply")
     first = gate.check(adapter.APPROVER_PERSONA, BRIDGE_ID, "apply",
-                       idempotency_key="k1", approval_token="token-once")
+                       idempotency_key="k1", approval_token=token)
     assert first["approval_used"] is True
     assert first["ledger_key"].startswith(BRIDGE_ID + ":apply:")
     with pytest.raises(PermissionError):
         gate.check(adapter.APPROVER_PERSONA, BRIDGE_ID, "apply",
-                   idempotency_key="k2", approval_token="token-once")
+                   idempotency_key="k2", approval_token=token)
 
 
 def test_manager_persona_cannot_apply_even_with_a_token():
@@ -200,7 +201,7 @@ def test_delivery_read_draft_apply_evidence_end_to_end(workspace: Path):
     assert not (workspace / "raporlar").exists(), "onaysiz apply yazmamali"
 
     draft = flow.draft_payload(request)
-    approval = flow.issue_approval(draft)
+    approval = flow.issue_approval(draft, gate=gate, target="raporlar", workspace=str(workspace))
     result = flow.deliver(
         gate, persona=adapter.MANAGER_PERSONA, request=request, target="raporlar",
         approval_token=approval["approval_token"], idempotency_key="veri-1",

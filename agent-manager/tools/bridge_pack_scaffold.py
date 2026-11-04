@@ -142,27 +142,30 @@ def test_dangerous_requires_single_use_token():
     gate = BridgeGate(_registry())
     with pytest.raises(PermissionError):
         gate.check("implementer", BRIDGE_ID, "dangerous", idempotency_key="smoke-key")
+    token = gate.issue_approval(BRIDGE_ID, "dangerous")
     first = gate.check("implementer", BRIDGE_ID, "dangerous",
                        idempotency_key="smoke-key",
-                       approval_token="smoke-approval-token")
+                       approval_token=token)
     assert first["approval_used"] is True
     assert first["ledger_key"].startswith(BRIDGE_ID + ":dangerous:")
     with pytest.raises(PermissionError):
         gate.check("implementer", BRIDGE_ID, "dangerous",
                    idempotency_key="smoke-key-2",
-                   approval_token="smoke-approval-token")
+                   approval_token=token)
 '''
 
     if top_level == "dangerous":
         gate_call = '''    gate = BridgeGate(_registry())
+    token = gate.issue_approval(BRIDGE_ID, "dangerous")
     result = gate.check("implementer", BRIDGE_ID, "dangerous",
                         idempotency_key="smoke-key",
-                        approval_token="smoke-approval-token")'''
+                        approval_token=token)'''
     else:
         gate_call = f'''    gate = BridgeGate(_registry())
+    token = gate.issue_approval(BRIDGE_ID, {top_level!r}) if {top_level!r} in {{"apply", "dangerous"}} else None
     result = gate.check(_persona(), BRIDGE_ID, {top_level!r},
                         idempotency_key="smoke-key",
-                        approval_token="smoke-approval-token")'''
+                        approval_token=token)'''
 
     return f'''"""Contract test for the {bridge_id} bridge pack."""
 from __future__ import annotations

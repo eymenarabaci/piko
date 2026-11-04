@@ -1069,13 +1069,7 @@ dialog#project-dialog::backdrop {
 .notification-button{position:relative;font-size:11px;padding:6px 9px;border:1px solid #e1e9f5;border-radius:6px;color:#5f718d;white-space:nowrap}
 .notification-button.has-unread{border-color:#9eb7ff;color:#3d65bc;background:#f4f8ff}
 .notification-count{display:inline-grid;place-items:center;min-width:16px;height:16px;margin-left:5px;padding:0 4px;border-radius:99px;background:#4d7cfe;color:#fff;font-size:9px}
-.piko-mascot{display:flex;align-items:center;gap:7px;font-size:10px;color:#6a7c98;white-space:nowrap}
-.mascot-face{width:22px;height:22px;border-radius:50%;background:#eaf0fc;border:1px solid #cfdcf5;display:grid;place-items:center;font-size:12px;line-height:1;transition:background .3s,transform .3s}
-.piko-mascot[data-state="working"] .mascot-face{background:#e3edff;border-color:#a9c2ff;animation:mascot-bounce 1.4s infinite}
-.piko-mascot[data-state="waiting"] .mascot-face{background:#fff7e3;border-color:#f0d9a6}
-.piko-mascot[data-state="blocked"] .mascot-face{background:#fdeef0;border-color:#f0c3ca}
-.piko-mascot[data-state="done"] .mascot-face{background:#e5f5ee;border-color:#a9d8c3}
-@keyframes mascot-bounce{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
+
 .delivery-card{border:1px solid #dbe6f7;border-radius:10px;background:#fff;padding:15px 17px;margin:14px 0;box-shadow:0 2px 10px #1020390a}
 .delivery-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap}
 .delivery-card-head b{font-size:13px}
@@ -1101,7 +1095,7 @@ body.view-piko #toggle-inspector{display:none}
 .notification-preferences label{font-size:10px;color:#637b9a}
 .notification-preferences input,.notification-preferences select{display:block;width:100%;margin-top:4px;padding:7px;border:1px solid #d6dfed;border-radius:5px;font-size:11px;background:#fff}
 .choice-dialog-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
-@media(max-width:650px){.view-switch button{padding:5px 7px}.notification-button{padding:5px 7px;font-size:10px}.notification-preferences{grid-template-columns:1fr}.piko-mascot{font-size:9px}}
+@media(max-width:650px){.view-switch button{padding:5px 7px}.notification-button{padding:5px 7px;font-size:10px}.notification-preferences{grid-template-columns:1fr}}
 
 /* Bridge pack card (developer view) */
 .bridge-cards{display:grid;gap:10px}
@@ -1109,3 +1103,13 @@ body.view-piko #toggle-inspector{display:none}
 .bridge-card h4{margin:4px 0 0;font-size:11px;color:#465c7e;font-weight:600}
 .bridge-card .delivery-section{margin:2px 0}
 .bridge-card .worker-meta{margin:2px 0 4px}
+
+.evidence-block{border-left:3px solid #cfdcef;background:#f8fbff;padding:8px 10px;border-radius:6px}
+.evidence-summary{font-weight:600;color:#2c3e5a;font-size:11px}
+.evidence-line{display:block;font-size:11px;color:#3d65bc;margin-top:2px}
+.evidence-link{text-decoration:underline;word-break:break-all}
+.evidence-lines{margin:5px 0 0;padding-left:16px;color:#5c6f8c}
+.status-badge.evidence-missing{background:#fdecec;color:#b42318;border:1px solid #f5c2c0}
+.status-badge.evidence-ok{background:#e8f7ef;color:#1d7a46;border:1px solid #b6e3c8}
+.notification-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
+.notification-actions button{font-size:10px;padding:6px 9px;border-radius:5px}

@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from manager.resource_locks import LockTimeout, ResourceLocks
+from manager.resource_locks import LockTimeout, LeaseLost, ResourceLocks
 
 
 @pytest.fixture
@@ -79,3 +79,62 @@ async def test_different_resources_do_not_conflict(locks):
     assert (await locks.holder("kicad:proje-y"))["run_id"] == "run-b"
     await one.release()
     await two.release()
+
+
+async def test_renewal_preserves_ownership_beyond_original_expiry(locks, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from manager import resource_locks
+    clock = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+    monkeypatch.setattr(resource_locks, "_now", lambda: clock[0])
+    lease = await locks.acquire("project:long", "run-a", timeout=0, ttl=60)
+    clock[0] += timedelta(seconds=40)
+    await lease.renew(60)
+    clock[0] += timedelta(seconds=40)
+    await lease.assert_owned()
+    with pytest.raises(LockTimeout):
+        await locks.acquire("project:long", "run-b", timeout=0, ttl=60)
+    await lease.release()
+
+
+async def test_live_same_run_cannot_steal_but_dead_owner_can_be_recovered(tmp_path, monkeypatch):
+    """A restarted driver takes its own workspace back at once.
+
+    Crashing mid-run used to park the job for the whole lease TTL because the
+    dead process left its token behind. Cross-process double-driving is closed
+    by the single-instance driver lock instead, so the run itself is allowed to
+    reclaim — and the abandoned token is invalidated so it can never renew.
+    """
+    one, two = ResourceLocks(tmp_path / "locks.sqlite"), ResourceLocks(tmp_path / "locks.sqlite")
+    await one.open(); await two.open()
+    try:
+        stale = await one.acquire("workspace:a", "same-run", timeout=0, ttl=60)
+        with pytest.raises(LockTimeout):
+            await two.acquire("workspace:a", "same-run", timeout=0, ttl=60)
+        await stale.assert_owned()
+        monkeypatch.setattr('manager.resource_locks._owner_alive', lambda _: False)
+        reclaimed = await two.acquire("workspace:a", "same-run", timeout=0, ttl=60)
+        assert (await two.holder("workspace:a"))["token"] == reclaimed.token
+        with pytest.raises(LeaseLost):
+            await stale.assert_owned()
+        with pytest.raises(LeaseLost):
+            await stale.renew(60)
+        await reclaimed.release()
+        assert await two.holder("workspace:a") is None
+    finally:
+        await one.close(); await two.close()
+
+
+async def test_stale_release_cannot_delete_replacement_with_same_run_id(locks, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from manager import resource_locks
+    clock = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+    monkeypatch.setattr(resource_locks, "_now", lambda: clock[0])
+    old = await locks.acquire("workspace:a", "same-run", timeout=0, ttl=10)
+    clock[0] += timedelta(seconds=11)
+    new = await locks.acquire("workspace:a", "same-run", timeout=0, ttl=60)
+    assert old.token != new.token
+    with pytest.raises(LeaseLost):
+        await old.renew(60)
+    await old.release()
+    await new.assert_owned()
+    await new.release()

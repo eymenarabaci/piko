@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+from pathlib import Path
 
 from . import office
 
@@ -12,12 +13,19 @@ def draft_payload(request: dict) -> dict:
     return office.build_draft(request)
 
 
-def issue_approval(draft: dict) -> dict:
+def approval_payload(draft: dict, target: str, workspace: str) -> dict:
+    root = Path(workspace).resolve()
+    if not str(target).strip():
+        raise ValueError("Onay için hedef klasör gerekli.")
+    return {"workspace": str(root), "target": str((root / target).resolve()), "hashes": draft["hashes"]}
+
+
+async def issue_approval(draft: dict, *, gate, target: str, workspace: str) -> dict:
     """Local user approval: a single-use token bound to the draft content hash."""
     digest = hashlib.sha256(
         "|".join(f"{name}:{value}" for name, value in sorted(draft["hashes"].items()))
         .encode("utf-8")).hexdigest()
-    token = f"office-{secrets.token_hex(16)}"
+    token = await gate.issue_approval_async(office.BRIDGE_ID, "apply", payload=approval_payload(draft, target, workspace))
     return {
         "approval_token": token,
         "draft_hash": digest,
@@ -62,7 +70,7 @@ async def deliver(engine, *, persona, request: dict, target: str,
     decision = await engine.authorize_bridge(
         apply_persona, office.BRIDGE_ID, "apply",
         approval_token=approval_token, idempotency_key=idempotency_key,
-        payload={"target": target, "hashes": draft["hashes"]})
+        payload=approval_payload(draft, target, workspace or str(engine.default_workspace)))
 
     if decision.get("replayed") or decision.get("should_execute") is False:
         existing = None

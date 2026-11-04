@@ -5,7 +5,8 @@ import asyncio
 import hashlib
 import json
 import uuid
-from datetime import datetime, timezone
+import secrets
+from datetime import datetime, timezone, timedelta
 
 import aiosqlite
 
@@ -23,6 +24,14 @@ ROLE_TOOL_PERMISSIONS = {
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def effect_key(work_id: str, purpose: str, content) -> str:
+    """Stable ledger key scoped to a work item, purpose and content."""
+    material = json.dumps(
+        {"work_id": str(work_id or ""), "purpose": str(purpose or ""), "content": content},
+        ensure_ascii=False, sort_keys=True, default=str)
+    return "effect:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 class BudgetExceeded(ValueError):
@@ -69,7 +78,8 @@ class OperationLedger:
                 result TEXT NOT NULL DEFAULT '',
                 error TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                verification_required INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS budgets(
                 scope TEXT PRIMARY KEY,
@@ -88,9 +98,21 @@ class OperationLedger:
                 scope TEXT NOT NULL DEFAULT '',
                 used_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS issued_approvals(
+                token_hash TEXT PRIMARY KEY, bridge TEXT NOT NULL, level TEXT NOT NULL,
+                payload_hash TEXT NOT NULL, scope TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL, used_at TEXT, operation_key TEXT
+            );
         """)
+        async with self.db.execute("PRAGMA table_info(operations)") as cursor:
+            columns = {row[1] for row in await cursor.fetchall()}
+        if "verification_required" not in columns:
+            await self.db.execute(
+                "ALTER TABLE operations ADD COLUMN verification_required INTEGER NOT NULL DEFAULT 0")
         await self.db.execute(
-            "UPDATE operations SET status='unknown',updated_at=?,"
+            "UPDATE operations SET verification_required=1 WHERE status='unknown'")
+        await self.db.execute(
+            "UPDATE operations SET status='unknown',verification_required=1,updated_at=?,"
             "error=CASE WHEN error='' THEN 'Servis kesintisi; dış işlem sonucu doğrulanamadı.' ELSE error END "
             "WHERE status='pending'", (_now(),))
         await self.db.commit()
@@ -106,12 +128,14 @@ class OperationLedger:
     @staticmethod
     def _record(row):
         keys = ("id", "kind", "idempotency_key", "payload_hash", "status", "attempts",
-                "result", "error", "created_at", "updated_at")
+                "result", "error", "created_at", "updated_at", "verification_required")
         item = dict(zip(keys, row))
         try:
             item["result"] = json.loads(item["result"]) if item["result"] else None
         except ValueError:
             pass
+        item["verification_required"] = bool(item.get("verification_required"))
+        item["needs_verification"] = item["verification_required"] or item["status"] == "unknown"
         return item
 
     async def begin(self, kind: str, idempotency_key: str, payload=None) -> dict:
@@ -142,7 +166,9 @@ class OperationLedger:
                 return record
             operation_id = uuid.uuid4().hex
             await self.db.execute(
-                "INSERT INTO operations VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO operations(id,kind,idempotency_key,payload_hash,status,"
+                "attempts,result,error,created_at,updated_at,verification_required) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,0)",
                 (operation_id, kind, idempotency_key, payload_hash, "pending", 1, "", "",
                  _now(), _now()))
             await self.db.commit()
@@ -153,10 +179,46 @@ class OperationLedger:
         record["replayed"] = False
         return record
 
+    async def begin_effect(self, work_id: str, purpose: str, content,
+                           *, kind: str = "") -> dict:
+        """Reserve a stable key; uncertain prior effects require external verification."""
+        key = effect_key(work_id, purpose, content)
+        record = await self.begin(kind or purpose, key,
+                                  {"work_id": work_id, "purpose": purpose, "content": content})
+        record["effect_key"] = key
+        return record
+
+    async def run_effect(self, adapter, *, work_id: str, purpose: str, content,
+                         payload=None) -> dict:
+        """Run an adapter or replay its recorded result without silently retrying uncertainty.
+
+        External effects and ledger commits are not atomic. An interrupted call
+        must be checked against the external system before it may be resolved.
+        """
+        call = adapter if callable(adapter) else getattr(adapter, "apply", None)
+        if not callable(call):
+            call = getattr(adapter, "run", None)
+        if not callable(call):
+            raise TypeError("Etki adaptörü çağrılabilir veya apply/run metotlu olmalı.")
+        record = await self.begin_effect(work_id, purpose, content)
+        if not record["should_execute"]:
+            return {"effect_key": record["effect_key"], "executed": False,
+                    "result": record.get("result"), "operation": record}
+        try:
+            result = call(content if payload is None else payload)
+            if hasattr(result, "__await__"):
+                result = await result
+        except BaseException as exc:
+            await self.fail(record["id"], str(exc), uncertain=True)
+            raise
+        completed = await self.complete(record["id"], result)
+        return {"effect_key": record["effect_key"], "executed": True,
+                "result": result, "operation": completed}
+
     async def complete(self, operation_id: str, result=None) -> dict:
         async with self.lock:
             await self.db.execute(
-                "UPDATE operations SET status='applied',result=?,error='',updated_at=? WHERE id=?",
+                "UPDATE operations SET status='applied',result=?,error='',verification_required=0,updated_at=? WHERE id=?",
                 (json.dumps(result, ensure_ascii=False, default=str) if result is not None else "",
                  _now(), operation_id))
             await self.db.commit()
@@ -170,8 +232,9 @@ class OperationLedger:
     async def fail(self, operation_id: str, error: str, *, uncertain: bool = False) -> dict:
         async with self.lock:
             await self.db.execute(
-                "UPDATE operations SET status=?,error=?,updated_at=? WHERE id=?",
-                ("unknown" if uncertain else "failed", str(error)[:2000], _now(), operation_id))
+                "UPDATE operations SET status=?,error=?,verification_required=?,updated_at=? WHERE id=?",
+                ("unknown" if uncertain else "failed", str(error)[:2000],
+                 1 if uncertain else 0, _now(), operation_id))
             await self.db.commit()
             async with self.db.execute("SELECT * FROM operations WHERE id=?",
                                        (operation_id,)) as cur:
@@ -195,18 +258,42 @@ class OperationLedger:
                 rows = await cur.fetchall()
         return [self._record(row) for row in rows]
 
+    async def issue_approval(self, *, bridge: str, level: str, payload=None,
+                             scope: str = "", ttl_seconds: float = 600) -> str:
+        if not bridge or level not in {"apply", "dangerous"} or not 0 < ttl_seconds <= 3600:
+            raise ValueError("Geçersiz onay kapsamı veya süresi.")
+        token = f"{bridge}-{secrets.token_urlsafe(32)}"
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
+        async with self.lock:
+            await self.db.execute("INSERT INTO issued_approvals(token_hash,bridge,level,payload_hash,scope,expires_at) VALUES(?,?,?,?,?,?)",
+                                  (digest, bridge, level, self._hash(payload if payload is not None else {}), scope, expires))
+            await self.db.commit()
+        return token
+
     async def consume_approval(self, token: str, *, bridge: str = "", level: str = "",
-                               scope: str = "") -> bool:
-        """Persist a single-use approval token; a replay returns False."""
+                               scope: str = "", payload=None, operation_key: str = "") -> bool:
+        """Consume an issued, scoped token; only a completed identical operation may replay."""
         token = str(token or "").strip()
         if not token:
             raise ValueError("Onay token'ı gerekli.")
         digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
         async with self.lock:
-            cursor = await self.db.execute(
-                "INSERT OR IGNORE INTO approvals(token_hash,bridge,level,scope,used_at) "
-                "VALUES(?,?,?,?,?)",
-                (digest, str(bridge)[:200], str(level)[:40], str(scope)[:200], _now()))
+            cursor = await self.db.execute("SELECT bridge,level,payload_hash,scope,expires_at,used_at,operation_key FROM issued_approvals WHERE token_hash=?", (digest,))
+            row = await cursor.fetchone()
+            expected_hash = self._hash(payload if payload is not None else {})
+            if row is None or row[:4] != (bridge, level, expected_hash, scope):
+                return False
+            if row[5]:
+                if not operation_key or row[6] != operation_key:
+                    return False
+                cursor = await self.db.execute("SELECT status,payload_hash,kind FROM operations WHERE idempotency_key=?", (operation_key,))
+                operation = await cursor.fetchone()
+                return operation == ("applied", expected_hash, bridge)
+            if datetime.fromisoformat(row[4]) <= datetime.now(timezone.utc):
+                return False
+            cursor = await self.db.execute("UPDATE issued_approvals SET used_at=?,operation_key=? WHERE token_hash=? AND used_at IS NULL", (_now(), operation_key, digest))
+            await self.db.execute("INSERT OR IGNORE INTO approvals(token_hash,bridge,level,scope,used_at) VALUES(?,?,?,?,?)", (digest, bridge, level, scope, _now()))
             await self.db.commit()
             return cursor.rowcount > 0
 

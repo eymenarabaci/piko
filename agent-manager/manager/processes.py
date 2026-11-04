@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
+from . import live_output
+from .token_usage import opencode_usage
 from datetime import datetime, timezone
 import json
 import os
@@ -163,12 +166,12 @@ class _WindowsJob:
 
 async def run_command(command: list[str], *, root: Path, workspace: Path,
                       timeout: float, on_event, stdin: str | None = None,
-                      env: dict[str, str] | None = None) -> dict:
+                      env: dict[str, str] | None = None, live_format: str = "text") -> dict:
     """Return {returncode, stdout, stderr}; no shell, no automatic retry.
 
     Output has a shared 2 MiB cap. Heartbeats report activity, never infer a failure.
     """
-    if not command or timeout <= 0:
+    if not command or timeout < 0:
         raise ProcessError('Geçersiz işlem isteği.')
     job = _WindowsJob() if os.name == 'nt' else None
     proc = None
@@ -197,14 +200,50 @@ async def run_command(command: list[str], *, root: Path, workspace: Path,
         if spawn_cancelled:
             raise asyncio.CancelledError
 
+        live_output.start(entry['resource_id'], proc.pid)
+
+        sessions_seen = set()
+        async def report_session(line):
+            try:
+                event = json.loads(line)
+                part = event.get('part') or {}
+                session = event.get('sessionID') or (part.get('sessionID') if isinstance(part, dict) else None)
+                if isinstance(session, str) and session.startswith('ses_') and session not in sessions_seen:
+                    sessions_seen.add(session)
+                    await on_event('provider_session', 'CLI oturumu kaydedildi.', {'session_id': session})
+            except (ValueError, AttributeError):
+                pass
+
         async def drain(name, stream):
             nonlocal total, last_activity
+            decoder = codecs.getincrementaldecoder("utf-8")("replace")
+            pending_line = ""
             while chunk := await stream.read(8192):
                 total += len(chunk)
                 last_activity = time.monotonic()
                 if total > MAX_OUTPUT_BYTES:
                     raise ProcessError('CLI çıktısı 2 MiB sınırını aştı.')
                 buffers[name].extend(chunk)
+                decoded = decoder.decode(chunk)
+                live_output.append(entry['resource_id'], byte_count=len(chunk))
+                if live_format == "opencode_jsonl":
+                    if name == 'stdout':
+                        pending_line += decoded
+                        while '\n' in pending_line:
+                            line, pending_line = pending_line.split('\n', 1)
+                            await report_session(line)
+                            live_output.append_event(entry['resource_id'], line)
+                            usage = opencode_usage(line)
+                            if usage:
+                                await on_event('provider_usage', 'CLI model turu kullanımı.', usage)
+                else:
+                    live_output.append(entry['resource_id'], decoded)
+            if live_format == "opencode_jsonl" and pending_line.strip():
+                await report_session(pending_line)
+                live_output.append_event(entry['resource_id'], pending_line)
+                usage = opencode_usage(pending_line)
+                if usage:
+                    await on_event('provider_usage', 'CLI model turu kullanımı.', usage)
 
         async def feed():
             if proc.stdin:
@@ -226,13 +265,13 @@ async def run_command(command: list[str], *, root: Path, workspace: Path,
                                 'received_bytes': total, 'output_changed': total != previous})
                 previous = total
 
-        await on_event('provider_started', 'CLI işlemi başlatıldı.', {'pid': proc.pid})
+        await on_event('provider_started', 'CLI işlemi başlatıldı.', {'pid': proc.pid, 'live_output_id': entry['resource_id'], 'timeout_seconds': timeout, 'unlimited': timeout == 0})
         tasks = [asyncio.create_task(drain('stdout', proc.stdout)),
                  asyncio.create_task(drain('stderr', proc.stderr)), asyncio.create_task(feed())]
         pulse = asyncio.create_task(heartbeat())
         tasks.append(pulse)
         try:
-            async with asyncio.timeout(max(.01, timeout - (time.monotonic() - started))):
+            async with asyncio.timeout(None if timeout == 0 else max(.01, timeout - (time.monotonic() - started))):
                 await asyncio.gather(*tasks[:-1], proc.wait())
         finally:
             pulse.cancel()
@@ -270,6 +309,7 @@ async def run_command(command: list[str], *, root: Path, workspace: Path,
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             if entry:
+                live_output.finish(entry['resource_id'], state)
                 entry['state'] = state
                 await _complete_owned(asyncio.to_thread(_record, root, dict(entry)))
             if state == 'cleanup_failed':

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import os
+from pathlib import Path
 
 from . import communication
 
@@ -36,12 +38,19 @@ def _preview(request: dict) -> tuple[str, str]:
     return preview, hashlib.sha256(preview.encode("utf-8")).hexdigest()
 
 
-def issue_approval(request: dict) -> dict:
+def approval_payload(request: dict, workspace: str, fixture_db: str = "") -> dict:
+    draft = draft_payload(request)
+    actual_db = communication.fixture_path(workspace, override=fixture_db or os.environ.get("PIKO_COMM_FIXTURE_DB", ""))
+    return {"workspace": str(Path(workspace).resolve()), "fixture_db": str(actual_db.resolve()),
+            "kind": draft["kind"], "to": draft["to"], "preview_sha256": _preview(request)[1]}
+
+
+async def issue_approval(request: dict, *, gate, workspace: str, fixture_db: str = "") -> dict:
     """Approval bound to the exact rendered preview the user reviewed."""
     preview, digest = _preview(request)
     draft = draft_payload(request)
     return {
-        "approval_token": f"communication-{secrets.token_hex(16)}",
+        "approval_token": await gate.issue_approval_async(communication.BRIDGE_ID, "apply", payload=approval_payload(request, workspace, fixture_db)),
         "draft_hash": digest,
         "kind": draft["kind"],
         "recipients": [item for item in draft["to"] if str(item).strip()],
@@ -72,7 +81,7 @@ async def deliver(engine, *, persona, request: dict, approval_token: str = "",
         preview, digest = _preview(request)
         return {"ok": True, "draft_only": True, "draft": draft,
                 "preview": preview, "preview_sha256": digest,
-                "approval": issue_approval(request)}
+                "approval": await issue_approval(request, gate=engine.bridge_gate, workspace=workspace or str(engine.default_workspace), fixture_db=fixture_db)}
 
     levels = ((persona or {}).get("bridges", {}).get(communication.BRIDGE_ID, {})
               if isinstance(persona, dict) else {})
@@ -84,8 +93,7 @@ async def deliver(engine, *, persona, request: dict, approval_token: str = "",
         apply_persona, communication.BRIDGE_ID, "apply",
         approval_token=approval_token,
         idempotency_key=idempotency_key or f"communication:{draft['subject']}",
-        payload={"kind": draft["kind"], "to": draft["to"],
-                 "preview_sha256": _preview(request)[1]})
+        payload=approval_payload(request, workspace or str(engine.default_workspace), fixture_db))
 
     if decision.get("replayed") or decision.get("should_execute") is False:
         existing = None

@@ -107,6 +107,79 @@ async def test_driver_resume_reopens_work_whose_run_is_gone(tmp_path):
         assert reopened["status"] == "open" and reopened["run_id"] == ""
 
 
+@pytest.mark.parametrize("lost_status", ["queued", "planning", "running"])
+async def test_resume_taskless_live_record_restarts_real_engine_task(tmp_path, lost_status):
+    async with stack(tmp_path) as (engine, work, _notes, _ledger, _locks):
+        item = await work.create("Kesintiden devam")
+        hooks = EngineDriverHooks(engine, default_mode="chat", executor_model="worker")
+        run_id = await hooks.start_work(item)
+        await settle(engine, run_id)
+        before = engine.providers.calls
+        await engine.change(run_id, status=lost_status, results={}, execution_id="new-checkpoint")
+        await work.update(item["id"], status="active")
+        assert not engine.tasks.get(run_id) or engine.tasks[run_id].done()
+        assert await hooks.resume_work(await work.get(item["id"])) == run_id
+        completed = await settle(engine, run_id)
+        assert completed["status"] == "completed"
+        assert engine.providers.calls == before + 1
+
+
+async def test_headless_builder_recovers_before_return_and_closes_engine(tmp_path, monkeypatch):
+    from manager import app as app_module, daemon as daemon_module
+    from unittest.mock import AsyncMock
+    recover = AsyncMock()
+    close = AsyncMock()
+    monkeypatch.setattr(Engine, "recover", recover)
+    monkeypatch.setattr(Engine, "close", close)
+    async def no_discovery(_):
+        return []
+    monkeypatch.setattr(app_module, "load_and_discover_models", no_discovery)
+    _daemon, _hooks, resources = await daemon_module.build_driver(tmp_path)
+    recover.assert_awaited_once()
+    await resources.aclose()
+    close.assert_awaited_once()
+
+
+async def test_engine_renews_lease_while_long_work_is_running(tmp_path):
+    from manager.resource_locks import LockTimeout
+    async with stack(tmp_path) as (engine, _work, _notes, _ledger, locks):
+        engine.resource_lock_ttl = 0.3
+        lease = await locks.acquire("test:long", "long-run", timeout=0, ttl=0.3)
+        async def long_work(run, execute):
+            await asyncio.sleep(0.7)
+        engine._drive_with_slot = long_work
+        running = asyncio.create_task(engine._drive_with_lease({"id": "long-run"}, True, lease))
+        try:
+            await asyncio.sleep(0.45)
+            with pytest.raises(LockTimeout):
+                await locks.acquire("test:long", "competitor", timeout=0, ttl=60)
+            await running
+        finally:
+            if not running.done():
+                running.cancel()
+                await asyncio.gather(running, return_exceptions=True)
+            await lease.release()
+
+
+async def test_lease_loss_cancels_and_awaits_protected_worker(tmp_path):
+    from manager.resource_locks import LeaseLost
+    async with stack(tmp_path) as (engine, _work, _notes, _ledger, _locks):
+        cancelled = asyncio.Event()
+        class LostLease:
+            async def assert_owned(self): pass
+            async def renew(self, ttl): raise LeaseLost("ownership replaced")
+        async def blocked_work(run, execute):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        engine.resource_lock_ttl = 0.03
+        engine._drive_with_slot = blocked_work
+        with pytest.raises(LeaseLost):
+            await engine._drive_with_lease({"id": "lost"}, True, LostLease())
+        assert cancelled.is_set()
+
+
 async def test_daemon_tick_starts_due_work_and_beats(tmp_path):
     async with stack(tmp_path) as (engine, work, notifications, ledger, _locks):
         beats = []
@@ -198,14 +271,15 @@ async def test_bridge_gate_token_survives_new_gate_instance(tmp_path):
             "approval": {"apply": "per_call_token"},
         })
         first = BridgeGate(registry, token_store=ledger)
+        token = await first.issue_approval_async("demo.local", "apply", payload={"x": 1})
         decision = await first.authorize("implementer", "demo.local", "apply",
-                                         approval_token="tok-1",
+                                         approval_token=token,
                                          idempotency_key="apply-1", payload={"x": 1})
         assert decision["approval_used"] is True
         second = BridgeGate(registry, token_store=ledger)
         with pytest.raises(ApprovalRequired):
             await second.authorize("implementer", "demo.local", "apply",
-                                   approval_token="tok-1",
+                                   approval_token=token,
                                    idempotency_key="apply-1", payload={"x": 1})
     finally:
         await ledger.close()
@@ -224,15 +298,16 @@ async def test_engine_bridge_apply_uses_operation_ledger(tmp_path):
             "approval": {"apply": "per_call_token"},
         })
         engine.bridge_gate.registry = registry
+        token = await engine.bridge_gate.issue_approval_async("demo.local", "apply", payload={"x": 2})
         decision = await engine.authorize_bridge(
-            "implementer", "demo.local", "apply", approval_token="tok-2",
+            "implementer", "demo.local", "apply", approval_token=token,
             idempotency_key="apply-2", payload={"x": 2})
         assert decision["operation_status"] == "pending"
         await engine.finish_bridge(decision, result={"ok": True})
         operations = await ledger.list()
         assert operations[0]["status"] == "applied"
         replay = await engine.authorize_bridge(
-            "implementer", "demo.local", "apply", approval_token="tok-3",
+            "implementer", "demo.local", "apply", approval_token=token,
             idempotency_key="apply-2", payload={"x": 2})
         assert replay["replayed"] is True
 
