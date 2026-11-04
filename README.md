@@ -15,7 +15,7 @@ Piko bir işi planlara ve adımlara ayırır; uygun modeli yönlendirir, sonuçl
 - **Ölçüm:** Token toplamları yalnız sağlayıcının bildirdiği kullanımdır. Bildirilmeyen tüketim bilinmiyor olarak kalır; ücret veya kalan kota tahmini değildir.
 - **Arayüz:** Projeler, sohbetler, canlı terminal, Piko/Geliştirici görünümü, görev bildirimleri ve isteğe bağlı Android uzaktan erişim.
 
-Direct yürütücü mevcut CLI oturumlarını kullanır. OpenCode/Evren, Codex, Antigravity ve yerel Ollama yolları yapılandırmaya göre sunulur; her sağlayıcının araç/izin desteği aynı değildir. Bu dağıtımın sağlayıcı izin listesi Evren ile sınırlıdır; katalogda görünmek yürütme yetkisi vermez. Ayrıntılar [motor kılavuzunda](agent-manager/README.md).
+Direct yürütücü mevcut CLI oturumlarını kullanır. OpenCode, Codex, Antigravity ve yerel Ollama yolları yapılandırmaya göre sunulur; her sağlayıcının araç/izin desteği aynı değildir. Bu dağıtımın sağlayıcı izin listesi Evren ile sınırlıdır; katalogda görünmek yürütme yetkisi vermez. Ayrıntılar [motor kılavuzunda](agent-manager/README.md).
 
 ## Windows kurulumu
 
