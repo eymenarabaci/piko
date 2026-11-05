@@ -1128,3 +1128,12 @@ body.view-piko #toggle-inspector{display:none}
 .compact-step-heading:focus-visible{outline:2px solid #407bc7;outline-offset:-3px}
 .plan-message-box>.executive-briefing-bubble{border:0;border-top:1px solid #d8e2ef;border-radius:0;background:transparent;padding:18px 0 0;margin-bottom:0}
 @media(max-width:600px){.plan-message-box{padding:10px}.compact-step-heading{padding:11px 10px}}
+
+/* Compact editor leaves live plan progress visible. */
+.composer-monitor{display:flex;align-items:center;gap:10px;min-width:0}
+.composer-monitor .conversation-progress{flex:1;min-width:0;margin:0 0 8px}
+.composer-toggle{flex-shrink:0;font-size:11px;color:#536d92;padding:8px 10px;border:1px solid #d7e0ef;border-radius:8px;background:#fff;min-height:34px;margin-bottom:8px}
+.composer-toggle:hover{background:#f2f6fc}
+.composer-collapsed{padding-top:6px!important;padding-bottom:6px!important}
+.composer-collapsed .composer-monitor .overview-stats-row .stat-chip:nth-child(n+4){display:none}
+@media(max-width:600px){.composer-monitor{gap:6px}.composer-toggle{font-size:10px;padding:7px}.composer-monitor .overview-stats-row{gap:4px;flex-wrap:wrap}}

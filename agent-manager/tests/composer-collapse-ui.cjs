@@ -1,0 +1,13 @@
+const fs=require('fs'),path=require('path');
+const {chromium}=require(path.join(process.env.USERPROFILE,'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright'));
+(async()=>{const root=path.resolve(__dirname,'..');let browser;try{browser=await chromium.launch({headless:true,executablePath:'C:/Program Files/Google/Chrome/Application/chrome.exe'});const page=await browser.newPage({viewport:{width:1280,height:1000}});const errors=[];page.on('pageerror',e=>errors.push(e.message));
+await page.route('**/ui/app.js*',r=>r.fulfill({contentType:'text/javascript',body:fs.readFileSync(root+'/ui/app.js','utf8')}));await page.route('**/ui/styles.css*',r=>r.fulfill({contentType:'text/css',body:fs.readFileSync(root+'/ui/styles.css','utf8')}));await page.route('http://127.0.0.1:8765/',r=>r.fulfill({contentType:'text/html',body:fs.readFileSync(root+'/ui/index.html','utf8')}));
+await page.goto('http://127.0.0.1:8765');await page.waitForLoadState('networkidle');
+await page.locator('.recent-run').first().click();await page.waitForSelector('#conversation-progress:not([hidden])');
+await page.fill('#prompt','Kaybolmaması gereken taslak');const before=await page.locator('.composer-zone').evaluate(e=>e.getBoundingClientRect().height);await page.click('#toggle-composer');
+if(await page.locator('#composer').isVisible())throw Error('Editor not collapsed');if(!await page.locator('#conversation-progress').isVisible())throw Error('Progress hidden');if(await page.locator('#toggle-composer').getAttribute('aria-expanded')!=='false')throw Error('aria');
+const after=await page.locator('.composer-zone').evaluate(e=>e.getBoundingClientRect().height);if(after>=before-100)throw Error('Insufficient space saving '+before+' '+after);
+await page.screenshot({path:path.join(root,'work','chat-ui-validation')+'/composer-collapsed.png'});await page.click('#toggle-composer');if(await page.inputValue('#prompt')!=='Kaybolmaması gereken taslak')throw Error('Draft lost');await page.click('#toggle-composer');await page.reload();await page.waitForLoadState('networkidle');if(await page.locator('#composer').isVisible())throw Error('Preference not retained');await page.locator('#toggle-composer').focus();await page.keyboard.press('Enter');if(!await page.locator('#composer').isVisible())throw Error('Keyboard toggle failed');
+await page.setViewportSize({width:390,height:844});await page.click('#toggle-composer');await page.screenshot({path:path.join(root,'work','chat-ui-validation')+'/composer-collapsed-mobile.png'});if(errors.length)throw Error(JSON.stringify(errors));console.log(JSON.stringify({checks:5,before,after,errors}));
+}finally{if(browser)await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1});
+

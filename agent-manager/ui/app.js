@@ -765,6 +765,7 @@ function newChat() {
   renderRun();
   renderRecent();
   $('#prompt').value = '';
+  setComposerCollapsed(false);
   $('#prompt').focus();
 }
 
@@ -1222,7 +1223,8 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
       pillBtn.type = 'button';
       pillBtn.onclick = () => {
         $('#prompt').value = s;
-        $('#prompt').focus();
+        setComposerCollapsed(false);
+  $('#prompt').focus();
         $('#composer').requestSubmit();
       };
       pills.append(pillBtn);
@@ -3285,6 +3287,24 @@ $('#prompt').addEventListener('paste', event => {
     queueAttachments(files);
   }
 });
+function setComposerCollapsed(collapsed, focus = false) {
+  const form = $('#composer');
+  const toggle = $('#toggle-composer');
+  if (!form || !toggle) return;
+  form.hidden = collapsed;
+  $('#composer-hints').hidden = collapsed;
+  form.closest('.composer-zone').classList.toggle('composer-collapsed', collapsed);
+  toggle.setAttribute('aria-expanded', String(!collapsed));
+  toggle.textContent = collapsed ? ($('#prompt').value.trim() ? 'Taslağı aç ▴' : 'Mesaj yaz ▴') : 'Mesaj kutusunu küçült ▾';
+  save('piko-composer-collapsed', collapsed);
+  if (!collapsed && focus) $('#prompt').focus();
+}
+
+$('#toggle-composer').addEventListener('click', () => {
+  setComposerCollapsed(!$('#composer').hidden, $('#composer').hidden);
+});
+setComposerCollapsed(load('piko-composer-collapsed', false));
+
 $('#composer').addEventListener('dragover', event => {
   if ([...(event.dataTransfer?.types || [])].includes('Files')) event.preventDefault();
 });
@@ -3459,6 +3479,7 @@ $$('[data-tab]').forEach(el => el.addEventListener('click', () => {
 }));
 $$('[data-example]').forEach(el => el.addEventListener('click', () => {
   $('#prompt').value = el.dataset.example;
+  setComposerCollapsed(false);
   $('#prompt').focus();
 }));
 $$('.settings-open').forEach(el => el.addEventListener('click', openSettings));
