@@ -19,7 +19,8 @@ from langgraph.graph import END, START, StateGraph
 
 from .task_record_audit import task_record_issues
 from .step_context import original_task_context
-from .conversation_summary import STEP_RESULT_GUIDANCE, plan_result_summary
+from .conversation_summary import (STEP_RESULT_GUIDANCE, build_plan_summary_prompt,
+                                   plan_result_summary, summary_text)
 from .execution_policy import model_allowed
 from .outcomes import is_timeout_error
 from .adaptive import (MAX_ADAPTATIONS, build_adaptive_prompt, extend_plan,
@@ -1648,8 +1649,23 @@ class Engine:
         raise NoEligibleModel("Orkestratör modelleri kota sınırına takıldı.")
 
     async def synthesize_summary(self, run: dict, results: dict) -> str:
-        """Present the plan's combined outcome without replaying its step roster."""
-        return plan_result_summary(run, results)
+        """Synthesize one outcome narrative without blocking delivery on copy failure."""
+        if not (run.get("plan") or {}).get("steps"):
+            return plan_result_summary(run, results)
+        summary_run = dict(run)
+        summary_run["timeout_seconds"] = min(run.get("timeout_seconds") or 45, 45)
+        try:
+            result = await asyncio.wait_for(
+                self._architect_json(summary_run, build_plan_summary_prompt(run, results),
+                                     "plan_summary"), timeout=60)
+            synthesis = summary_text(robust_json_decode(result["output"])[0])
+            return plan_result_summary(run, results, synthesis)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Quota, transport and malformed prose must not turn a valid delivery
+            # into a failed task or silently become a claim of success.
+            return plan_result_summary(run, results)
 
     async def _architect_json(self, run: dict, prompt: str, label: str) -> dict:
         """Run one read-only planning/audit call with a bounded model fallback."""
@@ -1667,6 +1683,8 @@ class Engine:
         candidates = fresh or candidates
         last_error = None
         for model_id in candidates[:4]:
+            if label == "plan_summary" and not model_allowed(self.models.get(model_id, {})):
+                continue
             try:
                 if run.get("execution_backend") == "cao":
                     result = await self.cao.run(self.models[model_id], prompt,
@@ -1697,6 +1715,8 @@ class Engine:
         # burning the whole retry budget; the run keeps a marker for the record.
         local_error = None
         for model_id in self._local_reader_models(availability):
+            if label == "plan_summary" and not model_allowed(self.models.get(model_id, {})):
+                continue
             try:
                 result = await self.providers.run(model_id, prompt, workspace=run["workspace"],
                                                   allow_writes=False,

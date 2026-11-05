@@ -855,6 +855,12 @@ function choosePlan(id = null) {
   pollEvents().catch(() => {});
 }
 
+function planGoal(run, archived = false) {
+  const program = programProgress(run);
+  return run.active_goal || program?.item?.goal || run.plan?.goal || run.plan?.title
+    || (archived ? run.prompt || run.title : run.title) || 'Bu planın hedefi kaydedilmemiş.';
+}
+
 function stepOutcomePreview(result, running) {
   if (running) return 'Çalışıyor; sonuç henüz hazır değil.';
   if (result?.awaiting_input) return 'Devam etmek için yanıtınızı bekliyor.';
@@ -882,7 +888,7 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
     container.append(bubble);
   }
   // 1. KULLANICI HEDEFİ BALONU
-  if (!(run.mode === 'chat' && run.chat_history?.[0]?.text === run.prompt)) {
+  if (!archived && !(run.mode === 'chat' && run.chat_history?.[0]?.text === run.prompt)) {
     const userBubble = node('article', `message-bubble ${archived ? 'chat-bubble-assistant piko-planned-goal' : 'user-message'}`);
     const userHead = node('div', archived ? 'chat-bubble-head' : 'user-head');
     userHead.append(node('span', 'user-avatar', archived ? '◈' : '👤'), node('b', '', archived ? 'Piko · Kendi planladığı hedef' : 'Siz'));
@@ -894,7 +900,7 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
   if (!archived) {
     for (const [index, previous] of (run.plan_history || []).entries()) {
       const section = node('section', 'archived-plan');
-      section.append(button(`Önceki plan ${index + 1} · ${previous.prompt || 'Plan'} ↗`, 'archived-plan-select', () => choosePlan(previous.execution_id)));
+      section.append(button(`Önceki plan ${index + 1} · ${previous.title || 'Plan'} ↗`, 'archived-plan-select', () => choosePlan(previous.execution_id)));
 
       renderRunMessages({...previous, plan_history: [], conversation_history: [], chat_history: []}, section, [], true);
       section.querySelectorAll('.run-actions button, .inline-question button').forEach(button => button.disabled = true);
@@ -966,7 +972,7 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
   const steps = run.plan?.steps || [];
   const isMultiStep = steps.length > 1;
 
-  if (isMultiStep || run.status === 'planned' || programProgress(run)) {
+  if ((steps.length && run.mode !== 'chat') || run.status === 'planned' || programProgress(run)) {
     const planBubble = node('article', 'message-bubble plan-overview-bubble');
     const planHead = node('div', 'plan-overview-head');
     const planIdentity = node('div', 'plan-identity');
@@ -990,12 +996,12 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
         ? `${doneCount}/${steps.length} adım tamamlandı.`
         : `${doneCount}/${steps.length} adım tamamlandı · ${statusLabels[run.status] || run.status}`;
     planBubble.append(node('p', 'conversation-status', statusText));
-    if (program) {
+    {
       const phaseInfo = node('p', 'program-phase-note',
-        `${program.item.goal || program.item.title || ''}${run.phase_status ? ` · ${phaseStatusLabels[run.phase_status] || run.phase_status}` : ''}`);
+        `${planGoal(run, archived)}${run.phase_status ? ` · ${phaseStatusLabels[run.phase_status] || run.phase_status}` : ''}`);
       planBubble.append(phaseInfo);
-      if (program.item.demo_requested) planBubble.append(node('span', 'program-demo-chip', 'Demo çıktısı istendi'));
-      if (program.item.schedule_hint) planBubble.append(node('span', 'program-schedule-chip', `Zamanlama: ${program.item.schedule_hint}`));
+      if (program?.item.demo_requested) planBubble.append(node('span', 'program-demo-chip', 'Demo çıktısı istendi'));
+      if (program?.item.schedule_hint) planBubble.append(node('span', 'program-schedule-chip', `Zamanlama: ${program.item.schedule_hint}`));
     }
     planBubble.append(button('Plan ayrıntılarını aç ↗', 'output-open-button', () => {
       state.tab = 'flow';
@@ -1193,7 +1199,7 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
     container.append(aiBubble);
   }
 
-  if (run.orchestrator_answer && !run.chat_history?.length && isMultiStep) {
+  if (run.orchestrator_answer && !run.chat_history?.length && steps.length && run.mode !== 'chat') {
     const briefingBubble = node('article', 'message-bubble executive-briefing-bubble');
     const bHead = node('div', 'briefing-head');
     bHead.append(node('span', '', '◈'), node('span', '', 'Planın sonucu'));
