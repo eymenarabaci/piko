@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 import json
 import re
@@ -287,7 +288,7 @@ def test_api_work_delivery_notifications_and_integrations(tmp_path):
     with TestClient(app) as client:
         created = client.post("/api/work", json={
             "goal": "Rapor hazırla", "title": "Rapor", "priority": "high",
-            "due_at": "2026-11-02T10:00:00+03:00", "acceptance": ["Rapor dosyası hazır"]})
+            "due_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(), "acceptance": ["Rapor dosyası hazır"]})
         assert created.status_code == 201
         work_id = created.json()["id"]
         detail = client.get(f"/api/work/{work_id}").json()

@@ -40,6 +40,13 @@ def _safe_label(value, limit=180):
     return value[:limit]
 
 
+def _project_fact(fact):
+    # Automatic run reports belong to episodic history, not reusable project
+    # knowledge. Preserve explicit rules/preferences and every original record.
+    return (fact.get('source') != 'auto_reflection'
+            or fact.get('category') in {'rule', 'preference'})
+
+
 class ProjectMemory:
     def __init__(self, data_dir: Path):
         self.root = Path(data_dir).resolve() / 'project_memory'
@@ -190,6 +197,9 @@ class ProjectMemory:
             facts = [dict(f) for f in previous.get('facts', [])]
             for fact in facts:
                 if fact.get('source') == 'auto_reflection':
+                    if not _project_fact(fact):
+                        fact['quarantine_reason'] = 'automatic_run_report_not_project_fact'
+                        fact.setdefault('quarantined_at', _now())
                     fact['verification'] = 'unverified'
                     fact['confidence'] = min(fact.get('confidence', 0.35), 0.35)
                     if not fact.get('content', '').startswith('Ajan'):
@@ -221,47 +231,18 @@ class ProjectMemory:
             return {'files': len(files), 'changed': len(changed), 'reused': reused,
                     'removed': len(removed), 'notebook_path': str(md_path),
                     'graph_path': str(json_path), 'truncated': truncated,
-                    'facts_count': len(facts)}
+                    'facts_count': sum(_project_fact(f) for f in facts),
+                    'quarantined_facts_count': sum(not _project_fact(f) for f in facts)}
 
     def _auto_reflect_internal(self, run: dict, facts: list[dict]) -> list[dict]:
-        """Automatically synthesize lessons, architectural choices, and error resolutions from run."""
-        facts_list = list(facts)
-        status = run.get('status')
-        results = run.get('results', {})
-        plan = run.get('plan') or {}
-        steps = plan.get('steps', [])
-        prompt = run.get('prompt', '')
+        """Keep run reports in plan_notes; never promote output text into facts.
 
-        # 1. Successful verification / architectural milestones
-        if status in {'completed', 'success'}:
-            for s in steps:
-                s_id = s.get('id', '')
-                res = results.get(s_id, {})
-                out = res.get('output', '')
-                title = s.get('title', s_id)
-                if res.get('status') in {'completed', 'success'} and any(w in title.lower() for w in {'test', 'doğrulama', 'verify', 'build', 'lint'}):
-                    content = f"Ajan doğrulama raporu (doğrulanmadı) ({title}): {out[:120].strip()}" if out else f"Ajan doğrulama kaydı (doğrulanmadı): {title}"
-                    self._append_fact_if_new(facts_list, content, category='insight', source='auto_reflection', tags=['test', 'verification'])
-            if len(steps) >= 3 and prompt:
-                p_words = [w for w in prompt.split() if len(w) > 3][:6]
-                summary_content = f"Ajanın tamamlandı kaydı (doğrulanmadı): {' '.join(p_words)} ({len(steps)} adım)"
-                self._append_fact_if_new(facts_list, summary_content, category='architecture', source='auto_reflection', tags=['workflow', 'success'])
-
-        # 2. Recovered or observed errors
-        if status in {'failed', 'error'}:
-            for s in steps:
-                s_id = s.get('id', '')
-                res = results.get(s_id, {})
-                if res.get('status') in {'failed', 'error'}:
-                    out = res.get('output', '') or res.get('error', '')
-                    title = s.get('title', s_id)
-                    reason = _safe_label(out[:140].strip()) if out else 'Bilinmeyen hata'
-                    content = f"Hata tecrübesi ({title}): {reason}"
-                    self._append_fact_if_new(facts_list, content, category='insight', source='auto_reflection', tags=['error', 'lesson'])
-
-        protected = [f for f in facts_list if f.get('source') != 'auto_reflection']
-        automatic = [f for f in facts_list if f.get('source') == 'auto_reflection']
-        return protected + automatic[-40:]
+        A completed status is not evidence of test execution. Prompt echoes,
+        quota errors and transport failures are execution history, not enduring
+        project architecture or reusable lessons. Existing records are retained
+        for audit and quarantined by refresh instead of being deleted.
+        """
+        return list(facts)
 
     @staticmethod
     def _append_fact_if_new(facts: list[dict], content: str, category: str = 'insight', source: str = 'auto_reflection', tags: list[str] | None = None):
@@ -347,7 +328,7 @@ class ProjectMemory:
                 self._atomic(md_path, self._markdown(data))
             return target
 
-    def list_facts(self, workspace: str | Path, category: str | None = None) -> list[dict]:
+    def list_facts(self, workspace: str | Path, category: str | None = None, *, include_quarantined: bool = False) -> list[dict]:
         with self._lock:
             workspace, json_path, _ = self._paths(workspace)
             if not json_path.is_file():
@@ -355,6 +336,8 @@ class ProjectMemory:
             try:
                 data = json.loads(json_path.read_text(encoding='utf-8'))
                 facts = data.get('facts', [])
+                if not include_quarantined:
+                    facts = [f for f in facts if _project_fact(f)]
                 if category:
                     facts = [f for f in facts if f.get('category') == category]
                 return facts
@@ -394,7 +377,10 @@ class ProjectMemory:
             if data['graph'].get(name):
                 lines.append('  - Bağlantılar: ' + ', '.join(data['graph'][name]))
         lines.extend(['', '## Kalıcı Öğrenilen Bilgiler ve Kurallar'])
-        facts = data.get('facts', [])
+        facts = [f for f in data.get('facts', []) if _project_fact(f)]
+        quarantined = sum(not _project_fact(f) for f in data.get('facts', []))
+        if quarantined:
+            lines.append(f'*{quarantined} otomatik yürütme raporu karantinada; proje bilgisi olarak kullanılmıyor. Özgün kayıtlar JSON içinde korunuyor.*')
         if facts:
             for f in facts:
                 cat = f.get('category', 'insight').upper()
@@ -438,8 +424,8 @@ class ProjectMemory:
             neighbors.update(source for source, edges in data['graph'].items() if name in edges)
         selected += sorted(neighbors - set(selected))[:8]
 
-        # Extract relevant facts
-        facts = data.get('facts', [])
+        # Only durable project facts enter reusable context, never run reports.
+        facts = [f for f in data.get('facts', []) if _project_fact(f)]
         scored_facts = []
         for f in facts:
             f_words = _words(f.get('content', ''))

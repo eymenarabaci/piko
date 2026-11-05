@@ -107,10 +107,11 @@ def test_compounding_memory_auto_reflection(tmp_path):
         }
     }
     stats = memory.refresh(workspace, run_payload)
-    assert stats['facts_count'] >= 1
-    facts = memory.list_facts(workspace)
-    assert any('Ajan doğrulama raporu (doğrulanmadı)' in f['content'] for f in facts)
-    assert all(f['verification'] == 'unverified' and f['confidence'] <= 0.35 for f in facts)
+    assert stats['facts_count'] == 0
+    assert not memory.list_facts(workspace)
+    data = json.loads(Path(stats['graph_path']).read_text(encoding='utf-8'))
+    assert 'All 5 tests passed' in data['plan_notes'][0]['steps'][0]['summary']
+    assert data['plan_notes'][0]['evidence'] == 'Ajan/orkestratör raporu; bağımsız doğrulanmadı.'
 
 
 
@@ -140,11 +141,36 @@ def test_user_rule_survives_automatic_fact_retention_and_context_ranking(tmp_pat
     automatic=[{'id':str(i),'source':'auto_reflection','category':'insight','content':f'pytest scheduler measurement baseline {i}','tags':['pytest']} for i in range(45)]
     retained=memory._auto_reflect_internal({'status':'running'},[rule,*automatic])
     assert rule in retained
-    assert len([f for f in retained if f['source']=='auto_reflection'])==40
+    assert len([f for f in retained if f['source']=='auto_reflection'])==45
     stats=memory.refresh(workspace)
     path=Path(stats['graph_path']);data=json.loads(path.read_text(encoding='utf-8'));data['facts']=retained;path.write_text(json.dumps(data),encoding='utf-8')
     context=memory.context(workspace,'pytest scheduler measurement baseline',max_chars=4000)
     assert 'Canlı servisi değiştirme' in context
     assert 'kaynak=user' in context
-    assert 'doğrulama=unverified' in context
+    assert 'pytest scheduler measurement baseline' not in context
+    assert len(memory.list_facts(workspace, include_quarantined=True)) == 46
+    assert len(memory.list_facts(workspace)) == 1
     assert 'Doğrulama başarılı' not in context
+
+
+def test_prompt_echo_and_transient_errors_are_quarantined_without_losing_user_rules(tmp_path):
+    workspace = tmp_path/'project'; workspace.mkdir()
+    memory = ProjectMemory(tmp_path/'data')
+    stats = memory.refresh(workspace)
+    path = Path(stats['graph_path']); data = json.loads(path.read_text(encoding='utf-8'))
+    records = [
+        {'id':'echo','source':'auto_reflection','category':'insight','content':'Doğrulama başarılı: Varsayılan olarak işi kendin tamamla.'},
+        {'id':'quota','source':'auto_reflection','category':'insight','content':'CAO HTTP 502 uygun model kotası kalmadı'},
+        {'id':'rule','source':'user','category':'rule','content':'Kota korumasını kaldırma'},
+        {'id':'pref','source':'user','category':'preference','content':'Türkçe yanıtla'}]
+    data['facts'] = records; path.write_text(json.dumps(data), encoding='utf-8')
+    stats = memory.refresh(workspace)
+    all_facts = memory.list_facts(workspace, include_quarantined=True)
+    assert {f['id'] for f in all_facts} == {'echo','quota','rule','pref'}
+    assert {f['id'] for f in memory.list_facts(workspace)} == {'rule','pref'}
+    assert {f['id'] for f in memory.search_facts(workspace, 'CAO kota doğrulama')} == {'rule','pref'} or all(f['source']=='user' for f in memory.search_facts(workspace, 'CAO kota doğrulama'))
+    assert all(f['quarantine_reason']=='automatic_run_report_not_project_fact' for f in all_facts if f['source']=='auto_reflection')
+    assert stats['facts_count']==2 and stats['quarantined_facts_count']==2
+    context=memory.context(workspace,'CAO HTTP 502 doğrulama',max_chars=4000)
+    assert 'Varsayılan olarak' not in context and 'CAO HTTP 502' not in context
+    assert 'Kota korumasını kaldırma' in context and 'Türkçe yanıtla' in context

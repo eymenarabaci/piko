@@ -744,7 +744,8 @@ class Engine:
         availability = await self.model_availability()
         ranked = await self.router.rank("architect", run["execution_backend"],
                                         allow_writes=False, availability=availability)
-        candidates = [preferred] + [c.model_id for c in ranked if c.model_id != preferred]
+        candidates = [mid for mid in [preferred] + [c.model_id for c in ranked if c.model_id != preferred]
+                      if mid in self.models and not self.models[mid].get("hidden") and model_allowed(self.models[mid])]
         last_error = None
         total_calls = 0
         for index, model_id in enumerate(candidates[:3]):
@@ -821,7 +822,7 @@ class Engine:
     async def plan_graph(self, run):
         async def plan_node(state):
             catalog = [{"id": mid, "provider": m["provider"], "capabilities": m.get("capabilities", [])}
-                       for mid, m in self.models.items() if model_allowed(m) and m.get("execution_supported", True)
+                       for mid, m in self.models.items() if model_allowed(m) and not m.get("hidden") and m.get("execution_supported", True)
                        and (run.get("execution_backend") != "ao" or m.get("provider") == "codex")
                        and (run.get("execution_backend") != "cao" or m.get("provider") in {"codex", "antigravity", "ollama", "evren"})
                        ]
@@ -1030,12 +1031,13 @@ class Engine:
         event = on_event or self.emitter(run["id"], step.id)
         attempted: set[str] = set()
         selected = step.model_id
-        if selected != "auto" and not model_allowed(self.models.get(selected, {})):
+        if selected != "auto" and (not model_allowed(self.models.get(selected, {})) or self.models.get(selected, {}).get("hidden")):
             selected = "auto"
         last_error = None
         if selected == "auto":
             if (run.get("executor_model") and run["executor_model"] != "auto"
-                    and model_allowed(self.models.get(run["executor_model"], {}))):
+                    and model_allowed(self.models.get(run["executor_model"], {}))
+                    and not self.models.get(run["executor_model"], {}).get("hidden")):
                 selected = run["executor_model"]
             else:
                 try:
@@ -1604,7 +1606,7 @@ class Engine:
         if messages:
             goal += "\nKullanıcının görev sırasında verdiği ek talimatlar:\n" + json.dumps(messages, ensure_ascii=False)
         catalog = [{"id": mid, "provider": model["provider"]}
-                   for mid, model in self.models.items() if model.get("execution_supported", True)
+                   for mid, model in self.models.items() if model_allowed(model) and not model.get("hidden") and model.get("execution_supported", True)
                    and (run["execution_backend"] != "cao" or model.get("provider") in {"codex", "antigravity", "ollama", "evren"})]
         prompt = build_adaptive_prompt(goal, plan, run["results"],
                                        revision=run.get("plan_revision", 0),
@@ -1650,6 +1652,10 @@ class Engine:
 
     async def synthesize_summary(self, run: dict, results: dict) -> str:
         """Synthesize one outcome narrative without blocking delivery on copy failure."""
+        if run.get("mode") == "chat":
+            # A direct conversation already has its final response; no extra agent.
+            return next((str(value.get("output") or "").strip() for value in results.values()
+                         if value.get("status") in {"completed", "success"}), "")
         if not (run.get("plan") or {}).get("steps"):
             return plan_result_summary(run, results)
         summary_run = dict(run)
@@ -1676,6 +1682,9 @@ class Engine:
         preferred = run.get("planner_model")
         candidates = ([preferred] if preferred in self.models and availability.get(preferred) else [])
         candidates += [choice.model_id for choice in ranked if choice.model_id not in candidates]
+        candidates = [mid for mid in candidates if mid in self.models
+                      and model_allowed(self.models[mid]) and not self.models[mid].get("hidden")
+                      and self.models[mid].get("execution_supported", True)]
         # A terminal that already exhausted its quota cannot answer an audit;
         # walk the ranked candidates instead of failing after two attempts.
         cooling = await self.router.get_cooldowns()
@@ -1746,6 +1755,8 @@ class Engine:
         """Local (no terminal) models that can answer a read-only JSON call."""
         ready = []
         for model_id, model in self.models.items():
+            if model.get("hidden") or not model_allowed(model):
+                continue
             if str(model.get("provider") or "").lower() not in {"ollama", "ollama_local"}:
                 continue
             if availability.get(model_id) is False:
