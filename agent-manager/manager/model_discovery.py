@@ -319,6 +319,8 @@ def discover_models(
 
 def load_models_file(path: Path | str) -> list[dict]:
     file = Path(path)
+    if not file.exists() and file.name == "models.json":
+        file = file.with_name("models.example.json")
     if not file.exists():
         return []
     try:

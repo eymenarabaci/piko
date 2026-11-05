@@ -6,3 +6,7 @@ data/
 work/
 *.pyc
 .piko/
+
+# Local model discovery, visibility preferences and optional operator policy
+/config/models.json
+/config/execution_policy.json

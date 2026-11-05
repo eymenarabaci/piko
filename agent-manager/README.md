@@ -45,15 +45,15 @@ Bu sınır, motor örneğinin adım kapasitesidir; tüm makinedeki her model ça
 
 ## Sağlayıcılar ve devam davranışı
 
-`config/models.json` model kataloğunu, `config/cli_config.json` CLI bağlantılarını, `config/execution_policy.json` izin verilen sağlayıcı politikasını tanımlar. Dağıtım politikası katalogda görünen modelleri ayrıca daraltabilir.
+`config/models.example.json` başlangıç kataloğudur. Bağlı ve desteklenen sağlayıcılar otomatik taranır; yerel `config/models.json` keşfedilen modelleri ve arayüzdeki Gizle/Göster tercihlerini saklar. Gizlenen modeller otomatik seçimden çıkarılır; tarama tercihleri korur. Bu yerel dosya Git ile paylaşılmaz. Varsayılan sağlayıcı kısıtı yoktur; isteğe bağlı yerel `config/execution_policy.json` yalnız operatör politikası gerektiğinde kullanılabilir.
 
 | Yol | Davranış |
 |---|---|
-| Direct / Evren–OpenCode | CLI JSONL çıktısı, kalıcı oturum kimliği ve aynı adım/model eşleşmesiyle `--session` devamı. Bu yolda sabit CLI duvar saati timeout'u kapalıdır. |
+| Direct / OpenCode | CLI JSONL çıktısı, kalıcı oturum kimliği ve aynı adım/model eşleşmesiyle `--session` devamı. Bu yolda sabit CLI duvar saati timeout'u kapalıdır. |
 | Direct / diğer adaptörler | Kurulu CLI veya yerel sağlayıcı üzerinden çalışır; özellikler sağlayıcının araç ve izin desteğine bağlıdır. |
 | AO / CAO | İsteğe bağlı yürütme altyapılarıdır. Kurulum ve uyumlu model gerekir; izole paralel yazma Direct yoluna özeldir. |
 
-Evren CLI çağrısının sınırsız timeout'u, görevin veya kaynaklarının sınırsız yetkili olduğu anlamına gelmez. Kullanıcı iptali, kota/onay kapıları ve yapılandırılmış diğer bütçeler korunur. Ağ hatasında aynı model/oturum için sınırlı geri çekilme; kota durumunda bekleme ve uygun model yönlendirmesi vardır. Her hata otomatik çözülemez. Süreç yeniden başlatılınca kayıtlı iş devam edebilir; dış araç etkileri için exactly-once garantisi verilmez.
+OpenCode CLI çağrısının sınırsız timeout'u, görevin veya kaynaklarının sınırsız yetkili olduğu anlamına gelmez. Kullanıcı iptali, kota/onay kapıları ve yapılandırılmış diğer bütçeler korunur. Ağ hatasında aynı model/oturum için sınırlı geri çekilme; kota durumunda bekleme ve uygun model yönlendirmesi vardır. Her hata otomatik çözülemez. Süreç yeniden başlatılınca kayıtlı iş devam edebilir; dış araç etkileri için exactly-once garantisi verilmez.
 
 ## Hafıza ve kullanım ölçümü
 

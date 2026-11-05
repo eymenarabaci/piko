@@ -27,7 +27,7 @@ Tamamlanma bir motor durumudur. Kullanıcının sürümlü teslimi kabul etmesi 
 
 ## Devam ve bekleme
 
-Evren/OpenCode Direct yolunda oturum kimliği çağrıdan önce saklanır. Eşleşme yürütme, adım ve model bazındadır; uygun devam `--session` ile aynı oturuma gider. Eski kayıtta bulunmayan oturum sonradan uydurulmaz. CLI çağrısında sabit duvar saati timeout'u kapalıdır; iptal ve diğer yetki/kota/bütçe sınırları ayrı işler.
+OpenCode Direct yolunda oturum kimliği çağrıdan önce saklanır. Eşleşme yürütme, adım ve model bazındadır; uygun devam `--session` ile aynı oturuma gider. Eski kayıtta bulunmayan oturum sonradan uydurulmaz. CLI çağrısında sabit duvar saati timeout'u kapalıdır; iptal ve diğer yetki/kota/bütçe sınırları ayrı işler.
 
 Geçici ağ/sağlayıcı hataları sınırlı dış geri çekilme döngüsüne çıkar. Ağ beklemesi ile kota beklemesi ayrı durum alanlarıyla tutulur. Kota defteri silinerek veya bekleme zamanı sıfırlanarak toparlanma yapılmaz. Başlangıç kurtarması ve sürücü sahipliği, aynı veri alanı üzerinde rakip yürütücü oluşturmamalıdır.
 
@@ -47,7 +47,7 @@ Bu mekanizmalar işletim sistemi erişim izolasyonu değildir. Özellikle dış 
 
 Proje indeksi dosyaların yapısını anlatır; episodik iş hafızası yapılan iş/plan raporlarını ve kaynak bilgisini taşır. Kullanıcı kuralları korunur. Model raporunun doğrulanmamış olması görünür kalır; indeksleme bir kabul testi değildir.
 
-Sağlayıcı bildirimi varsa gerçek token usage çağrı/tur kimliğiyle tekilleştirilir. Evren/OpenCode JSONL `step_finish` bildirimleri bu kaynağı sağlar. Bildirilmeyen veya yarım kalan tüketim bilinmiyor olarak kalır; metinden sayı türetilmez. Ledger/kota koruması ile kullanıcıya gösterilen ölçülmüş tüketim toplamı farklı sorumluluklardır. Ön rezervasyon kesin harcama ve kesin bakiye değildir.
+Sağlayıcı bildirimi varsa gerçek token usage çağrı/tur kimliğiyle tekilleştirilir. OpenCode JSONL `step_finish` bildirimleri bu kaynağı sağlar. Bildirilmeyen veya yarım kalan tüketim bilinmiyor olarak kalır; metinden sayı türetilmez. Ledger/kota koruması ile kullanıcıya gösterilen ölçülmüş tüketim toplamı farklı sorumluluklardır. Ön rezervasyon kesin harcama ve kesin bakiye değildir.
 
 ## Güncelleme ve kanıt sınırları
 

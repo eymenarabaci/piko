@@ -39,7 +39,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "agy models",
-      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -89,7 +88,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "agy models",
-      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -139,7 +137,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "agy models",
-      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -189,7 +186,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "agy models",
-      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -239,7 +235,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "agy models",
-      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -286,7 +281,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": null,
-      "catalog_observed_at": null,
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -329,10 +323,9 @@
       },
       "base_model": "",
       "default_effort": "",
-      "hidden": true,
+      "hidden": false,
       "execution_supported": false,
       "catalog_source": null,
-      "catalog_observed_at": null,
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -381,7 +374,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "ollama /api/tags",
-      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
       "quantization": "Q4_K_M",
       "parameter_size": "4.2B",
       "digest": "d8b0f5e9760cd1682034f292d7ef72ec46f432149be0df7574bf2d6e92e38c04",
@@ -432,7 +424,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "agy models",
-      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -482,7 +473,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "agy models",
-      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -527,7 +517,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "agy models",
-      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -572,7 +561,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "agy models",
-      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -617,7 +605,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "agy models",
-      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -667,7 +654,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "agy models",
-      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -717,7 +703,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "agy models",
-      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -762,7 +747,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "agy models",
-      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -817,7 +801,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "codex models_cache.json",
-      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -874,7 +857,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "codex models_cache.json",
-      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -931,7 +913,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "codex models_cache.json",
-      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -987,7 +968,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "codex models_cache.json",
-      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -1040,10 +1020,9 @@
       },
       "base_model": "gpt-reserve",
       "default_effort": "medium",
-      "hidden": true,
+      "hidden": false,
       "execution_supported": true,
       "catalog_source": "codex models_cache.json",
-      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -1100,7 +1079,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "codex models_cache.json",
-      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -1157,7 +1135,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "codex models_cache.json",
-      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -1213,7 +1190,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "codex models_cache.json",
-      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -1266,10 +1242,9 @@
       },
       "base_model": "gpt-6-sol",
       "default_effort": "medium",
-      "hidden": true,
+      "hidden": false,
       "execution_supported": true,
       "catalog_source": "codex models_cache.json",
-      "catalog_observed_at": "2026-10-17T14:50:28.208437Z",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -1311,7 +1286,6 @@
       "hidden": false,
       "execution_supported": false,
       "catalog_source": "ollama /api/tags",
-      "catalog_observed_at": "2026-10-17T14:50:37.479369Z",
       "quantization": "Q4_K_M",
       "parameter_size": "2.0B",
       "digest": "8f68893c685c3ddff2aa3fffce2aa60a30bb2da65ca488b61fff134a4d1730e7",
@@ -1322,342 +1296,6 @@
       "runtime": "direct",
       "account": "default",
       "triple_key": "Qwen/Qwen3-1.7B::direct::default"
-    },
-    {
-      "id": "opencode:evren/auto",
-      "model": "evren/auto",
-      "base_model": "evren/auto",
-      "provider": "evren",
-      "runtime": "opencode",
-      "account": "default",
-      "cli": "opencode",
-      "capabilities": [
-        "development",
-        "architect",
-        "reviewer",
-        "general"
-      ],
-      "effort_levels": [],
-      "priority": {
-        "development": 20.0,
-        "architect": 20.0,
-        "reviewer": 20.0,
-        "general": 20.0
-      },
-      "availability": {
-        "status": "unknown",
-        "quota_status": "unknown",
-        "checked_at": null,
-        "source": null,
-        "verified": false
-      },
-      "provenance": {
-        "identity": "cli_discovery",
-        "capabilities": "derived_metadata",
-        "provider_catalog_verified": true,
-        "calibrated": false,
-        "note": "OpenCode CLI model listesinden keşfedildi; kimlik (model, runtime, hesap) üçlüsüdür."
-      },
-      "default_effort": "",
-      "hidden": false,
-      "execution_supported": true,
-      "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
-      "quantization": null,
-      "parameter_size": null,
-      "digest": null,
-      "input_modalities": [
-        "text"
-      ],
-      "triple_key": "evren/auto::opencode::default"
-    },
-    {
-      "id": "opencode:evren/deepseek-v4.1-flash",
-      "model": "evren/deepseek-v4.1-flash",
-      "base_model": "evren/deepseek-v4.1-flash",
-      "provider": "evren",
-      "runtime": "opencode",
-      "account": "default",
-      "cli": "opencode",
-      "capabilities": [
-        "development",
-        "architect",
-        "reviewer",
-        "general"
-      ],
-      "effort_levels": [],
-      "priority": {
-        "development": 20.0,
-        "architect": 20.0,
-        "reviewer": 20.0,
-        "general": 20.0
-      },
-      "availability": {
-        "status": "unknown",
-        "quota_status": "unknown",
-        "checked_at": null,
-        "source": null,
-        "verified": false
-      },
-      "provenance": {
-        "identity": "cli_discovery",
-        "capabilities": "derived_metadata",
-        "provider_catalog_verified": true,
-        "calibrated": false,
-        "note": "OpenCode CLI model listesinden keşfedildi; kimlik (model, runtime, hesap) üçlüsüdür."
-      },
-      "default_effort": "",
-      "hidden": false,
-      "execution_supported": true,
-      "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
-      "quantization": null,
-      "parameter_size": null,
-      "digest": null,
-      "input_modalities": [
-        "text"
-      ],
-      "triple_key": "evren/deepseek-v4.1-flash::opencode::default"
-    },
-    {
-      "id": "opencode:evren/gemma-4-31b",
-      "model": "evren/gemma-4-31b",
-      "base_model": "evren/gemma-4-31b",
-      "provider": "evren",
-      "runtime": "opencode",
-      "account": "default",
-      "cli": "opencode",
-      "capabilities": [
-        "development",
-        "architect",
-        "reviewer",
-        "general"
-      ],
-      "effort_levels": [],
-      "priority": {
-        "development": 20.0,
-        "architect": 20.0,
-        "reviewer": 20.0,
-        "general": 20.0
-      },
-      "availability": {
-        "status": "unknown",
-        "quota_status": "unknown",
-        "checked_at": null,
-        "source": null,
-        "verified": false
-      },
-      "provenance": {
-        "identity": "cli_discovery",
-        "capabilities": "derived_metadata",
-        "provider_catalog_verified": true,
-        "calibrated": false,
-        "note": "OpenCode CLI model listesinden keşfedildi; kimlik (model, runtime, hesap) üçlüsüdür."
-      },
-      "default_effort": "",
-      "hidden": false,
-      "execution_supported": true,
-      "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
-      "quantization": null,
-      "parameter_size": null,
-      "digest": null,
-      "input_modalities": [
-        "text"
-      ],
-      "triple_key": "evren/gemma-4-31b::opencode::default"
-    },
-    {
-      "id": "opencode:evren/glm-5.3",
-      "model": "evren/glm-5.3",
-      "base_model": "evren/glm-5.3",
-      "provider": "evren",
-      "runtime": "opencode",
-      "account": "default",
-      "cli": "opencode",
-      "capabilities": [
-        "development",
-        "architect",
-        "reviewer",
-        "general"
-      ],
-      "effort_levels": [],
-      "priority": {
-        "development": 20.0,
-        "architect": 20.0,
-        "reviewer": 20.0,
-        "general": 20.0
-      },
-      "availability": {
-        "status": "unknown",
-        "quota_status": "unknown",
-        "checked_at": null,
-        "source": null,
-        "verified": false
-      },
-      "provenance": {
-        "identity": "cli_discovery",
-        "capabilities": "derived_metadata",
-        "provider_catalog_verified": true,
-        "calibrated": false,
-        "note": "OpenCode CLI model listesinden keşfedildi; kimlik (model, runtime, hesap) üçlüsüdür."
-      },
-      "default_effort": "",
-      "hidden": false,
-      "execution_supported": true,
-      "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
-      "quantization": null,
-      "parameter_size": null,
-      "digest": null,
-      "input_modalities": [
-        "text"
-      ],
-      "triple_key": "evren/glm-5.3::opencode::default"
-    },
-    {
-      "id": "opencode:evren/mimo-v2.6-pro",
-      "model": "evren/mimo-v2.6-pro",
-      "base_model": "evren/mimo-v2.6-pro",
-      "provider": "evren",
-      "runtime": "opencode",
-      "account": "default",
-      "cli": "opencode",
-      "capabilities": [
-        "development",
-        "architect",
-        "reviewer",
-        "general"
-      ],
-      "effort_levels": [],
-      "priority": {
-        "development": 20.0,
-        "architect": 20.0,
-        "reviewer": 20.0,
-        "general": 20.0
-      },
-      "availability": {
-        "status": "unknown",
-        "quota_status": "unknown",
-        "checked_at": null,
-        "source": null,
-        "verified": false
-      },
-      "provenance": {
-        "identity": "cli_discovery",
-        "capabilities": "derived_metadata",
-        "provider_catalog_verified": true,
-        "calibrated": false,
-        "note": "OpenCode CLI model listesinden keşfedildi; kimlik (model, runtime, hesap) üçlüsüdür."
-      },
-      "default_effort": "",
-      "hidden": false,
-      "execution_supported": true,
-      "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
-      "quantization": null,
-      "parameter_size": null,
-      "digest": null,
-      "input_modalities": [
-        "text"
-      ],
-      "triple_key": "evren/mimo-v2.6-pro::opencode::default"
-    },
-    {
-      "id": "opencode:evren/qwen3-vl-30b",
-      "model": "evren/qwen3-vl-30b",
-      "base_model": "evren/qwen3-vl-30b",
-      "provider": "evren",
-      "runtime": "opencode",
-      "account": "default",
-      "cli": "opencode",
-      "capabilities": [
-        "development",
-        "architect",
-        "reviewer",
-        "general"
-      ],
-      "effort_levels": [],
-      "priority": {
-        "development": 20.0,
-        "architect": 20.0,
-        "reviewer": 20.0,
-        "general": 20.0
-      },
-      "availability": {
-        "status": "unknown",
-        "quota_status": "unknown",
-        "checked_at": null,
-        "source": null,
-        "verified": false
-      },
-      "provenance": {
-        "identity": "cli_discovery",
-        "capabilities": "derived_metadata",
-        "provider_catalog_verified": true,
-        "calibrated": false,
-        "note": "OpenCode CLI model listesinden keşfedildi; kimlik (model, runtime, hesap) üçlüsüdür."
-      },
-      "default_effort": "",
-      "hidden": false,
-      "execution_supported": true,
-      "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
-      "quantization": null,
-      "parameter_size": null,
-      "digest": null,
-      "input_modalities": [
-        "text"
-      ],
-      "triple_key": "evren/qwen3-vl-30b::opencode::default"
-    },
-    {
-      "id": "opencode:evren/qwen3.8-flash-next",
-      "model": "evren/qwen3.8-flash-next",
-      "base_model": "evren/qwen3.8-flash-next",
-      "provider": "evren",
-      "runtime": "opencode",
-      "account": "default",
-      "cli": "opencode",
-      "capabilities": [
-        "development",
-        "architect",
-        "reviewer",
-        "general"
-      ],
-      "effort_levels": [],
-      "priority": {
-        "development": 20.0,
-        "architect": 20.0,
-        "reviewer": 20.0,
-        "general": 20.0
-      },
-      "availability": {
-        "status": "unknown",
-        "quota_status": "unknown",
-        "checked_at": null,
-        "source": null,
-        "verified": false
-      },
-      "provenance": {
-        "identity": "cli_discovery",
-        "capabilities": "derived_metadata",
-        "provider_catalog_verified": true,
-        "calibrated": false,
-        "note": "OpenCode CLI model listesinden keşfedildi; kimlik (model, runtime, hesap) üçlüsüdür."
-      },
-      "default_effort": "",
-      "hidden": false,
-      "execution_supported": true,
-      "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
-      "quantization": null,
-      "parameter_size": null,
-      "digest": null,
-      "input_modalities": [
-        "text"
-      ],
-      "triple_key": "evren/qwen3.8-flash-next::opencode::default"
     },
     {
       "id": "opencode:ollama/deepseek-r1:7b",
@@ -1698,7 +1336,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -1740,7 +1377,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -1788,7 +1424,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -1836,7 +1471,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -1884,7 +1518,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -1932,7 +1565,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -1980,7 +1612,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -2028,7 +1659,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -2076,7 +1706,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -2124,7 +1753,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -2172,7 +1800,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -2220,7 +1847,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -2268,7 +1894,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "opencode models",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -2316,7 +1941,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "claude-code runtime",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -2365,7 +1989,6 @@
       "hidden": false,
       "execution_supported": true,
       "catalog_source": "claude-code runtime",
-      "catalog_observed_at": "2026-11-01T20:58:45.650223+00:00",
       "quantization": null,
       "parameter_size": null,
       "digest": null,
@@ -2507,6 +2130,100 @@
         "text"
       ],
       "triple_key": "qwen2.5-coder:7b::direct::default"
+    },
+    {
+      "id": "opencode:opencode/crouton-alpha-free",
+      "model": "opencode/crouton-alpha-free",
+      "base_model": "opencode/crouton-alpha-free",
+      "provider": "opencode",
+      "runtime": "opencode",
+      "account": "default",
+      "cli": "opencode",
+      "capabilities": [
+        "development",
+        "architect",
+        "reviewer",
+        "general"
+      ],
+      "effort_levels": [],
+      "priority": {
+        "development": 20.0,
+        "architect": 20.0,
+        "reviewer": 20.0,
+        "general": 20.0
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_discovery",
+        "capabilities": "derived_metadata",
+        "provider_catalog_verified": true,
+        "calibrated": false,
+        "note": "OpenCode CLI model listesinden keşfedildi; kimlik (model, runtime, hesap) üçlüsüdür."
+      },
+      "default_effort": "",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "opencode models",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text"
+      ],
+      "triple_key": "opencode/crouton-alpha-free::opencode::default"
+    },
+    {
+      "id": "opencode:opencode/pulse-alpha-free",
+      "model": "opencode/pulse-alpha-free",
+      "base_model": "opencode/pulse-alpha-free",
+      "provider": "opencode",
+      "runtime": "opencode",
+      "account": "default",
+      "cli": "opencode",
+      "capabilities": [
+        "development",
+        "architect",
+        "reviewer",
+        "general"
+      ],
+      "effort_levels": [],
+      "priority": {
+        "development": 20.0,
+        "architect": 20.0,
+        "reviewer": 20.0,
+        "general": 20.0
+      },
+      "availability": {
+        "status": "unknown",
+        "quota_status": "unknown",
+        "checked_at": null,
+        "source": null,
+        "verified": false
+      },
+      "provenance": {
+        "identity": "cli_discovery",
+        "capabilities": "derived_metadata",
+        "provider_catalog_verified": true,
+        "calibrated": false,
+        "note": "OpenCode CLI model listesinden keşfedildi; kimlik (model, runtime, hesap) üçlüsüdür."
+      },
+      "default_effort": "",
+      "hidden": false,
+      "execution_supported": true,
+      "catalog_source": "opencode models",
+      "quantization": null,
+      "parameter_size": null,
+      "digest": null,
+      "input_modalities": [
+        "text"
+      ],
+      "triple_key": "opencode/pulse-alpha-free::opencode::default"
     }
   ]
 }
