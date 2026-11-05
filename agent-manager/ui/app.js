@@ -855,17 +855,17 @@ function choosePlan(id = null) {
   pollEvents().catch(() => {});
 }
 
+function stepOutcomePreview(result, running) {
+  if (running) return 'Çalışıyor; sonuç henüz hazır değil.';
+  if (result?.awaiting_input) return 'Devam etmek için yanıtınızı bekliyor.';
+  if (result?.status === 'failed') return `Tamamlanamadı: ${String(result.error || 'Hata ayrıntılarını açın.').slice(0, 160)}`;
+  const raw = String(result?.output || '');
+  const outcome = raw.match(/(?:^|\n)\s*(?:#{1,4}\s*)?(?:\*\*)?(?:Sonuç|Yapılan değişiklik|Kullanıcıya etkisi|Özet)(?:\*\*)?\s*:\s*([^\n]+)(?:\n([^\n#]+))?/i);
+  const text = (outcome ? outcome[1] : raw).replace(/```[\s\S]*?```/g, '').replace(/[#*`>|]/g, '').replace(/\s+/g, ' ').trim();
+  return text ? (text.length > 190 ? text.slice(0, 187).trimEnd() + '…' : text) : 'Kısa sonuç özeti yok; ayrıntıları açın.';
+}
+
 function renderRunMessages(run, container, questionDrafts, archived = false) {
-  if (!archived) {
-    for (const [index, previous] of (run.plan_history || []).entries()) {
-      const section = node('section', 'archived-plan');
-      section.append(button(`Önceki plan ${index + 1} · ${previous.prompt || 'Plan'} ↗`, 'archived-plan-select', () => choosePlan(previous.execution_id)));
-      section.addEventListener('click', () => { state.planViewId = previous.execution_id; state.fingerprint = ''; renderRun(); });
-      renderRunMessages({...previous, plan_history: [], conversation_history: [], chat_history: []}, section, [], true);
-      section.querySelectorAll('.run-actions button, .inline-question button').forEach(button => button.disabled = true);
-      container.append(section);
-    }
-  }
 
   for (const message of run.conversation_history || []) {
     const user = message.role === 'user';
@@ -890,6 +890,22 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
     userBubble.append(userHead, node('div', 'user-body', run.prompt));
     container.append(userBubble);
   }
+
+  if (!archived) {
+    for (const [index, previous] of (run.plan_history || []).entries()) {
+      const section = node('section', 'archived-plan');
+      section.append(button(`Önceki plan ${index + 1} · ${previous.prompt || 'Plan'} ↗`, 'archived-plan-select', () => choosePlan(previous.execution_id)));
+
+      renderRunMessages({...previous, plan_history: [], conversation_history: [], chat_history: []}, section, [], true);
+      section.querySelectorAll('.run-actions button, .inline-question button').forEach(button => button.disabled = true);
+      container.append(section);
+    }
+  }
+
+  const planContainer = node('section', 'plan-message-box');
+  container.append(planContainer);
+  const dialogueContainer = container;
+  container = planContainer;
 
   const instructions = instructionRecords(run);
   if (instructions.length) {
@@ -1064,7 +1080,14 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
     const personaIcon = personaIcons[personaKey] || personaIcons.default;
     const personaLabel = personaLabels[personaKey] || personaKey;
 
-    const stepBubble = node('article', 'message-bubble agent-step-bubble');
+    const stepBubble = node('details', 'message-bubble agent-step-bubble compact-step');
+    stepBubble.dataset.stepKey = `${run.id || run.execution_id}:${step.id}`;
+    const shortHead = node('summary', 'compact-step-heading');
+    shortHead.append(node('strong', '', step.title || step.id),
+      badge(isRunning ? 'running' : (result?.status || 'planned')),
+      node('span', 'compact-step-description', stepOutcomePreview(result, isRunning)));
+    stepBubble.append(shortHead);
+    if (result?.awaiting_input) stepBubble.open = true;
     if (result?.status === 'completed' || result?.status === 'success') stepBubble.classList.add('status-completed');
     else if (result?.status === 'failed') stepBubble.classList.add('status-failed');
     else if (isRunning) stepBubble.classList.add('status-running');
@@ -1135,6 +1158,8 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
     container.append(stepBubble);
   }
 
+  container = dialogueContainer;
+
   // 4. CHAT HISTORY (CANLI KULLANICI & ORKESTRATÖR DİYALOĞU)
   if (run.chat_history?.length) {
     for (const msg of run.chat_history) {
@@ -1171,7 +1196,7 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
   if (run.orchestrator_answer && !run.chat_history?.length && isMultiStep) {
     const briefingBubble = node('article', 'message-bubble executive-briefing-bubble');
     const bHead = node('div', 'briefing-head');
-    bHead.append(node('span', '', '◈'), node('span', '', 'Baş Yönetici Özeti (Executive Briefing)'));
+    bHead.append(node('span', '', '◈'), node('span', '', 'Planın sonucu'));
     bHead.append(node('span', 'briefing-badge', 'Sentez & Rapor'));
     briefingBubble.append(bHead);
 
@@ -1197,7 +1222,7 @@ function renderRunMessages(run, container, questionDrafts, archived = false) {
       pills.append(pillBtn);
     });
     briefingBubble.append(pills);
-    container.append(briefingBubble);
+    planContainer.append(briefingBubble);
   }
 
   renderMermaidDiagrams();
@@ -1299,6 +1324,7 @@ function renderRun() {
   const messages = $('#messages');
   const oldScroll = messages.scrollTop;
   const nearBottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
+  const openSteps = new Set([...container.querySelectorAll('details.compact-step[open]')].map(item => item.dataset.stepKey));
   const questionDrafts = [...container.querySelectorAll('.inline-question-input')].map(input => input.value);
   const focusedQuestion = document.activeElement?.classList?.contains('inline-question-input');
   container.replaceChildren();
@@ -1308,15 +1334,20 @@ function renderRun() {
     section.dataset.runId = planRun.id;
     if (planRun.mode !== 'chat') {
       planNumber++;
+      section.dataset.planNumber = String(planNumber);
       section.append(button(`Plan ${planNumber} · ${statusLabels[planRun.status] || planRun.status} · Ayrıntıları göster ↗`, 'conversation-plan-select', () => choosePlan(planRun.id)));
     }
     section.addEventListener('click', event => {
-      if (event.target.closest('.archived-plan, .user-test-request, button, input, textarea, select')) return;
+      if (event.target.closest('.archived-plan, .user-test-request, details, button, input, textarea, select')) return;
       state.planViewId = planRun.id; state.fingerprint = ''; renderRun();
     });
     renderRunMessages(planRun, section, questionDrafts);
+    const navigation = section.querySelector(':scope > .conversation-plan-select');
+    const box = section.querySelector(':scope > .plan-message-box');
+    if (navigation && box) box.prepend(navigation);
     container.append(section);
   }
+  container.querySelectorAll('details.compact-step').forEach(item => { if (openSteps.has(item.dataset.stepKey)) item.open = true; });
   renderWorkPanel(run, container);
   if (false) {
   container.replaceChildren();

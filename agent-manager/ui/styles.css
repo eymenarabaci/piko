@@ -1113,3 +1113,18 @@ body.view-piko #toggle-inspector{display:none}
 .status-badge.evidence-ok{background:#e8f7ef;color:#1d7a46;border:1px solid #b6e3c8}
 .notification-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
 .notification-actions button{font-size:10px;padding:6px 9px;border-radius:5px}
+
+/* One conversational plan with progressive step disclosure. */
+.plan-message-box{border:1px solid #d8e2ef;border-radius:16px;background:#fff;padding:16px;margin:14px 0;min-width:0}
+.plan-message-box>.message-bubble{max-width:100%;margin:10px 0;box-shadow:none}
+.plan-message-box>.plan-overview-bubble{border:0;padding:4px 0 12px;background:transparent}
+.plan-message-box .compact-step{padding:0;border:1px solid #e1e7ef;border-radius:10px;background:#fafbfd;overflow:hidden}
+.compact-step-heading{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 12px;padding:13px 15px;cursor:pointer;list-style:none;font-size:13px}
+.compact-step-heading::-webkit-details-marker{display:none}
+.compact-step-heading strong:before{content:'▸';display:inline-block;width:18px;color:#617796}
+.compact-step[open]>.compact-step-heading strong:before{content:'▾'}
+.compact-step-description{grid-column:1/-1;color:#58687c;line-height:1.55;padding-left:18px;overflow-wrap:anywhere}
+.compact-step>.agent-step-head,.compact-step>.agent-step-title,.compact-step>.agent-step-body,.compact-step>.agent-step-footer,.compact-step>.inline-question{margin:12px 16px}
+.compact-step-heading:focus-visible{outline:2px solid #407bc7;outline-offset:-3px}
+.plan-message-box>.executive-briefing-bubble{border:0;border-top:1px solid #d8e2ef;border-radius:0;background:transparent;padding:18px 0 0;margin-bottom:0}
+@media(max-width:600px){.plan-message-box{padding:10px}.compact-step-heading{padding:11px 10px}}
